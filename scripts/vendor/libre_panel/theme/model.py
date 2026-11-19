@@ -1,0 +1,1494 @@
+"""Theme format ``libre-panel-theme/1``.
+
+A theme is a folder with a ``theme.json`` and optional assets (images, fonts).
+Themes are meant to be shared, so everything in them is treated as untrusted:
+asset paths may not leave the theme folder and format strings cannot reach
+into Python objects (see ``libre_panel.render.formatting``).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from functools import cache
+from pathlib import Path, PureWindowsPath
+from typing import Any
+
+from PIL import ImageColor
+
+from libre_panel.config import FAN_LOOKS, FAN_PAINTS, SYMBOL_PACKS, user_themes_dir
+from libre_panel.devices.models import find_model, orientation_of
+from libre_panel.fonts import BUILTIN_PREFIX, DEFAULT_FONT, builtin_font_path, builtin_fonts
+from libre_panel.icons import ICON_NAMES
+from libre_panel.theme.modules import (
+    BACKDROPS,
+    CARDS,
+    GRID_CELLS,
+    GRID_DEFAULTS,
+    MODULE_FALLBACKS,
+    MODULE_KINDS,
+    MODULE_SOURCES,
+    STYLE_DEFAULTS,
+)
+
+THEME_FORMAT = "libre-panel-theme/1"
+THEME_FILENAME = "theme.json"
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class ThemeError(ValueError):
+    """Raised for invalid or unsafe themes."""
+
+
+# Field kinds: int, number, number?, string, text, color, color?, bool, sensor,
+# format, font, asset, rules, icon and "enum:a|b|c". Colors may name a palette
+# entry ("@accent"). The editor builds its property forms from this table, so
+# it is the single source of truth for widgets.
+_COMMON: dict[str, tuple[str, Any]] = {
+    "id": ("string", ""),
+    "x": ("int", 0),
+    "y": ("int", 0),
+    "visible": ("bool", True),
+    "locked": ("bool", False),  # editor only: not draggable
+    "hide_if_missing": ("bool", False),  # hide when its sensor has no value
+    # Show only while this sensor has a value ("!key": only while it has none),
+    # so a card, its labels and icons go with the readings they frame.
+    "needs": ("sensor", ""),
+    # turned, degrees clockwise: about its middle, a text about the point it is aligned at
+    # halfway down its line, a module's parts about the module's middle (render.renderer)
+    "rotate": ("number", 0.0),
+    "opacity": ("number", 1.0),
+    "glow": ("number", 0.0),  # 0 = off, 1 = strong
+    "glow_radius": ("int", 10),
+    "shadow": ("color?", None),
+    "shadow_offset": ("int", 3),
+    "shadow_blur": ("int", 6),
+    # editor only: the parts of a detached module share the module's id here (Theme.detached
+    # keeps the module, to put it back together)
+    "group": ("string", ""),
+}
+COMMON_FIELDS = _COMMON
+# Fields the editor groups under "Effects".
+EFFECT_FIELDS = ("opacity", "glow", "glow_radius", "shadow", "shadow_offset", "shadow_blur")
+BLUR_MAX = 64  # the most a widget's glow, shadow or backdrop may blur, in px
+
+
+def _text_style(tabular: bool) -> dict[str, tuple[str, Any]]:
+    return {
+        "font": ("font", ""),  # empty = the theme's font
+        "font_size": ("int", 24),
+        "color": ("color", "#ffffff"),
+        "align": ("enum:left|center|right", "left"),
+        "letter_spacing": ("number", 0),
+        "tabular": ("bool", tabular),  # equal-width digits: numbers do not jitter
+        "max_width": ("int", 0),  # 0 = any width; wider text is made to fit
+        "fit": ("enum:shrink|ellipsis", "shrink"),  # how: a smaller font, or cut with …
+    }
+
+
+# The look of a weather symbol or the moon (render/symbols.py): "auto" takes the one the user
+# chose (Settings -> Weather and place, ``symbols`` in config.toml), else "vivid"
+PACK_FIELD = ("enum:auto|" + "|".join(SYMBOL_PACKS), "auto")
+
+WIDGET_SPECS: dict[str, dict[str, tuple[str, Any]]] = {
+    "rect": {
+        "w": ("int", 100),
+        "h": ("int", 50),
+        "color": ("color?", "#1f2937"),
+        "color2": ("color?", None),
+        "gradient": ("enum:vertical|horizontal", "vertical"),
+        "radius": ("int", 0),
+        "outline": ("color?", None),
+        "outline_width": ("int", 1),
+        "backdrop_blur": ("int", 0),
+    },
+    "text": {
+        "text": ("text", "Label"),
+        # Libre Panel's own words in the panel's language ("Nothing playing" is "Es läuft
+        # nichts" in German); a text it does not know stays as it is
+        "translate": ("bool", False),
+        "uppercase": ("bool", False),  # in capitals, as a clock's date can be
+        **_text_style(False),
+        "glow_area": ("box?", None),  # [x, y, w, h]: a lit text's glow stays inside
+    },
+    "metric": {
+        "sensor": ("sensor", "cpu.load"),
+        "format": ("format", "{value:.0f}{unit}"),
+        "fallback": ("string", "--"),
+        **_text_style(True),
+        "smooth": ("bool", False),  # the number glides with bars and rings of its sensor
+        "glide_ms": ("int", 0),  # with smooth: its own glide (ms), not the theme's smoothing_ms
+        "color_rules": ("rules", []),
+        "glow_area": ("box?", None),
+    },
+    "bar": {
+        "sensor": ("sensor", "cpu.load"),
+        "w": ("int", 200),
+        "h": ("int", 16),
+        "min": ("number", 0),
+        "max": ("number", 100),
+        "color": ("color", "#22d3ee"),
+        "color2": ("color?", None),
+        "background": ("color?", "#1f2937"),
+        "radius": ("int", 4),
+        "direction": ("enum:right|left|up|down", "right"),
+        "scale": ("enum:linear|sqrt|log", "linear"),
+        "segments": ("int", 0),
+        "segment_gap": ("int", 2),
+        # segments that rise as levels on a mixer, as the volume's message shows it: the first
+        # this share of the bar's thickness, the last all of it (0: all of it; flat finish)
+        "rising": ("number", 0),
+        "smooth": ("bool", True),
+        "glide_ms": ("int", 0),  # with smooth: its own glide (ms), not the theme's smoothing_ms
+        "color_rules": ("rules", []),
+        "glow_area": ("box?", None),  # [x, y, w, h]: a lit bar's glow stays inside
+        # a second reading as a thin line across the bar, at its value on the bar's own scale
+        # (the average of earlier rounds, a limit); drawn over the bar, whatever its finish
+        "mark": ("sensor", ""),
+        "mark_color": ("color", "#ffffff"),
+        "mark_width": ("int", 2),
+        # a dot of this radius (px) at the bar's end, its head, in its colour (0: none)
+        "end_dot": ("number", 0),
+    },
+    "gauge": {
+        "sensor": ("sensor", "cpu.load"),
+        "w": ("int", 120),
+        "h": ("int", 120),
+        "min": ("number", 0),
+        "max": ("number", 100),
+        "start_angle": ("number", 135),
+        "end_angle": ("number", 405),
+        "thickness": ("int", 12),
+        "color": ("color", "#22d3ee"),
+        "color2": ("color?", None),
+        "background": ("color?", "#1f2937"),
+        "scale": ("enum:linear|sqrt|log", "linear"),
+        "cap": ("enum:round|flat", "round"),
+        "ticks": ("int", 0),
+        "tick_color": ("color?", None),
+        "smooth": ("bool", True),
+        "glide_ms": ("int", 0),  # with smooth: its own glide (ms), not the theme's smoothing_ms
+        "color_rules": ("rules", []),
+    },
+    "graph": {
+        "sensor": ("sensor", "cpu.load"),
+        "w": ("int", 200),
+        "h": ("int", 60),
+        "min": ("number?", 0),
+        "max": ("number?", 100),
+        "scale": ("enum:linear|sqrt|log", "linear"),
+        "history": ("int", 60),
+        # video mode: the seconds the curve spans (0: a pixel per point, 25 a second, as
+        # SPUR II's: as fluid as a graph moves; ``history`` is for still pictures)
+        "seconds": ("number", 0),
+        "color": ("color", "#22d3ee"),
+        "fill": ("bool", True),
+        "fill_fade": ("bool", True),
+        "fill_alpha": ("number", 0),  # how opaque the fill is, 0 to 1 (0: 0.25, a fade 0.45)
+        "direction": ("enum:up|down", "up"),  # down: hangs from the top, filled from there
+        "inset": ("bool", True),  # the line stays inside (off: the range spans the box)
+        # the glow kept between the box's sides: a graph from one edge of its card to the
+        # other (the game's) does not shine past them
+        "clip": ("bool", False),
+        # a dot of this radius (px) in the line's colour at the newest point of the line, with
+        # the widget's glow around it, as the end of SPUR II's Horizon curves (0: none)
+        "end_dot": ("number", 0),
+        "smooth": ("bool", True),
+        "per_frame": ("bool", False),  # older themes: a point a pixel apart (seconds = w / 25)
+        # video mode: a reading with the value's course finely ("game.fps_trace", 25 points a
+        # second), drawn instead of the value's glide where it comes: every dip as measured
+        "trace": ("string", ""),
+        # an automatic range (min or max null) in whole steps of this (0: as the values are):
+        # it changes seldom, and the fill's fade starts at its top
+        "range_step": ("number", 0),
+        "line_width": ("int", 2),
+        "grid": ("int", 0),
+        "grid_color": ("color?", "#ffffff1f"),
+        "background": ("color?", None),
+    },
+    "clock": {
+        "format": ("string", "%H:%M"),
+        "timezone": ("string", ""),  # e.g. "Asia/Tokyo"; empty = this computer's
+        "uppercase": ("bool", False),  # the weekday and month in capitals, as SPUR II's date
+        # what changes on the second: jumps, rolls (the old letter up and out, the new one in
+        # from below) or fades, as SPUR II's clocks do, for ``digits_seconds`` (at most 1)
+        "digits": ("enum:jump|roll|fade", "jump"),
+        "digits_seconds": ("number", 0.42),
+        **_text_style(True),
+    },
+    # A clock face with hands.
+    "analog": {
+        "w": ("int", 160),
+        "h": ("int", 160),
+        "timezone": ("string", ""),
+        "color": ("color", "#ffffff"),  # hour and minute hands
+        "color2": ("color", "#22d3ee"),  # second hand and centre
+        "face": ("color?", "#1f2937"),
+        "marks": ("color?", "#8a97a8"),
+        "seconds": ("bool", True),
+        # the second hand: jumps on the second (tick), moves to it in ``digits_seconds`` as a
+        # clock's rolling digits do (glide), or goes round without stopping (sweep)
+        "hand": ("enum:tick|glide|sweep", "tick"),
+        "digits_seconds": ("number", 0.42),
+    },
+    # The days, hours or minutes until a date: "2026-12-24", "2026-12-24 18:00",
+    # or "12-24" for every year.
+    "countdown": {
+        "target": ("string", "12-24"),
+        # number: 76 / 5:12 / 12:33; unit: days / hours / minutes; clock: 05:12:33
+        # left in the day; text: "76 days"; days; date: the day it counts to
+        "part": ("enum:number|unit|clock|text|days|date", "text"),
+        "done": ("string", ""),  # shown once it is there (empty: "Today" / "Now")
+        **_text_style(True),
+    },
+    # The moon as it is lit tonight.
+    "moon": {
+        "size": ("int", 64),
+        "sensor": ("sensor", "moon.phase"),
+        "color": ("color", "#f2efe6"),  # the lit part
+        "color2": ("color?", "#2b3242"),  # the dark part
+        "mirror": ("bool", False),  # as seen south of the equator
+        "pack": PACK_FIELD,
+    },
+    # The earth as it is now (render/earth.py): lit by the sun where it stands, the cities'
+    # lights on its night side, the clouds, your place marked ([weather] latitude and
+    # longitude). It faces your place, or turns once in ``spin`` seconds (where the panel
+    # moves; the day and the night stay where they are on the earth at this moment).
+    "earth": {
+        "size": ("int", 160),
+        "spin": ("number", 0),
+        "clouds": ("bool", True),
+        "lights": ("bool", True),  # the cities' lights on the night side
+        "place": ("bool", True),  # your place marked
+        "color": ("color", "#6badff"),  # the air at its rim
+        "color2": ("color", "#ffd27a"),  # your place
+    },
+    # The sun's way over the sky today (render/sunpath.py): an arc over the horizon from sunrise
+    # to sunset, the day gone in the sun's light, the rest dotted, the sun where it stands; by
+    # night the arc lies dim under the moon's crescent. Its sensor is how much of the day has
+    # gone (``sun.progress``, none by night); without the sun's times ([weather] latitude and
+    # longitude) it is not drawn.
+    "sunpath": {
+        "w": ("int", 160),
+        "h": ("int", 44),
+        "sensor": ("sensor", "sun.progress"),
+        "thickness": ("number", 2),
+        "color": ("color", "#f5c46b"),  # the sun, and the day gone
+        "color2": ("color?", None),  # where the day began (empty: the colour, deeper)
+        "background": ("color", "#2a3644"),  # the horizon and the day to come
+        "night": ("color", "#c9d3de"),  # the moon by night
+    },
+    # The sign of an AI agent at work (render/agent.py): working, waiting for you, idle, off,
+    # as its reading says (ai.claude.state, ai.codex.state).
+    "agent": {
+        "size": ("int", 64),
+        "sensor": ("sensor", "ai.claude.state"),
+        "color": ("color", "#2ee6d6"),  # working and idle
+        "color2": ("color", "#f5b942"),  # waiting for you
+        "muted": ("color", "#5b6474"),  # off
+    },
+    # A fan: its rotor turns with the sensor's speed (RPM) inside a ring that shows the load.
+    "fan": {
+        "sensor": ("sensor", "gpu.fan"),
+        "w": ("int", 48),
+        "h": ("int", 48),
+        "color": ("color", "#22d3ee"),
+        "max_rpm": ("number", 3000),  # the speed that fills the ring and turns the rotor fastest
+        "frame": ("enum:ring|square|none", "ring"),  # the load ring, the lit square frame, or none
+        # the rotor's look (render/fan_looks.py) and its colours, the theme's or the look's own
+        # (Noctua's brown and beige); "auto": what the user chose for the fan (Settings ->
+        # Sensors, [hardware] in config.toml), else Noctua's G2 in the theme's colour
+        "look": ("enum:auto|" + "|".join(FAN_LOOKS), "auto"),
+        "paint": ("enum:auto|" + "|".join(FAN_PAINTS), "auto"),
+    },
+    "image": {
+        "src": ("asset", ""),
+        "w": ("int", 0),
+        "h": ("int", 0),
+        "fit": ("enum:stretch|contain|cover", "stretch"),  # into w x h
+        "align": ("enum:left|center|right", "center"),  # contain: where it stands in w x h
+        "radius": ("int", 0),
+        # blurred by this radius (px): a backdrop of its colours, as an album cover behind
+        # what plays; it fills its box on any panel (0: sharp)
+        "blur": ("int", 0),
+        # more pictures for a slideshow, one per line ("photos/*.jpg" takes a folder)
+        "slides": ("text", ""),
+        # per picture; one that moves (a video, an animated GIF) plays whole rounds, at least
+        # this long: a longer video to its end
+        "seconds": ("int", 10),
+        "speed": ("number", 1.0),  # how fast a video or an animated picture plays (0.25 to 4)
+    },
+    "weather": {
+        "field": (
+            "enum:temperature|apparent_temperature|humidity|wind_speed|description|code",
+            "temperature",
+        ),
+        "format": ("format", "{value:.0f}{unit}"),
+        "fallback": ("string", "--"),
+        **_text_style(True),
+    },
+    "icon": {
+        "icon": ("icon", "cpu"),  # "weather" follows the weather code, "link" the connection
+        # icon "weather": the code it follows, e.g. weather.day.1.code (empty = now)
+        "sensor": ("sensor", ""),
+        "size": ("int", 32),
+        "color": ("color", "#ffffff"),
+        "stroke": ("number", 2.0),
+    },
+    # A weather symbol that moves: the sun's rays turn, rain and snow fall, clouds drift.
+    # It follows a weather code ("weather.code", "weather.hour.3.code" ...), by day or night.
+    "symbol": {
+        "sensor": ("sensor", "weather.code"),
+        "size": ("int", 64),
+        "color": ("color", "#ffffff"),  # clouds and the moon (sun, rain, snow: the palette's)
+        "moving": ("bool", True),  # off: it stands (it moves where the panel is driven fast)
+        "offset": ("number", 0.0),  # seconds its motion is shifted: a row is not in step
+        "pack": PACK_FIELD,
+    },
+    # A download as the Studio's inset shows it (render/download.py): what loads, its progress,
+    # the speed and the time left, and the speed over the last minutes. It reads the state the
+    # ``downloads`` service publishes; ``empty`` stands where nothing downloads.
+    "downloads": {
+        "state": ("string", "downloads"),
+        "w": ("int", 596),
+        "h": ("int", 130),
+        "font": ("font", ""),  # the heading and the numbers
+        "label_font": ("font", ""),  # the names
+        "color": ("color", "#f1f5f9"),  # the numbers
+        "muted": ("color", "#8a97a8"),  # the names; a paused download
+        "color2": ("color", "#22d3ee"),  # progress and speed
+        "done": ("color", "#4ade80"),  # a finished download
+        "background": ("color?", "#1f2937"),  # the progress's groove
+        "empty": ("string", ""),  # shown where nothing downloads
+    },
+    # The month as a grid of days, today marked.
+    "calendar": {
+        "w": ("int", 280),
+        "h": ("int", 200),
+        "font": ("font", ""),
+        "font_size": ("int", 16),
+        "color": ("color", "#ffffff"),  # the days
+        "color2": ("color", "#22d3ee"),  # today's mark
+        "muted": ("color", "#8a97a8"),  # the weekday names
+        "first_day": ("enum:monday|sunday", "monday"),
+    },
+    # Readings found by name or pattern, as many as fit: temperatures, fans,
+    # drives, cores, processes. One per line: "cpu.temp", "temp.*" (all of
+    # them), "!temp.acpi*" (left out), "cpu.temp = CPU" (with a name). Without
+    # one the name comes from a reading beside it ("disk.1.name" for
+    # "disk.1.load") or the sensor's own label.
+    "list": {
+        "w": ("int", 240),
+        "h": ("int", 160),
+        "items": ("text", "cpu.temp = CPU\ngpu.temp = GPU\nfan.*"),
+        "style": ("enum:rows|bars|columns|cells|fans", "bars"),  # fans: each one turning
+        "columns": ("int", 0),  # side by side; 0 = automatic
+        "max_items": ("int", 0),  # 0 = as many as fit
+        "sort": ("enum:none|high|low|name", "none"),
+        "format": ("format", "auto"),  # auto: as usual for the unit (45%, 2.4 MB/s)
+        "detail": ("string", ""),  # a reading beside each one to show too, e.g. "free"
+        "detail_format": ("format", "{value:.0f} {unit}"),
+        "min": ("number", 0),
+        "max": ("number", 100),  # at or below min: the largest value shown
+        "scale": ("enum:linear|sqrt|log", "linear"),
+        "levels": ("bool", True),  # bars and filled cells; off: numbers only
+        "smooth": ("bool", True),  # the bars glide to a new reading, as a bar's do
+        "hide_unused": ("bool", False),  # fans: none that has stood still since the start
+        "font": ("font", ""),  # the values
+        "font_size": ("int", 18),
+        "label_font": ("font", ""),
+        "uppercase": ("bool", True),  # names in capitals
+        "color": ("color", "#ffffff"),  # the values
+        "muted": ("color", "#8a97a8"),  # the names
+        "color2": ("color", "#22d3ee"),  # bars and cells
+        "background": ("color?", "#1f2937"),  # their tracks
+        "empty": ("string", ""),  # shown when nothing is found
+        "color_rules": ("rules", []),
+    },
+    # A building block on the theme's grid; laid out for its size when drawn
+    # (libre_panel.theme.modules). x and y are not used: the cells place it.
+    "module": {
+        "module": ("enum:" + "|".join(MODULE_KINDS), "ring"),
+        "col": ("int", 0),
+        "row": ("int", 0),
+        "cols": ("int", 1),
+        "rows": ("int", 1),
+        "source": ("enum:" + "|".join(MODULE_SOURCES), "cpu"),
+        "sensor": ("sensor", ""),  # source "sensor": any reading
+        "format": ("format", ""),  # source "sensor": empty = "{value:.0f}{unit}"
+        "title": ("string", ""),  # empty = the module's own
+        "text": ("text", ""),  # the title module's text
+        "color": ("color?", None),  # empty = the look's colour for the source
+        "fallback": ("enum:" + "|".join(MODULE_FALLBACKS), "auto"),  # without readings
+        "card": ("enum:auto|on|off", "auto"),
+        # weather: a forecast when there is room; "auto" = days, and hours too
+        # on a big module
+        "forecast": ("enum:auto|days|hours|both|off", "auto"),
+        "step": ("int", 0),  # hourly forecast: hours between two columns (0: 3, the card 1)
+        # temps, drives, dashboard: the readings to show, one per line ("cpu.temp = CPU");
+        # card slots: the cards, one per line ("playback", "forecast if weather.temperature")
+        "items": ("text", ""),
+        # temps: at most so many fans, where there is room (0: none), and which, one per line
+        # as the items ("fan.lpc.fan_2 = Front"; empty: the graphics card's, then the others)
+        "fans": ("int", 6),
+        "fan_items": ("text", ""),
+        "threads": ("bool", False),  # cores: every thread, not every core (where known)
+        # cores: the whole processor's load beside the title, and its history where there is
+        # room (off in a companion: the screen beside it shows them)
+        "total": ("bool", True),
+        # a ring instrument: the course of the load along the bottom of a tall card
+        "history": ("bool", False),
+        # the game's frame rate: its course from 0 up to this many fps, its scale fixed (0: a
+        # top of its own, in steps of 30 fps)
+        "top": ("number", 175),
+        "sort": ("enum:cpu|memory", "cpu"),  # processes: by processor time or memory
+        "timezone": ("string", ""),  # analog clock: e.g. "Asia/Tokyo"
+        "target": ("string", ""),  # countdown: "2026-12-24", "2026-12-24 18:00", "12-24"
+        "seconds": ("int", 10),  # picture: seconds per picture in a slideshow
+        "speed": ("number", 1.0),  # picture: how fast its videos and animated pictures play
+        # the cards (theme.cards): the weather card's symbols move (the symbol's own
+        # field); a slot keeps a paused track on show this long (minutes), and a change of
+        # card takes so long (seconds)
+        "moving": ("bool", True),
+        "hold": ("number", 2.0),
+        "change": ("number", 0.6),
+        # a slot's playback card: a new track moves in from the right as the old one moves out
+        # to the left, in this many seconds (0: the new track is there at once)
+        "slide": ("number", 0),
+        # a card slot: which card is on show, the first with something to show or each in
+        # turn for ``turn`` minutes (a line's own time first: "forecast for 5m"), and how it
+        # goes from one card to the next (theme.modules CARD_ORDERS, CARD_TRANSITIONS)
+        "order": ("enum:first|turns", "first"),
+        "turn": ("number", 5.0),
+        "transition": ("enum:light|fade|slide|rise|wipe|cut|random", "light"),
+        # the playback card: the time at the right of the progress, the track's length (3:47)
+        # or what is left of it (-2:24)
+        "time": ("enum:total|remaining", "total"),
+        # AI activity: Claude Code, Codex, or both side by side
+        "agent": ("enum:both|claude|codex", "both"),
+    },
+}
+
+# How a widget's shape is drawn (render.finish): "flat" (the default), "lit"
+# (SPUR II's light: values as light in their grooves, glows as light), "facet" or
+# "acrylic". A finish a type does not have draws it flat, with a warning.
+FINISHES = ("flat", "lit", "facet", "acrylic")
+FINISH_FIELD = ("enum:" + "|".join(FINISHES), FINISHES[0])
+# a module's finish unless the theme names one: its kind's own (flat, or lit for a card)
+AUTO = "auto"
+for _type in (
+    "text", "metric", "clock", "weather", "countdown", "bar", "gauge", "graph", "icon", "symbol",
+    "downloads", "module",
+):  # fmt: skip
+    WIDGET_SPECS[_type]["finish"] = FINISH_FIELD
+WIDGET_SPECS["module"]["finish"] = ("enum:" + "|".join((AUTO, *FINISHES)), AUTO)
+
+# The few fields the editor's inspector shows first for each widget type, in
+# this order; the others are one click further ("Details"). Position and size
+# are set on the canvas, so they are never among them.
+PRIMARY_FIELDS: dict[str, tuple[str, ...]] = {
+    "rect": ("color", "color2", "radius", "outline"),
+    "text": ("text", "finish", "color", "font_size"),
+    "metric": ("sensor", "format", "finish", "color", "smooth", "color_rules"),
+    "bar": ("sensor", "finish", "color", "smooth", "color_rules"),
+    "gauge": ("sensor", "finish", "color", "smooth", "color_rules"),
+    "graph": ("sensor", "finish", "color", "fill", "seconds"),
+    "clock": ("format", "timezone", "color", "font_size"),
+    "analog": ("timezone", "hand", "color", "color2", "seconds"),
+    "countdown": ("target", "part", "color", "font_size"),
+    "moon": ("color", "color2", "mirror"),
+    "earth": ("spin", "clouds", "color", "color2"),
+    "agent": ("sensor", "color", "color2"),
+    "sunpath": ("color", "color2", "background", "night"),
+    "image": ("src", "fit", "slides", "seconds", "speed"),
+    "weather": ("field", "format", "color", "font_size"),
+    "icon": ("icon", "finish", "color", "sensor"),
+    "calendar": ("first_day", "color", "color2", "muted"),
+    "list": ("items", "style", "sort", "color2", "color_rules"),
+    "module": ("module", "source", "finish", "color", "card"),
+}
+
+# The look of the whole panel, block by block (render.look); a block that is
+# missing is off. The editor builds its settings from this table.
+LOOK_SPECS: dict[str, dict[str, tuple[str, Any]]] = {
+    # SPUR II's grid: thin lines every ``spacing`` px, every ``major``-th one
+    # stronger (0: none); colours empty: the palette's grid colours, else a
+    # breath away from the background
+    "grid": {
+        "spacing": ("int", 8),
+        "major": ("int", 5),
+        "color": ("color?", None),
+        "major_color": ("color?", None),
+        "alpha": ("number", 1.0),
+    },
+}
+LOOK_RANGES: dict[tuple[str, str], tuple[float, float]] = {
+    ("grid", "spacing"): (2, 400),
+    ("grid", "major"): (0, 50),
+    ("grid", "alpha"): (0, 1),
+}
+# What themes said of things that are gone (after 0.8.0rc2: the panel light, the depth dust and
+# the ridges of rects): dropped without a word, so a theme from before loads as it did
+GONE_LOOK = frozenset({"light", "dust"})
+GONE_FIELDS: dict[str, frozenset[str]] = {"rect": frozenset({"ridge"})}
+
+_PALETTE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+@dataclass
+class Theme:
+    name: str
+    width: int
+    height: int
+    widgets: list[dict[str, Any]]
+    author: str = ""
+    license: str = ""
+    description: str = ""
+    # A set the theme belongs to, kept apart in galleries; "" = Libre Panel's own or the
+    # user's.
+    collection: str = ""
+    background_color: str = "#000000"
+    background_image: str | None = None
+    # A gradient over the colour and under the picture: (from, to), top to bottom (or left to
+    # right: background_direction "horizontal"), drawn by the renderer without bands
+    background_gradient: tuple[str, str] | None = None
+    background_direction: str = "vertical"
+    refresh_ms: int = 1000
+    model: str = "custom"
+    palette: dict[str, str] = field(default_factory=dict)
+    font: str = DEFAULT_FONT
+    smoothing_ms: int = 400
+    screen: dict[str, Any] | None = None  # {"name": ..., "options": {...}}: a plugin draws
+    # messages from services: where, how long, which kinds not, and a plugin style
+    toast: dict[str, Any] = field(default_factory=lambda: dict(TOAST_DEFAULTS))
+    # The grid modules sit on ({} = automatic) and the look's style (cards,
+    # corners, glow, fonts); None = not set in the theme.
+    grid: dict[str, int] | None = None
+    style: dict[str, Any] | None = None
+    # The panel's look by block ("grid"; render.look); {} = none.
+    look: dict[str, Any] = field(default_factory=dict)
+    # What the person may switch on or off in this theme: {"frames": {"label": "...", "on":
+    # true}}; widgets that need ``switch.frames`` (or ``!switch.frames``) show by it
+    switches: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # editor only: the modules detached into widgets, by their id (the widgets' ``group``), as
+    # they were: the editor can put one back together
+    detached: dict[str, dict[str, Any]] = field(default_factory=dict)
+    root: Path | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def orientation(self) -> str:
+        return orientation_of(self.width, self.height)
+
+    @property
+    def toast_anchor(self) -> str:
+        return self.toast["anchor"]
+
+    def _background(self) -> dict[str, Any]:
+        background: dict[str, Any] = {
+            "color": self.background_color,
+            "image": self.background_image,
+        }
+        if self.background_gradient is not None:
+            background["gradient"] = list(self.background_gradient)
+            if self.background_direction != "vertical":
+                background["gradient_direction"] = self.background_direction
+        return background
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "format": THEME_FORMAT,
+            "name": self.name,
+            "author": self.author,
+            "license": self.license,
+            "description": self.description,
+            **({"collection": self.collection} if self.collection else {}),
+            "display": {
+                "model": self.model,
+                "orientation": self.orientation,
+                "width": self.width,
+                "height": self.height,
+            },
+            "palette": dict(self.palette),
+            "font": self.font,
+            "background": self._background(),
+            "refresh_ms": self.refresh_ms,
+            "animation": {"smoothing_ms": self.smoothing_ms},
+            "widgets": deepcopy(self.widgets),
+        }
+        if self.grid is not None:
+            data["grid"] = dict(self.grid)
+        if self.style is not None:
+            data["style"] = dict(self.style)
+        if self.look is not None:
+            data["look"] = deepcopy(self.look)
+        if self.screen is not None:
+            data["screen"] = deepcopy(self.screen)
+        if self.look:
+            data["look"] = deepcopy(self.look)
+        if self.switches:
+            data["switches"] = deepcopy(self.switches)
+        if self.detached:
+            data["detached"] = deepcopy(self.detached)
+        toast = {k: deepcopy(v) for k, v in self.toast.items() if v != TOAST_DEFAULTS[k]}
+        if toast:
+            data["toast"] = toast
+        return data
+
+
+@cache
+def builtin_themes_dir() -> Path:
+    """The themes that come with Libre Panel. Found once: where they lie does not change while
+    it runs, and resolving the path on disk, which the main loop's theme lookup asked for with
+    every frame, took a tenth of its time (more on Windows)."""
+    return Path(__file__).resolve().parent.parent / "themes"
+
+
+def valid_theme_name(name: str) -> bool:
+    return bool(_NAME_RE.match(name)) and ".." not in name
+
+
+def resolve_asset(root: Path, rel: str) -> Path:
+    """Resolve an asset path inside a theme folder, refusing anything outside it."""
+    if not rel or not isinstance(rel, str):
+        raise ThemeError("empty asset path")
+    if Path(rel).is_absolute() or PureWindowsPath(rel).drive or rel.startswith(("/", "\\")):
+        raise ThemeError(f"asset path must be relative to the theme folder: {rel!r}")
+    base = root.resolve()
+    target = (base / rel).resolve()
+    if not target.is_relative_to(base):
+        raise ThemeError(f"asset path leaves the theme folder: {rel!r}")
+    return target
+
+
+COVER_COLOR = "@cover"  # a colour that is the colour of the cover on show, not a palette entry
+
+
+def _check_color(
+    value: Any, where: str, optional: bool, palette: dict[str, str] | None = None
+) -> Any:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str):
+        raise ThemeError(f"{where}: expected a color string like '#22d3ee'")
+    if value == COVER_COLOR:  # live: what the cover on show carries (render.cover)
+        return value
+    if value.startswith("@"):
+        if palette is None:
+            raise ThemeError(f"{where}: palette references are not allowed here, use a colour")
+        if value[1:] not in palette:
+            raise ThemeError(f"{where}: {value!r} is not in the theme palette")
+        return value
+    try:
+        ImageColor.getrgb(value)
+    except ValueError as exc:
+        raise ThemeError(f"{where}: invalid color {value!r}") from exc
+    return value
+
+
+def _check_font(value: str, where: str, root: Path | None) -> str:
+    if value.startswith(BUILTIN_PREFIX):
+        if builtin_font_path(value) is None:
+            names = ", ".join(BUILTIN_PREFIX + n for n in builtin_fonts())
+            raise ThemeError(f"{where}: unknown built-in font {value!r} (available: {names})")
+    elif value and root is not None:
+        resolve_asset(root, value)
+    return value
+
+
+def _coerce(kind: str, value: Any, where: str, palette: dict[str, str] | None = None) -> Any:
+    optional = kind.endswith("?")
+    base = kind.rstrip("?")
+    if value is None and optional:
+        return None
+    if base == "int":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ThemeError(f"{where}: expected an integer")
+        if not math.isfinite(value):  # 1e999 or NaN in the file
+            raise ThemeError(f"{where}: expected an integer, not {value}")
+        return int(value)
+    if base == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ThemeError(f"{where}: expected a number")
+        return value
+    if base == "bool":
+        if not isinstance(value, bool):
+            raise ThemeError(f"{where}: expected true/false")
+        return value
+    if base == "color":
+        return _check_color(value, where, optional, palette)
+    if base == "icon":
+        if value not in ICON_NAMES:
+            raise ThemeError(f"{where}: unknown icon {value!r}")
+        return value
+    if base.startswith("enum:"):
+        options = base[5:].split("|")
+        if value not in options:
+            raise ThemeError(f"{where}: must be one of {', '.join(options)}")
+        return value
+    if base == "box":  # [x, y, w, h] on the panel
+        four = isinstance(value, list) and len(value) == 4
+        if not four or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in value):
+            raise ThemeError(f"{where}: expected [x, y, w, h]")
+        box = [int(v) for v in value]
+        if box[2] <= 0 or box[3] <= 0:
+            raise ThemeError(f"{where}: its width and height must be above 0")
+        return box
+    if base == "rules":
+        if not isinstance(value, list):
+            raise ThemeError(f"{where}: expected a list of rules")
+        rules = []
+        for i, rule in enumerate(value):
+            if not isinstance(rule, dict) or "above" not in rule or "color" not in rule:
+                raise ThemeError(f"{where}[{i}]: rule needs 'above' and 'color'")
+            rules.append(
+                {
+                    "above": _coerce("number", rule["above"], f"{where}[{i}].above"),
+                    "color": _check_color(rule["color"], f"{where}[{i}].color", False, palette),
+                }
+            )
+        return rules
+    # string, text, sensor, format, font, asset
+    if not isinstance(value, str):
+        raise ThemeError(f"{where}: expected a string")
+    return value
+
+
+_BASE_KINDS = {
+    "int", "number", "bool", "color", "icon", "rules",
+    "string", "text", "sensor", "format", "font", "asset",
+}  # fmt: skip
+
+
+def valid_kind(kind: Any) -> bool:
+    """A field kind the loader and the editor know (plugins declare their fields with these)."""
+    if not isinstance(kind, str):
+        return False
+    base = kind.rstrip("?")
+    return base in _BASE_KINDS or (base.startswith("enum:") and len(base) > 5)
+
+
+def _plugin(kind: str, name: str) -> Any:
+    if kind == "toasts":  # the built-in styles (card, band) and plugins' alike
+        from libre_panel.render.overlays import toast_style
+
+        return toast_style(name)
+    from libre_panel.plugins.loader import registry
+
+    return registry().get(kind, name)
+
+
+def _check_paths(
+    spec: dict[str, tuple[str, Any]], values: dict[str, Any], where: str, root: Path | None
+) -> None:
+    """Fonts and assets named in plugin fields stay inside the theme folder too."""
+    for key, (kind, _default) in spec.items():
+        value = values.get(key)
+        if not value or not isinstance(value, str):
+            continue
+        if kind.rstrip("?") == "font":
+            _check_font(value, f"{where}.{key}", root)
+        elif kind.rstrip("?") == "asset" and root is not None:
+            resolve_asset(root, value)
+
+
+def normalize_widget(
+    raw: Any, index: int, palette: dict[str, str] | None = None, root: Path | None = None
+) -> tuple[dict[str, Any], list[str]]:
+    where = f"widgets[{index}]"
+    if not isinstance(raw, dict):
+        raise ThemeError(f"{where}: expected an object")
+    wtype = raw.get("type")
+    plugin = None
+    if isinstance(wtype, str) and wtype in WIDGET_SPECS:
+        spec = {**_COMMON, **WIDGET_SPECS[wtype]}
+    elif isinstance(wtype, str) and "." in wtype:  # a plugin's widget type
+        plugin = _plugin("widgets", wtype)
+        if plugin is None:
+            return _missing_plugin_widget(raw, wtype, index, where, palette)
+        spec = {**_COMMON, **plugin.spec}
+    else:
+        raise ThemeError(f"{where}: unknown widget type {wtype!r}")
+    widget: dict[str, Any] = {"type": wtype}
+    for key, (kind, default) in spec.items():
+        value = raw.get(key, deepcopy(default))
+        widget[key] = _coerce(kind, value, f"{where}.{key}", palette)
+    if not 0 <= widget["opacity"] <= 1:
+        raise ThemeError(f"{where}.opacity: must be between 0 and 1")
+    if not 0 <= widget["glow"] <= 1:
+        raise ThemeError(f"{where}.glow: must be between 0 and 1")
+    if not -360 <= widget["rotate"] <= 360:
+        raise ThemeError(f"{where}.rotate: must be between -360 and 360")
+    for key in ("glow_radius", "shadow_blur", "backdrop_blur", "blur"):
+        if key in widget and not 0 <= widget[key] <= BLUR_MAX:
+            raise ThemeError(f"{where}.{key}: must be between 0 and {BLUR_MAX}")
+    if wtype == "bar" and not 0 <= widget["rising"] <= 1:
+        raise ThemeError(f"{where}.rising: must be between 0 and 1")
+    if wtype == "fan" and widget["max_rpm"] <= 0:
+        raise ThemeError(f"{where}.max_rpm: must be above 0")
+    if not widget["id"]:
+        widget["id"] = f"{wtype}-{index + 1}"
+    if plugin is not None:
+        _check_paths(plugin.spec, widget, where, root)
+    unknown = sorted(set(raw) - set(spec) - {"type"} - GONE_FIELDS.get(wtype, frozenset()))
+    warnings = [f"{where}: ignoring unknown field {k!r}" for k in unknown]
+    return widget, warnings
+
+
+def _missing_plugin_widget(
+    raw: dict[str, Any], wtype: str, index: int, where: str, palette: dict[str, str] | None
+) -> tuple[dict[str, Any], list[str]]:
+    """Kept as it is, so saving the theme loses nothing; it is not drawn."""
+    widget = deepcopy(raw)
+    for key, (kind, default) in _COMMON.items():
+        widget[key] = _coerce(kind, raw.get(key, deepcopy(default)), f"{where}.{key}", palette)
+    if not widget["id"]:
+        widget["id"] = f"{wtype}-{index + 1}"
+    return widget, [f"{where}: widget type {wtype!r} needs a plugin that is not installed"]
+
+
+TOAST_ANCHORS = ("top-right", "top-left", "bottom-right", "bottom-left", "top", "bottom")
+
+
+TOAST_DEFAULTS: dict[str, Any] = {
+    "anchor": "top-right",
+    "seconds": 4.0,
+    "queue": True,  # false: the same or a higher rank takes over, a lower one is dropped
+    "off": [],
+    "style": "",
+    "options": {},
+}
+
+
+def _parse_toast(
+    raw: Any, palette: dict[str, str], root: Path | None, warnings: list[str]
+) -> dict[str, Any]:
+    """``"toast": {"anchor": "bottom-right", "seconds": 5, "off": ["music"],
+    "style": "myplugin.band", "options": {...}}``: messages from services."""
+    toast = deepcopy(TOAST_DEFAULTS)
+    if raw is None:
+        return toast
+    if not isinstance(raw, dict):
+        raise ThemeError("toast must be an object")
+    anchors = "enum:" + "|".join(TOAST_ANCHORS)
+    toast["anchor"] = _coerce(anchors, raw.get("anchor", "top-right"), "toast.anchor")
+    seconds = _coerce("number", raw.get("seconds", 4.0), "toast.seconds")
+    if not 0.5 <= seconds <= 60:
+        raise ThemeError("toast.seconds: must be between 0.5 and 60")
+    toast["seconds"] = seconds
+    toast["queue"] = _coerce("bool", raw.get("queue", True), "toast.queue")
+    off = raw.get("off", [])
+    if not isinstance(off, list) or not all(isinstance(kind, str) for kind in off):
+        raise ThemeError('toast.off: expected a list of kinds, e.g. ["music"]')
+    toast["off"] = list(off)
+    toast["style"] = _coerce("string", raw.get("style", ""), "toast.style")
+    if toast["style"]:
+        given = raw.get("options", {}) or {}
+        toast["options"] = _plugin_options(
+            "toasts", toast["style"], given, "toast", palette, root, warnings
+        )
+    return toast
+
+
+def _plugin_options(
+    kind: str,
+    name: str,
+    given: Any,
+    where: str,
+    palette: dict[str, str],
+    root: Path | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """A plugin's options with its defaults, checked against its schema."""
+    if not isinstance(given, dict):
+        raise ThemeError(f"{where}.options must be an object")
+    plugin = _plugin(kind, name)
+    if plugin is None:
+        warnings.append(f"{where} {name!r} needs a plugin that is not installed")
+        return deepcopy(given)
+    options = {
+        key: _coerce(kind_of, given.get(key, deepcopy(default)), f"{where}.options.{key}", palette)
+        for key, (kind_of, default) in plugin.options.items()
+    }
+    _check_paths(plugin.options, options, f"{where}.options", root)
+    warnings.extend(
+        f"{where}.options: ignoring unknown option {k!r}" for k in sorted(set(given) - set(options))
+    )
+    return options
+
+
+def _parse_screen(
+    raw: Any, palette: dict[str, str], root: Path | None, warnings: list[str]
+) -> dict[str, Any] | None:
+    """``"screen": {"name": ..., "options": {...}}``: a plugin draws the whole frame."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ThemeError("screen must be an object with a name")
+    name = _coerce("string", raw.get("name", ""), "screen.name")
+    if not name:
+        raise ThemeError("screen.name: missing")
+    given = raw.get("options", {}) or {}
+    options = _plugin_options("screens", name, given, "screen", palette, root, warnings)
+    return {"name": name, "options": options}
+
+
+def _parse_grid(raw: Any) -> dict[str, int] | None:
+    """``"grid": {"columns": 8, "rows": 2, "gap": 16, "margin": 24}`` (0 = automatic), with
+    up to :data:`GRID_CELLS` columns and rows."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ThemeError("grid must be an object")
+    grid = {}
+    for key, default in GRID_DEFAULTS.items():
+        value = _coerce("int", raw.get(key, default), f"grid.{key}")
+        if not 0 <= value <= (GRID_CELLS if key in ("columns", "rows") else 200):
+            raise ThemeError(f"grid.{key}: out of range")
+        grid[key] = value
+    return grid
+
+
+def _parse_style(raw: Any, root: Path | None) -> dict[str, Any] | None:
+    """``"style"``: how modules look (cards, corners, glow, fonts)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ThemeError("style must be an object")
+    style = {}
+    kinds = {
+        "card": "enum:" + "|".join(CARDS),
+        "radius": "int",
+        "glow": "number",
+        "backdrop": "enum:" + "|".join(BACKDROPS),
+        "display_font": "string",
+        "text_font": "string",
+        "card_opacity": "number",
+    }
+    for key, kind in kinds.items():
+        style[key] = _coerce(kind, raw.get(key, STYLE_DEFAULTS[key]), f"style.{key}")
+    if not 0 <= style["glow"] <= 1:
+        raise ThemeError("style.glow: must be between 0 and 1")
+    if not CARD_OPACITY_MIN <= style["card_opacity"] <= 1:
+        raise ThemeError(f"style.card_opacity: must be between {CARD_OPACITY_MIN} and 1")
+    if not 0 <= style["radius"] <= 100:
+        raise ThemeError("style.radius: must be between 0 and 100")
+    for key in ("display_font", "text_font"):
+        style[key] = _check_font(style[key] or DEFAULT_FONT, f"style.{key}", root)
+    return style
+
+
+def _parse_look(raw: Any, palette: dict[str, str], warnings: list[str]) -> dict[str, Any]:
+    """``"look": {"grid": {...}}``: the panel's look, block by block. A missing
+    block (or ``false``) is off, ``true`` or ``{}`` is on with the defaults.
+    Blocks this version does not know are kept as they are, so saving loses
+    nothing; those of things that are gone (GONE_LOOK) are dropped."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ThemeError("look must be an object")
+    look: dict[str, Any] = {}
+    for name, given in raw.items():
+        spec = LOOK_SPECS.get(name)
+        if name in GONE_LOOK:
+            continue
+        if spec is None:
+            warnings.append(f"look: ignoring unknown block {name!r}")
+            look[name] = deepcopy(given)
+            continue
+        if given is None or given is False:
+            continue
+        if given is True:
+            given = {}
+        if not isinstance(given, dict):
+            raise ThemeError(f"look.{name} must be an object")
+        block = {}
+        for key, (kind, default) in spec.items():
+            value = _coerce(kind, given.get(key, deepcopy(default)), f"look.{name}.{key}", palette)
+            low, high = LOOK_RANGES.get((name, key), (None, None))
+            if low is not None and not low <= value <= high:
+                raise ThemeError(f"look.{name}.{key}: must be between {low} and {high}")
+            block[key] = value
+        warnings.extend(
+            f"look.{name}: ignoring unknown field {k!r}" for k in sorted(set(given) - set(spec))
+        )
+        look[name] = block
+    return look
+
+
+def _finish_warnings(widgets: list[dict[str, Any]], warnings: list[str]) -> None:
+    """One warning per widget type (or icon) whose finish is not there: drawn flat."""
+    if all(widget.get("finish", FINISHES[0]) in (FINISHES[0], AUTO) for widget in widgets):
+        return
+    from libre_panel.render.finish import supports  # the finishes are code: loaded when named
+
+    told = set()
+    for widget in widgets:
+        name = widget.get("finish", FINISHES[0])
+        if name in (FINISHES[0], AUTO) or supports(widget):
+            continue
+        what = f"the icon {widget['icon']!r}" if widget["type"] == "icon" else widget["type"]
+        if (name, what) not in told:
+            told.add((name, what))
+            warnings.append(f"finish {name!r} is not available for {what}; drawn flat")
+
+
+SWITCH = "switch."  # a need on one of the theme's switches: "switch.frames"
+MAX_SWITCHES = 8
+
+
+def _parse_switches(raw: Any) -> dict[str, dict[str, Any]]:
+    """``"switches": {"frames": {"label": "Frames around every part", "on": true}}``: what
+    the person may switch in this theme (Look shows them), and how each is to begin with."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or len(raw) > MAX_SWITCHES:
+        raise ThemeError(f"switches: an object of at most {MAX_SWITCHES} name: {{label, on}}")
+    switches = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str) or not _PALETTE_NAME.match(name):
+            raise ThemeError(f"switches: invalid name {name!r} (use a-z, 0-9, - and _)")
+        if not isinstance(spec, dict):
+            raise ThemeError(f'switches.{name}: {{"label": "...", "on": true}}')
+        switches[name] = {
+            "label": _coerce("string", spec.get("label", name), f"switches.{name}.label"),
+            "on": _coerce("bool", spec.get("on", True), f"switches.{name}.on"),
+        }
+    return switches
+
+
+MAX_DETACHED = 64
+
+
+def _parse_detached(
+    raw: Any, palette: dict[str, str], root: Path | None, warnings: list[str]
+) -> dict[str, dict[str, Any]]:
+    """``"detached": {"<id>": {module}}``: modules the editor turned into widgets, as they were
+    (the widgets with their id as ``group`` are what came of them). One that is no module, or
+    does not load, is left out: it cannot be put back together, nothing else changes."""
+    if not isinstance(raw, dict):
+        return {}
+    kept: dict[str, dict[str, Any]] = {}
+    for name, module in list(raw.items())[:MAX_DETACHED]:
+        if not isinstance(module, dict) or module.get("type") != "module":
+            continue
+        try:
+            widget, _ = normalize_widget(module, 0, palette, root)
+        except ThemeError as exc:
+            warnings.append(f"detached.{name}: {exc}")
+            continue
+        kept[str(name)] = widget
+    return kept
+
+
+def parse_theme(data: Any, root: Path | None = None) -> Theme:
+    if not isinstance(data, dict):
+        raise ThemeError("theme.json must contain an object")
+    if data.get("format") != THEME_FORMAT:
+        raise ThemeError(
+            f"unsupported theme format {data.get('format')!r}, expected {THEME_FORMAT}"
+        )
+    display = data.get("display", {})
+    if not isinstance(display, dict):
+        raise ThemeError("display must be an object")
+    model_id = _coerce("string", display.get("model", "custom"), "display.model")
+    panel = find_model(model_id)
+    if model_id != "custom" and panel is None:
+        raise ThemeError(f"display.model: unknown panel model {model_id!r}")
+    if panel is not None:
+        orientation = _coerce(
+            "enum:landscape|portrait",
+            display.get("orientation", "landscape"),
+            "display.orientation",
+        )
+        width, height = panel.size(orientation)
+        for key, expected in (("width", width), ("height", height)):
+            if key in display and display[key] != expected:
+                raise ThemeError(
+                    f"display.{key} is {display[key]} but {panel.label} in {orientation} "
+                    f"is {width}x{height}"
+                )
+    else:
+        width = _coerce("int", display.get("width"), "display.width")
+        height = _coerce("int", display.get("height"), "display.height")
+    if not (16 <= width <= 4096 and 16 <= height <= 4096):
+        raise ThemeError("display size must be between 16 and 4096 pixels")
+    raw_palette = data.get("palette", {}) or {}
+    if not isinstance(raw_palette, dict):
+        raise ThemeError("palette must be an object of name: color")
+    palette: dict[str, str] = {}
+    for name, color in raw_palette.items():
+        if not isinstance(name, str) or not _PALETTE_NAME.match(name):
+            raise ThemeError(f"palette: invalid name {name!r} (use a-z, 0-9, - and _)")
+        palette[name] = _check_color(color, f"palette.{name}", False)  # no references here
+    font = _check_font(
+        _coerce("string", data.get("font", DEFAULT_FONT), "font") or DEFAULT_FONT, "font", root
+    )
+    animation = data.get("animation", {}) or {}
+    if not isinstance(animation, dict):
+        raise ThemeError("animation must be an object")
+    smoothing_ms = _coerce("int", animation.get("smoothing_ms", 400), "animation.smoothing_ms")
+    if not 0 <= smoothing_ms <= 5000:
+        raise ThemeError("animation.smoothing_ms: must be between 0 and 5000")
+    background = data.get("background", {}) or {}
+    if not isinstance(background, dict):
+        raise ThemeError('background must be an object, e.g. {"color": "#101418"}')
+    bg_color = _check_color(background.get("color", "#000000"), "background.color", False, palette)
+    bg_image = background.get("image")
+    if bg_image is not None:
+        bg_image = _coerce("string", bg_image, "background.image")
+        if root is not None:
+            resolve_asset(root, bg_image)
+    bg_gradient = background.get("gradient")
+    if bg_gradient is not None:
+        if not isinstance(bg_gradient, list) or len(bg_gradient) != 2:
+            raise ThemeError('background.gradient: two colours, e.g. ["#0A0E13", "#06090D"]')
+        bg_gradient = tuple(
+            _check_color(c, "background.gradient", False, palette) for c in bg_gradient
+        )
+    bg_direction = background.get("gradient_direction", "vertical")
+    if bg_direction not in ("vertical", "horizontal"):
+        raise ThemeError('background.gradient_direction: "vertical" or "horizontal"')
+    refresh_ms = _coerce("int", data.get("refresh_ms", 1000), "refresh_ms")
+    if refresh_ms < 100:
+        raise ThemeError("refresh_ms must be at least 100")
+
+    raw_widgets = data.get("widgets", [])
+    if not isinstance(raw_widgets, list):
+        raise ThemeError("widgets must be a list")
+    widgets, warnings, seen = [], [], set()
+    for i, raw in enumerate(raw_widgets):
+        widget, w = normalize_widget(raw, i, palette, root)
+        if widget["id"] in seen:
+            raise ThemeError(f"widgets[{i}]: duplicate id {widget['id']!r}")
+        seen.add(widget["id"])
+        if widget.get("font"):
+            _check_font(widget["font"], f"widgets[{i}].font", root)
+        if root is not None and widget.get("src") and not widget["src"].startswith("@"):
+            resolve_asset(root, widget["src"])  # "@media.cover": a picture a sensor has
+        widgets.append(widget)
+        warnings.extend(w)
+    _finish_warnings(widgets, warnings)
+
+    return Theme(
+        name=_coerce("string", data.get("name", "Untitled"), "name"),
+        author=_coerce("string", data.get("author", ""), "author"),
+        license=_coerce("string", data.get("license", ""), "license"),
+        description=_coerce("string", data.get("description", ""), "description"),
+        collection=_coerce("string", data.get("collection", ""), "collection"),
+        width=width,
+        height=height,
+        background_color=bg_color,
+        background_image=bg_image,
+        background_gradient=bg_gradient,
+        background_direction=bg_direction,
+        refresh_ms=refresh_ms,
+        model=model_id,
+        palette=palette,
+        font=font,
+        smoothing_ms=smoothing_ms,
+        widgets=widgets,
+        grid=_parse_grid(data.get("grid")),
+        style=_parse_style(data.get("style"), root),
+        screen=_parse_screen(data.get("screen"), palette, root, warnings),
+        toast=_parse_toast(data.get("toast"), palette, root, warnings),
+        look=_parse_look(data.get("look"), palette, warnings),
+        switches=_parse_switches(data.get("switches")),
+        detached=_parse_detached(data.get("detached"), palette, root, warnings),
+        root=root,
+        warnings=warnings,
+    )
+
+
+def load_theme(folder: Path) -> Theme:
+    path = folder / THEME_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ThemeError(f"no {THEME_FILENAME} in {folder}") from exc
+    except json.JSONDecodeError as exc:
+        raise ThemeError(f"{path}: {exc}") from exc
+    return parse_theme(data, root=folder)
+
+
+def plugin_theme_dirs() -> list[Path]:
+    """Folders of themes that plugins bring (``libre_panel.themes``)."""
+    from libre_panel.plugins.loader import registry
+
+    installed = registry()
+    folders = (installed.get("themes", name) for name in installed.names("themes"))
+    return [folder for folder in folders if folder is not None and folder.is_dir()]
+
+
+def _search_dirs() -> list[Path]:
+    # User themes first so a user can shadow a plugin's or a built-in theme of
+    # the same name; a plugin's shadows a built-in one.
+    return [user_themes_dir(), *plugin_theme_dirs(), builtin_themes_dir()]
+
+
+def find_theme(name: str) -> Path:
+    if not valid_theme_name(name):
+        raise ThemeError(f"invalid theme name {name!r}")
+    for base in _search_dirs():
+        folder = base / name
+        if (folder / THEME_FILENAME).is_file():
+            return folder
+    raise ThemeError(f"theme {name!r} not found")
+
+
+VERTICAL = "-vertical"  # "lumen-vertical" is Lumen laid out for a panel that stands on end
+# "lumen-1920x720" is Lumen laid out for a panel of that size (the 12.3"): the version for a
+# panel's own size comes first, then the one for the way it is mounted
+_SIZED = re.compile(r"^(.+)-(\d{2,5})x(\d{2,5})$")
+
+
+def _installed(name: str) -> bool:
+    try:
+        find_theme(name)
+    except ThemeError:
+        return False
+    return True
+
+
+def version_stem(name: str) -> str:
+    """The name the versions of ``name`` share, to which a size or "-vertical" is added:
+    "lumen" for "lumen-1920x720" and "lumen-vertical"; a pair version keeps its ending,
+    "lumen-pair" for "lumen-pair-1920x720"."""
+    sized = _SIZED.match(name)
+    return sized[1] if sized else name[: -len(VERTICAL)] if name.endswith(VERTICAL) else name
+
+
+def version_base(name: str) -> str | None:
+    """The theme ``name`` is a version of ("lumen" for "lumen-vertical", "lumen-1920x720" and
+    "lumen-pair"), as the name says; None for a theme that is no version."""
+    sized = _SIZED.match(name)
+    if sized:
+        return sized[1]
+    for ending in (VERTICAL, PAIR):
+        if name.endswith(ending) and len(name) > len(ending):
+            return name[: -len(ending)]
+    return None
+
+
+# "lumen-pair" is Lumen while a companion shows beside it on another panel (Lumen Companion):
+# what the companion shows is left out ("lumen-pair-1920x720" on the 12.3")
+PAIR = "-pair"
+
+
+def _root(name: str) -> str:
+    """The theme a version is one of, through all its endings ("lumen" for
+    "lumen-pair-1920x720")."""
+    while (base := version_base(name)) is not None:
+        name = base
+    return name
+
+
+def pair_version(shown: str) -> str | None:
+    """The version of ``shown`` (a theme in its version for the panel: theme_for) for a panel
+    with a companion beside it, where that is installed: "lumen-pair-1920x720" for
+    "lumen-1920x720", "lumen-pair" for "lumen"; None for a theme without one."""
+    if is_companion(shown) or PAIR + "-" in shown or shown.endswith(PAIR):
+        return None
+    base = version_base(shown) or shown
+    paired = f"{base}{PAIR}{shown[len(base) :]}"
+    return paired if _installed(paired) else None
+
+
+_PAIRED = re.compile(r"-pair(?=(-vertical|-\d+x\d+)?$)")
+
+
+def unpaired_version(shown: str) -> str | None:
+    """The version of the pair version ``shown`` for a panel without a companion beside it,
+    where that is installed: "lumen-1920x720" for "lumen-pair-1920x720" (put on the panel from
+    Design while a companion ran beside it); None for any other theme."""
+    if not _PAIRED.search(shown):
+        return None
+    alone = _PAIRED.sub("", shown, count=1)
+    return alone if alone and _installed(alone) else None
+
+
+def follows_first(follow: bool | None, theme: str) -> bool:
+    """Whether a panel beside the first shows the companion of the first panel's theme (Arena
+    Companion beside Arena) instead of its own ``theme``: as its ``[[panels]] follow`` says,
+    else (None, a config of 0.7) when its theme is a companion."""
+    return is_companion(theme) if follow is None else follow
+
+
+def companion_for(first: str) -> str | None:
+    """The companion of the theme the first panel shows ("arena-companion" while it shows
+    Arena, its pair version too), where one is installed; None else."""
+    root = _root(first)
+    if is_companion(root):
+        return None
+    name = f"{root}-companion"
+    return name if _installed(name) else None
+
+
+def with_accent(theme: Theme, colour: str | None) -> Theme:
+    """``theme`` in an accent colour of the person's (config.toml ``accent``, accent.py): the
+    palette's accent, and every entry in the same colour as it (Lumen's cpu), take
+    ``colour``; None: the theme as it is."""
+    base = theme.palette.get("accent")
+    if not colour or not base:
+        return theme
+    palette = {
+        name: colour if value.lower() == base.lower() else value
+        for name, value in theme.palette.items()
+    }
+    return replace(theme, palette=palette)
+
+
+CARD_OPACITY_MIN = 0.4  # cards that cover less: what is on them stands on the background
+
+
+def with_card_opacity(theme: Theme, percent: int) -> Theme:
+    """``theme`` with cards that cover ``percent`` % of the background (config.toml
+    ``card_opacity``): the module cards' surface and the frames in the theme's surface colour
+    (``@surface``, Lumen's), not what is on them; 0: as the theme has them (its style's
+    ``card_opacity``, 1 where it has none)."""
+    if percent <= 0:
+        return theme
+    style = {**STYLE_DEFAULTS, **(theme.style or {})}
+    style["card_opacity"] = max(CARD_OPACITY_MIN, percent / 100)
+    return replace(theme, style=style)
+
+
+def with_light_colours(theme: Theme, on: bool) -> Theme:
+    """``theme`` in light colours for a white PC (config.toml ``light_colours``,
+    theme.light_colours); off: as it is."""
+    if not on:
+        return theme
+    from libre_panel.theme.light_colours import light_theme
+
+    return light_theme(theme)
+
+
+_COMPANION = re.compile(r"-companion(-vertical|-\d+x\d+)?$")
+
+
+def is_companion(name: str) -> bool:
+    """Whether the theme ``name`` is made to go beside another on a second panel (Lumen
+    Companion, its versions too): kept for that, as the round report is for its page."""
+    return bool(_COMPANION.search(name))
+
+
+_AGENTS = re.compile(r"^agents(-|$)")
+
+
+def is_agents_screen(name: str) -> bool:
+    """Whether the theme ``name`` is a screen of the AI agents (Agents, Agents Claude, their
+    versions): kept apart from the panel's first themes, as it shows nothing until AI activity
+    is set up."""
+    return bool(_AGENTS.search(name))
+
+
+def with_look(theme: Theme, source: Theme | None) -> Theme:
+    """``theme`` in the look of ``source``, for a panel beside the first in the first panel's
+    look (config.toml ``[[panels]] same_look``): the colours of its palette, by name (and
+    those only ``theme`` has stay), its background colour, its fonts and how its modules are
+    framed (``style``: cards, corners, glow). What is where, the pictures and the effects
+    stay ``theme``'s; so does a font of ``source``'s own folder, which ``theme`` cannot reach.
+    None, or ``theme`` itself: the theme as it is."""
+    if source is None or (source.root is not None and source.root == theme.root):
+        return theme
+
+    def reachable(font: str) -> bool:
+        return not font or font.startswith(BUILTIN_PREFIX)
+
+    style = theme.style
+    if source.style is not None:
+        style = {**(theme.style or {}), **source.style}
+        for key in ("display_font", "text_font"):
+            if not reachable(source.style.get(key, "")):
+                style[key] = (theme.style or STYLE_DEFAULTS).get(key) or DEFAULT_FONT
+    return replace(
+        theme,
+        palette={**theme.palette, **source.palette},
+        background_color=source.background_color,
+        font=source.font if reachable(source.font) else theme.font,
+        style=style,
+    )
+
+
+def switches_for(theme: Theme, chosen: dict[str, dict[str, bool]]) -> dict[str, bool]:
+    """The person's choice of the switches of ``theme``: config.toml's ``[switches]`` for every
+    theme ("*"), and before it ``[switches.<theme>]``, by the theme its versions are made from
+    (``[switches.lumen]`` holds for "lumen-1920x720")."""
+    name = theme.root.name if theme.root is not None else ""
+    return {**chosen.get("*", {}), **chosen.get(version_base(name) or name, {})}
+
+
+def theme_for(name: str, orientation: str, size: tuple[int, int] | None = None) -> str:
+    """The version of the theme ``name`` for a panel mounted ``orientation`` ("landscape",
+    "portrait"; "" leaves it to the theme) whose frames are ``size`` (if known): its version for
+    that size ("lumen-1920x720" on the 12.3"), else "lumen-vertical" for "lumen" on a panel that
+    stands on end and the other way round, where that version is installed; else ``name``."""
+    sized = _SIZED.match(name)
+    if sized and size is not None and (int(sized[2]), int(sized[3])) != tuple(size):
+        if _installed(sized[1]):  # a version for another size: the theme it is one of
+            name = sized[1]
+    if size is not None:
+        own = f"{version_stem(name)}-{size[0]}x{size[1]}"
+        if own != name and _installed(own):
+            return own
+        if own == name:
+            return name
+    if orientation == "portrait" and not name.endswith(VERTICAL):
+        other = name + VERTICAL
+    elif orientation == "landscape" and name.endswith(VERTICAL):
+        other = name[: -len(VERTICAL)]
+    else:
+        return name
+    try:
+        find_theme(other)
+    except ThemeError:
+        return name
+    return other
+
+
+def list_themes() -> list[dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for base in reversed(_search_dirs()):
+        if not base.is_dir():
+            continue
+        for folder in sorted(base.iterdir()):
+            if (folder / THEME_FILENAME).is_file() and valid_theme_name(folder.name):
+                source = "user" if base == user_themes_dir() else "plugin"
+                found[folder.name] = {
+                    "id": folder.name,
+                    "builtin": source != "user",  # read-only: saved as a copy
+                    "source": "built-in" if base == builtin_themes_dir() else source,
+                    "path": str(folder),
+                }
+    return sorted(found.values(), key=lambda t: t["id"])
+
+
+def save_theme(name: str, data: dict[str, Any], source: str | None = None) -> Path:
+    """Validate and save a theme into the user themes directory.
+
+    When saving a copy of another theme, that theme's assets are copied along
+    so images and fonts keep working.
+    """
+    if not valid_theme_name(name):
+        raise ThemeError(f"invalid theme name {name!r}")
+    target = user_themes_dir() / name
+    if source and source != name and not target.exists():
+        src_folder = find_theme(source)
+        shutil.copytree(src_folder, target)
+    target.mkdir(parents=True, exist_ok=True)
+    theme = parse_theme(data, root=target)
+    try:
+        text = (json.dumps(theme.to_dict(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError as exc:  # half of an emoji (a lone surrogate) from a page's script
+        raise ThemeError(f"the theme holds text that is not valid Unicode ({exc.reason})") from exc
+    # a write that fails (a full disk) leaves the theme as it was, and the panel never reads
+    # half a file
+    tmp = target / (THEME_FILENAME + ".tmp")
+    tmp.write_bytes(text)
+    os.replace(tmp, target / THEME_FILENAME)
+    return target

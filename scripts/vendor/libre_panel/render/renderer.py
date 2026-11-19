@@ -1,0 +1,5604 @@
+"""Turns a theme plus a sensor snapshot into a frame.
+
+The theme editor uses this same renderer for its preview, so what the editor
+shows is exactly what the panel shows.
+
+Every widget is drawn into its own layer (shapes at 3x for smooth edges),
+effects (shadow, glow, opacity) are applied to that layer and the result is
+composited. Layers that did not change are reused from a cache, so a frame
+where only a few values moved costs little.
+"""
+
+from __future__ import annotations
+
+import calendar
+import itertools
+import json
+import logging
+import math
+import operator
+import queue
+import re
+import threading
+import time
+import weakref
+from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageOps
+
+from libre_panel import clock, i18n, timezones
+from libre_panel.config import DEFAULT_SYMBOLS, SYMBOL_PACKS
+from libre_panel.fonts import DEFAULT_FONT, builtin_font_path
+from libre_panel.fonts.fallback import cursive, truetype
+from libre_panel.icons import draw_icon, link_icon, weather_icon_name
+from libre_panel.render import cover, fan, fan_looks, kept, lists, moving
+from libre_panel.render import finish as finishes
+from libre_panel.render import scene as scenes
+from libre_panel.render.countdown import countdown_text
+from libre_panel.render.formatting import FormatError, auto_format, safe_format
+from libre_panel.render.kept import MB, Kept, cached, size_of
+from libre_panel.render.motion import MAX_POINTS, RATE, History, Motion, Spring, grid
+from libre_panel.render.motion import number as motion_number
+from libre_panel.sensors.base import TRACE_LAG_S, Snapshot, want
+from libre_panel.theme.model import COVER_COLOR, SWITCH, Theme, ThemeError, resolve_asset
+from libre_panel.theme.modules import SLOT_KINDS, slot_cards
+from libre_panel.theme.modules import expand as expand_modules
+
+log = logging.getLogger(__name__)
+
+# Sensor texts shown in the user's language on the panel.
+TRANSLATED_READINGS = {"weather.description", "battery.state", "moon.name", "media.state"}
+
+VOLUME, MUTED = "audio.volume", "audio.muted"
+VOLUME_GLIDE_MS = 320  # the volume's bars and rings: 95 % of a step after about a third of a second
+
+# Shapes are drawn at this scale and downsampled for smooth edges.
+SUPERSAMPLE = 3
+_ANCHORS = {"left": "la", "center": "ma", "right": "ra"}
+_DIGITS = "0123456789"
+
+Box = list[int]  # [x, y, w, h]
+RGBA = tuple[int, int, int, int]
+
+# A clock's changing digits (``digits``): how long they take after the second, by default,
+# and how far a rolling one moves, of the band its digits live in (as SPUR II's clocks)
+DIGITS_S = 0.42
+DIGITS_TRAVEL = 0.92
+
+
+@dataclass
+class Piece:
+    """A rendered widget: an RGBA layer placed at (x, y)."""
+
+    layer: Image.Image
+    x: int
+    y: int
+    box: Box | None = None  # hit box for the editor; defaults to the layer bounds
+    backdrop: Image.Image | None = None  # "L" mask: blur the canvas beneath first
+    backdrop_radius: int = 0
+    add: bool = False  # light: added onto what lies beneath (the card slot's line of light)
+    light: Piece | None = None  # light added onto the panel after the layer: a glow
+    # what it can change on the canvas, worked out once (Renderer._extent): a frame
+    # asks that of every piece for every region it composes
+    span: tuple[int, int, int, int] | None = field(default=None, init=False, compare=False)
+    # how an engine makes the layer itself, where it does (lit.py's Ring): for ``layer`` alone
+    # (a piece with another layer, turned or faded, goes as its pixels)
+    native: Any = field(default=None, compare=False)
+
+
+@dataclass
+class _Letters:
+    """A text laid out letter by letter (:meth:`Renderer._letters`)."""
+
+    size: tuple[int, int]  # the layer's
+    left: int  # where the layer goes
+    y: int
+    box: Box
+    glyphs: list[tuple[Image.Image, int, int] | None]  # each letter on the layer (None: a blank)
+    font: Any
+    # where each letter's ink lies in its picture (None: it has none, a space; False: not known,
+    # a finish's own letter): see Renderer._laid
+    inks: list[Any] | None = None
+
+
+class _Builder:
+    """One daemon thread that builds pieces for the renderer.
+
+    One thread, so fonts (FreeType faces are not thread-safe) are never used
+    twice at once; a daemon, so it can never keep the program alive. The graphs'
+    strips, which draw no text, have one of their own. ``gate`` runs before each
+    job: it waits for the gap between two frames (:meth:`Renderer._wait_for_gap`).
+    """
+
+    def __init__(self, name: str = "render-builder",
+                 gate: Callable[[], Any] | None = None) -> None:  # fmt: skip
+        self._gate = gate
+        self._jobs: queue.Queue[tuple[Future, Callable[[], Any]] | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._work, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, job: Callable[[], Any]) -> Future:
+        future: Future = Future()
+        self._jobs.put((future, job))
+        return future
+
+    def _work(self) -> None:
+        while (item := self._jobs.get()) is not None:
+            if self._gate is not None:
+                self._gate()
+            future, job = item
+            try:
+                future.set_result(job())
+            except Exception as exc:
+                future.set_exception(exc)
+
+    def close(self) -> None:
+        self._jobs.put(None)
+
+
+@dataclass(eq=False)
+class _Globe:
+    """A globe on show (Renderer._draw_earth): what it is (``key``), the moment it is lit
+    for, the piece it showed last (and its step, for one that turns) and the lighting under
+    way in the helper thread."""
+
+    key: tuple[Any, ...]
+    turning: Any = None  # render.earth.Turning, for a globe that turns
+    lit: float | None = None
+    piece: Piece | None = None
+    step: int | None = None
+    shown: float | None = None  # the moment the piece of a turning globe is lit for
+    pending: tuple[float, Future] | None = None
+    offset: int = 0  # the steps a turning globe is ahead (it begins at your place)
+
+
+def changed_region(
+    previous: Image.Image | None, current: Image.Image
+) -> tuple[int, int, int, int] | None:
+    """Bounding box (x0, y0, x1, y1) of pixels that differ, or None if identical (the same
+    picture handed out again: Renderer.render while nothing changed)."""
+    if previous is current:
+        return None
+    if previous is None or previous.size != current.size or previous.mode != current.mode:
+        return (0, 0, current.width, current.height)
+    return ImageChops.difference(previous, current).getbbox()
+
+
+def changed_regions(previous: Image.Image | None, current: Image.Image, gap: int = 24,
+                    most: int = 4) -> list[tuple[int, int, int, int]]:  # fmt: skip
+    """The parts that changed as a few boxes, for a panel on a slow link: one box around a
+    clock in one corner and a value in the other is most of the screen, two are small. Rows of
+    changes closer than ``gap`` px are one band, and so are columns within a band; then the two
+    boxes whose joined box adds the fewest pixels are joined until ``most`` are left (each box
+    costs a command and an answer)."""
+    whole = changed_region(previous, current)
+    if whole is None:
+        return []
+    if previous is None or previous.size != current.size or previous.mode != current.mode:
+        return [whole]
+    import numpy as np
+
+    x0, y0, x1, y1 = whole
+    diff = ImageChops.difference(previous.crop(whole), current.crop(whole))
+    changed = np.asarray(diff.convert("L")) > 0
+
+    def runs(flags: Any) -> list[tuple[int, int]]:
+        found: list[tuple[int, int]] = []
+        for i in np.flatnonzero(flags):
+            if found and i - found[-1][1] <= gap:
+                found[-1] = (found[-1][0], int(i) + 1)
+            else:
+                found.append((int(i), int(i) + 1))
+        return found
+
+    boxes = []
+    for top, bottom in runs(changed.any(axis=1)):
+        for left, right in runs(changed[top:bottom].any(axis=0)):
+            boxes.append((x0 + left, y0 + top, x0 + right, y0 + bottom))
+    if len(boxes) > 8 * most:  # changes all over: one box (and no long search for pairs)
+        return [whole]
+
+    def joined(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, int, int, int]:
+        return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+    def area(box: tuple[int, ...]) -> int:
+        return (box[2] - box[0]) * (box[3] - box[1])
+
+    while len(boxes) > most:
+        pairs = [(i, j) for i in range(len(boxes)) for j in range(i + 1, len(boxes))]
+        i, j = min(pairs, key=lambda p: area(joined(boxes[p[0]], boxes[p[1]]))
+                   - area(boxes[p[0]]) - area(boxes[p[1]]))  # fmt: skip
+        boxes[i] = joined(boxes[i], boxes[j])
+        del boxes[j]
+    return boxes
+
+
+def _drawing(finish: Any, renderer: Renderer) -> Callable[..., Any]:
+    """``finish.draw`` as the renderer calls it for a widget, without the reference to the
+    renderer that a ``partial`` would keep: the renderer holds it, and a cycle is freed only
+    when the collector runs, which the main loop's guards (timing.Guards) put off for hours."""
+    ref = weakref.ref(renderer)
+
+    def draw(widget: dict[str, Any], snapshot: Snapshot, now: float) -> Any:
+        return finish.draw(ref(), widget, snapshot, now)
+
+    return draw
+
+
+def _number(value: Any) -> float | None:
+    """A reading's value as a number; None for none, a text, and NaN or infinity (which are
+    no reading: one would poison the value that glides)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an integer too large for a float
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _undrawable(value: Any) -> bool:
+    """Whether ``value`` is a number that cannot be drawn: NaN, infinity, or an integer too large
+    for a float (over 2**1023: a JSON payload of 400 digits)."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    return isinstance(value, int) and value.bit_length() > 1023
+
+
+class _Finite:
+    """``snapshot`` with every reading that is NaN, infinite or too large for a float taken for
+    none: a source can send one (a payload "nan"), and no widget, card or list must draw it or
+    glide to it.
+
+    Only the readings not looked at the frame before are looked at: in video mode the readings
+    are a new dict every frame, nearly all of them the same Reading objects (frozen) under the
+    same keys in the same order. The last frame's keys and readings are kept (held, so that
+    an object found drawable is never another); what is not the same object in the same place
+    is looked at, all of them when the keys differ or a reading was not drawable."""
+
+    def __init__(self) -> None:
+        self._keys: list[str] = []
+        self._readings: list[Any] = []
+
+    def __call__(self, snapshot: Snapshot) -> Snapshot:
+        readings = snapshot.readings
+        keys, values = list(readings), list(readings.values())  # (at C speed, as below)
+        if keys == self._keys:
+            looked = list(itertools.compress(values, map(operator.is_not, values, self._readings)))
+        else:
+            looked = values
+        bad = set()
+        for reading in looked:  # (no call per reading)
+            value = reading.value
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    bad.add(id(reading))
+            elif isinstance(value, int) and value.bit_length() > 1023:
+                bad.add(id(reading))
+        if bad:  # (rare: all are looked at again next time)
+            self._keys, self._readings = [], []
+            fixed = {k: replace(r, value=None) if id(r) in bad else r for k, r in readings.items()}
+            return replace(snapshot, readings=fixed)
+        self._keys, self._readings = keys, values
+        return snapshot
+
+
+def _finite(snapshot: Snapshot) -> Snapshot:
+    """:class:`_Finite` without a memory: every reading is looked at."""
+    return _Finite()(snapshot)
+
+
+COURSE_POINTS = 4000  # a course a service publishes whole is drawn up to this long
+
+
+@lru_cache(maxsize=32)
+def _course(text: str) -> tuple[float | None, ...] | None:
+    """A course a service published whole: a reading whose value is a list of numbers as text
+    (``"[61.5, 63.0, null, 64.2]"``, ``null`` a gap), such as the round's temperatures
+    (``report.course.cpu_temp``). None for any other value, or fewer than two points."""
+    try:
+        found = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(found, list) or not 1 < len(found) <= COURSE_POINTS:
+        return None
+    return tuple(
+        float(v)
+        if isinstance(v, int | float) and not isinstance(v, bool) and not _undrawable(v)
+        else None
+        for v in found
+    )
+
+
+def course_of(value: Any) -> tuple[float | None, ...] | None:
+    """The course in a reading's value (see ``_course``), else None."""
+    if not isinstance(value, str) or not value.startswith("["):
+        return None
+    return _course(value)
+
+
+def _gaps(values: list[float]) -> list[float | None]:
+    """A history with a gap (None) where a value is NaN, infinite or too large for a float,
+    else the history itself."""
+    try:
+        if math.isfinite(sum(values)):  # (at C speed: one NaN or infinity makes the sum one)
+            return values
+    except (TypeError, OverflowError):  # a gap in it, or an integer beyond a float
+        pass
+    return [
+        value if isinstance(value, (int, float)) and not _undrawable(value) else None
+        for value in values
+    ]
+
+
+def _fraction(value: float | None, lo: float, hi: float, scale: str = "linear") -> float:
+    """Position of ``value`` between ``lo`` and ``hi`` (0..1).
+
+    ``sqrt`` and ``log`` keep small values visible on huge ranges such as
+    network rates (SPUR II used a square-root scale for exactly that).
+    """
+    if value is None or hi == lo:
+        return 0.0
+    linear = min(1.0, max(0.0, (value - lo) / (hi - lo)))
+    if scale == "sqrt":
+        return math.sqrt(linear)
+    if scale == "log":
+        span = abs(hi - lo)
+        return math.log1p(linear * span) / math.log1p(span)
+    return linear
+
+
+def _rule_color(widget: dict[str, Any], value: float | None) -> str | None:
+    """The color of the highest threshold the value exceeds, or None."""
+    color = None
+    if value is None:
+        return None
+    for rule in sorted(widget.get("color_rules", []), key=lambda r: r["above"]):
+        if value > rule["above"]:
+            color = rule["color"]
+    return color
+
+
+def _steps(frac: float, length: float) -> float:
+    """``frac`` of ``length`` pixels in steps of the supersampled grid: a finer
+    change draws the same pixels, so a gliding bar is drawn again only when
+    it moves visibly."""
+    steps = max(1, round(length * SUPERSAMPLE))
+    return round(frac * steps) / steps
+
+
+def _smoothstep(u: float) -> float:
+    return u * u * (3 - 2 * u)
+
+
+def _lerp(a: RGBA, b: RGBA, t: float) -> RGBA:
+    t = min(1.0, max(0.0, t))
+    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(4))  # type: ignore[return-value]
+
+
+def _blur(img: Image.Image, radius: float, exact: bool = False) -> Image.Image:
+    """Colour-true Gaussian blur of an RGBA image (premultiplied alpha). ``exact``
+    blurs at full size: the same pixels wherever a part is cut from (graph strips)."""
+    if radius <= 0:
+        return img
+    pre = img.convert("RGBa")
+    if max(img.size) > 320 and radius >= 4 and not exact:  # half size: 4x cheaper, same look
+        small = pre.resize((max(1, img.width // 2), max(1, img.height // 2)), Image.BILINEAR)
+        pre = small.filter(ImageFilter.GaussianBlur(radius / 2)).resize(img.size, Image.BILINEAR)
+    else:
+        pre = pre.filter(ImageFilter.GaussianBlur(radius))
+    return pre.convert("RGBA")
+
+
+def _soft_light(
+    base: Image.Image, radius: float, gain: float = 1.0, noise: bool = True
+) -> Image.Image:
+    """``base`` (RGBA, straight) blurred as :func:`_blur` blurs it, with its alpha times ``gain``
+    (at most full), its alpha worked out in floating point and made 8 bits, with the dither
+    (render.dither) where ``noise`` says: a glow made stronger than it was blurred then steps
+    no more than a level at a time (whole levels made stronger spread apart, as rings round it
+    on a large panel), and with the dither not even that. Its colour is blurred as before.
+    Only the part where there is light is worked on (what is lit, and three radii round it)."""
+    import numpy as np
+
+    from libre_panel.render import dither
+
+    lit = base.getchannel("A").getbbox()
+    if lit is None:
+        return Image.new("RGBA", base.size, (0, 0, 0, 0))
+    half = max(base.size) > 320 and radius >= 4  # half size: 4x cheaper, the same look (as _blur)
+    # (at half size a few pixels more round it, nothing of the light in them: room enough that
+    # the blur's matrices serve a box that grows and shrinks, dither.blur)
+    reach = math.ceil(3 * radius) + (8 if half else 2)
+    box = (max(0, lit[0] - reach), max(0, lit[1] - reach),
+           min(base.width, lit[2] + reach), min(base.height, lit[3] + reach))  # fmt: skip
+    part = base.crop(box)
+    size = part.size
+    pixels = np.asarray(part)
+    # one colour (a text, a symbol, a ring in one colour): the light is that colour, unblurred
+    # (a text's soft edges are many levels of alpha, of the one colour)
+    packed = pixels.view(np.uint32)[..., 0]  # (each pixel's four bytes as one number)
+    colour = packed & np.uint32(0xFFFFFF)
+    first = colour.flat[int(np.argmax(packed > 0xFFFFFF))]
+    one = bool((np.where(packed > 0xFFFFFF, colour, first) == first).all())
+    alpha = pixels[..., 3].astype(np.float32)
+    if half:
+        small = (max(1, size[0] // 2), max(1, size[1] // 2))
+        alpha = np.asarray(Image.fromarray(alpha, "F").resize(small, Image.BILINEAR), np.float32)
+        soft = Image.fromarray(dither.blur(alpha, radius / 2), "F").resize(size, Image.BILINEAR)
+    else:
+        soft = dither.blur(alpha, radius)
+    if one:
+        out = np.empty((size[1], size[0], 4), np.uint8)
+        out[..., :3] = pixels[np.unravel_index(int(np.argmax(packed > 0xFFFFFF)), packed.shape)][:3]
+    elif half:
+        colour = part.convert("RGBa").resize(small, Image.BILINEAR)
+        colour = colour.filter(ImageFilter.GaussianBlur(radius / 2)).resize(size, Image.BILINEAR)
+        out = np.asarray(colour.convert("RGBA")).copy()
+    else:
+        colour = part.convert("RGBa").filter(ImageFilter.GaussianBlur(radius))
+        out = np.asarray(colour.convert("RGBA")).copy()
+    soft = np.minimum(255.0, np.asarray(soft, np.float32) * gain)
+    out[..., 3] = dither.to_u8(soft, box[0], box[1], noise)
+    whole = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    whole.paste(Image.fromarray(out, "RGBA"), box[:2])
+    return whole
+
+
+@cached("renderer.ramps", 2 * MB)
+def _ramp(w: int, h: int, edge: int) -> Image.Image:
+    """Opacity over ``h`` rows: full, but soft over ``edge`` rows at the top and the bottom."""
+    column = Image.new("L", (1, h))
+    column.putdata(
+        [round(255 * max(0.0, min(1.0, y / edge, (h - 1 - y) / edge))) for y in range(h)]
+    )
+    return column.resize((w, h))
+
+
+def _moved(
+    image: Image.Image, dy: float, colour: tuple[int, int, int] | None = None
+) -> tuple[Image.Image, int]:
+    """``image`` moved down by ``dy`` pixels, a fraction too: the image and the whole row it
+    goes to (a fraction blends two rows, as a letter in motion is). A letter all in ``colour``
+    (the renderer's own) moves only its opacity, the same as it moved before, and stays all in
+    its colour: moved with its colours (weighed by their opacity, as Pillow moves them), a
+    faint pixel's colour was what the rounding of so little left of it (of #2EE6D6 at an
+    opacity of 3, (0, 170, 170)), and a glow round the letter was blurred from those."""
+    row = math.floor(dy)
+    part = dy - row
+    if part < 1 / 64:
+        return image, row
+    if part > 63 / 64:
+        return image, row + 1
+    size, shift = (image.width, image.height + 1), (1, 0, 0, 0, 1, -part)
+    bilinear = Image.Resampling.BILINEAR
+    if colour is not None:
+        opacity = image.getchannel("A").transform(size, Image.Transform.AFFINE, shift, bilinear)
+        moved = Image.new("RGBA", size, (*colour, 0))
+        moved.putalpha(opacity)
+        return moved, row
+    return image.transform(size, Image.Transform.AFFINE, shift, bilinear), row
+
+
+def _between(one: Image.Image, other: Image.Image, part: int, parts: int) -> Image.Image:
+    """``part`` / ``parts`` of the way from ``one`` to ``other``, blended with their colours
+    weighed by their opacity: no dark seam where one is clear and the other is not."""
+    mixed = Image.blend(one.convert("RGBa"), other.convert("RGBa"), part / parts)
+    return mixed.convert("RGBA")
+
+
+def _scale_alpha(img: Image.Image, factor: float) -> Image.Image:
+    if factor >= 0.999:
+        return img
+    out = img.copy()
+    out.putalpha(img.getchannel("A").point(lambda a: int(a * factor)))
+    return out
+
+
+def _dimmed(light: Piece | None, factor: float) -> Piece | None:
+    """A light piece ``factor`` as bright (light is added: all its channels scale)."""
+    if light is None or factor >= 0.999:
+        return light
+    table = [int(v * factor) for v in range(256)] * 4
+    return replace(light, layer=light.layer.point(table))
+
+
+Turn = tuple[float, tuple[float, float]]  # degrees clockwise, about this point on the panel
+# a quarter turn clockwise and its multiples, exactly (PIL's turns are anticlockwise)
+_QUARTERS = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
+             270: Image.Transpose.ROTATE_90}  # fmt: skip
+
+
+def _turned_point(point: tuple[float, float], turn: Turn) -> tuple[float, float]:
+    """``point`` turned as ``turn`` says (y grows downwards: clockwise as seen)."""
+    angle, (cx, cy) = turn
+    cos, sin = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    dx, dy = point[0] - cx, point[1] - cy
+    return cx + dx * cos - dy * sin, cy + dx * sin + dy * cos
+
+
+def _turned_box(box: Box, turn: Turn) -> Box:
+    """The box around ``box`` turned."""
+    x, y, w, h = box
+    corners = [_turned_point(c, turn) for c in ((x, y), (x + w, y), (x, y + h), (x + w, y + h))]
+    xs = [round(c[0], 6) for c in corners]  # (a quarter turn's sines are not quite 1 and 0)
+    ys = [round(c[1], 6) for c in corners]
+    left, top = math.floor(min(xs)), math.floor(min(ys))
+    return [left, top, math.ceil(max(xs)) - left, math.ceil(max(ys)) - top]
+
+
+def _turned_image(image: Image.Image, angle: float) -> Image.Image:
+    """All of ``image`` turned ``angle`` degrees clockwise: a quarter turn pixel for pixel,
+    any other smoothly."""
+    quarter = _QUARTERS.get(int(angle)) if angle == int(angle) else None
+    if quarter is not None:
+        return image.transpose(quarter)
+    return image.rotate(-angle, resample=Image.Resampling.BICUBIC, expand=True)
+
+
+def _turned(piece: Piece, turn: Turn) -> Piece:
+    """``piece`` turned: its layer, its box, what blurs beneath it and its light."""
+    layer = piece.layer if piece.layer.mode == "RGBA" else piece.layer.convert("RGBA")
+    turned = _turned_image(layer, turn[0])
+    middle = _turned_point((piece.x + layer.width / 2, piece.y + layer.height / 2), turn)
+    box = piece.box or [piece.x, piece.y, layer.width, layer.height]
+    backdrop = piece.backdrop
+    if backdrop is not None:  # (it lies on the box: the box goes where it now lies)
+        backdrop = _turned_image(backdrop, turn[0])
+        mx, my = _turned_point((box[0] + box[2] / 2, box[1] + box[3] / 2), turn)
+        box = [round(mx - backdrop.width / 2), round(my - backdrop.height / 2), *backdrop.size]
+    else:
+        box = _turned_box(box, turn)
+    return replace(
+        piece,
+        layer=turned,
+        x=round(middle[0] - turned.width / 2),
+        y=round(middle[1] - turned.height / 2),
+        box=box,
+        backdrop=backdrop,
+        light=None if piece.light is None else _turned(piece.light, turn),
+    )
+
+
+# (gradients as large as the panel are made once for a card, kept as a piece: not kept here)
+@cached("renderer.gradients", 4 * MB)
+def _gradient(size: tuple[int, int], a: RGBA, b: RGBA, horizontal: bool,
+              noise: bool = False) -> Image.Image:  # fmt: skip
+    """Linear gradient from ``a`` to ``b`` (cached: callers must not modify it); with ``noise``
+    worked out in floating point and made 8 bits with the dither (render.dither)."""
+    steps = size[0] if horizontal else size[1]
+    if noise:
+        return _dithered(size, _ramp_floats(a, b, steps, 1), horizontal)
+    strip = Image.new("RGBA", (steps, 1) if horizontal else (1, steps))
+    strip.putdata([_lerp(a, b, i / max(1, steps - 1)) for i in range(steps)])
+    return strip.resize(size, Image.NEAREST)
+
+
+@cached("renderer.gradients_down", 1 * MB)  # (for cards and rects: made once, kept as pieces)
+def _gradient_down(size: tuple[int, int], a: RGBA, b: RGBA, horizontal: bool,
+                   noise: bool = False) -> Image.Image:  # fmt: skip
+    """The colours a gradient three times the size has once reduced (cached:
+    callers must not modify it); with ``noise`` made 8 bits with the dither."""
+    steps = size[0] if horizontal else size[1]
+    if noise:
+        return _dithered(size, _ramp_floats(a, b, steps, SUPERSAMPLE), horizontal)
+    last = max(1, steps * SUPERSAMPLE - 1)
+    colours = []
+    for i in range(steps):
+        parts = [_lerp(a, b, (SUPERSAMPLE * i + k) / last) for k in range(SUPERSAMPLE)]
+        colours.append(tuple(round(sum(p[c] for p in parts) / SUPERSAMPLE) for c in range(4)))
+    strip = Image.new("RGBA", (steps, 1) if horizontal else (1, steps))
+    strip.putdata(colours)
+    return strip.resize(size, Image.NEAREST)
+
+
+def _ramp_floats(a: RGBA, b: RGBA, steps: int, sub: int) -> Any:
+    """The colours (steps, 4) from ``a`` to ``b``, each the mean of ``sub`` as a gradient ``sub``
+    times as long has them (as :func:`_gradient_down` reduces it), in floating point."""
+    import numpy as np
+
+    last = max(1, steps * sub - 1)
+    t = np.clip(np.arange(steps * sub, dtype=np.float32) / last, 0, 1).reshape(steps, sub)
+    lo, hi = np.asarray(a, np.float32), np.asarray(b, np.float32)
+    return (lo + (hi - lo) * t[..., None]).mean(axis=1)
+
+
+def _dithered(size: tuple[int, int], ramp: Any, horizontal: bool) -> Image.Image:
+    """A gradient of ``size`` running along ``ramp`` (steps, 4: floats), made 8 bits with the
+    dither: its colours and its alpha, a fully transparent or opaque one stays so."""
+    from libre_panel.render import dither
+
+    w, h = size
+    return Image.fromarray(dither.ramp_u8(ramp, h if horizontal else w, horizontal), "RGBA")
+
+
+@lru_cache(maxsize=64)
+def _card_corners(r: int, outline: int) -> tuple[Image.Image, Image.Image | None, int]:
+    """How much of each pixel a card with corners of radius ``r`` (and an
+    outline ``outline`` px wide) covers near its corners: a small card drawn
+    three times larger and reduced, ``2 * c + 2`` px square, whose ``c`` px
+    corners are those of any larger card (Pillow draws the corners in boxes at
+    the card's corners, the rest as rectangles)."""
+    s, c = SUPERSAMPLE, r + 2
+    m = 2 * c + 2
+    box = [0, 0, m * s - 1, m * s - 1]
+    shape = Image.new("L", (m * s, m * s), 0)
+    ImageDraw.Draw(shape).rounded_rectangle(box, radius=r * s, fill=255)
+    ring = None
+    if outline:
+        ring = Image.new("L", (m * s, m * s), 0)
+        ImageDraw.Draw(ring).rounded_rectangle(box, radius=r * s, outline=255, width=outline * s)
+        ring = ring.reduce(s)
+    return shape.reduce(s), ring, c
+
+
+def _fitted(image: Image.Image, w: int, h: int, fit: str, align: str = "center") -> Image.Image:
+    """``image`` at w x h: stretched, inside with room left (contain, at the left, in the middle
+    or at the right: ``align``) or filling it (cover)."""
+    if fit == "cover":
+        return ImageOps.fit(image, (w, h), Image.Resampling.LANCZOS)
+    if fit == "contain":
+        inner = ImageOps.contain(image, (w, h), Image.Resampling.LANCZOS)
+        out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        left = {"left": 0, "right": w - inner.width}.get(align, (w - inner.width) // 2)
+        out.paste(inner, (left, (h - inner.height) // 2))
+        return out
+    return image.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def _blurred(image: Image.Image, radius: float, w: int = 0, h: int = 0, fit: str = "stretch",
+             align: str = "center") -> Image.Image:  # fmt: skip
+    """``image`` at w x h (as :func:`_fitted`; 0: its own size) blurred by ``radius`` px: fitted
+    and blurred at a fraction of the size, then drawn up (a backdrop of a cover's colours across
+    a 1920 x 480 panel costs a few milliseconds, once per cover); transparent edges stay clean."""
+    if w <= 0 or h <= 0:
+        w, h = image.size
+    scale = max(1, min(8, int(radius // 4)))
+    small = _fitted(image.convert("RGBA"), max(1, round(w / scale)), max(1, round(h / scale)),
+                    fit, align).convert("RGBa")  # fmt: skip
+    small = small.filter(ImageFilter.GaussianBlur(radius / scale))
+    return small.resize((w, h), Image.Resampling.BILINEAR).convert("RGBA")
+
+
+def _rounded(image: Image.Image, radius: int) -> Image.Image:
+    """``image`` with round corners (drawn larger, then reduced: smooth edges)."""
+    w, h = image.size
+    mask = Image.new("L", (w * SUPERSAMPLE, h * SUPERSAMPLE), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [0, 0, w * SUPERSAMPLE - 1, h * SUPERSAMPLE - 1], radius=radius * SUPERSAMPLE, fill=255
+    )
+    mask = mask.resize((w, h), Image.Resampling.LANCZOS)
+    out = image.copy()
+    out.putalpha(ImageChops.multiply(image.getchannel("A"), mask))
+    return out
+
+
+def _catmull_rom(points: list[tuple[float, float]], samples: int = 6) -> list[tuple[float, float]]:
+    """Smooth curve through all points (centripetal-free, uniform Catmull-Rom)."""
+    if len(points) < 3:
+        return points
+    out = [points[0]]
+    padded = [points[0], *points, points[-1]]
+    for i in range(1, len(padded) - 2):
+        p0, p1, p2, p3 = padded[i - 1], padded[i], padded[i + 1], padded[i + 2]
+        for step in range(1, samples + 1):
+            t = step / samples
+            t2, t3 = t * t, t * t * t
+            out.append(
+                tuple(
+                    0.5
+                    * (
+                        2 * p1[k]
+                        + (-p0[k] + p2[k]) * t
+                        + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
+                        + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3
+                    )
+                    for k in (0, 1)
+                )
+            )
+    return out
+
+
+# "media.playing=1", "sun.up!=0", "cpu.temp>80", "game.limiter=gpu": a ``needs`` that compares a
+# reading with a number, or (``=``, ``!=``) with a word
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+_COMPARE = re.compile(
+    r"^(?P<key>[^=<>!]+?)\s*(?P<op>==|=|!=|>=|<=|>|<)\s*"
+    r"(?P<value>-?\d+(?:\.\d+)?|[A-Za-z_][\w .-]*?)$"
+)
+_OPERATORS = {
+    "=": lambda a, b: a == b, "==": lambda a, b: a == b, "!=": lambda a, b: a != b,
+    ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+    "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+}  # fmt: skip
+
+
+def need_key(need: str) -> str:
+    """The sensor a condition of ``needs`` reads: ``"!gpu.load"`` and ``"media.playing=1"``
+    read ``gpu.load`` and ``media.playing``; ``"@media.cover"`` (a picture) ``media.cover``."""
+    need = need.strip().lstrip("!").strip()
+    found = _COMPARE.match(need)
+    return (found["key"].strip() if found else need).lstrip("@")
+
+
+@lru_cache(maxsize=1024)
+def _needs_of(needs: str) -> tuple[str, ...]:
+    """The conditions of a ``needs``, one by one (worked out once a text: every widget asks for
+    its own with every frame)."""
+    return tuple(need for need in (part.strip() for part in needs.split(",")) if need)
+
+
+def need_holds(need: str, snapshot: Snapshot) -> bool:
+    """Whether one condition of ``needs`` holds: a reading that has a value (``"gpu.load"``),
+    none (``"!gpu.load"``; a state that is ``null`` has none), a picture that a source has
+    (``"@media.app_icon"``), or compares so (``"media.playing=1"``: ``=``, ``!=``, ``>``, ``>=``,
+    ``<``, ``<=`` with a number; a reading without a number never does; ``"game.limiter=gpu"``:
+    ``=`` and ``!=`` with a word, a text in any case; a ``!`` in front says the opposite)."""
+    need = need.strip()
+    body = need.lstrip("!").strip()
+    found = _COMPARE.match(body)
+    if body.startswith("@"):
+        holds = snapshot.images.get(body[1:]) is not None
+    elif found is None:  # (a state a service has taken back is the text "null": none)
+        value = snapshot.value(body)
+        holds = value is not None and value != "null"
+    else:
+        value = snapshot.value(found["key"].strip())
+        if _NUMBER.fullmatch(found["value"]):
+            number = _number(float(value) if isinstance(value, bool) else value)  # (on is 1)
+            holds = number is not None and _OPERATORS[found["op"]](number, float(found["value"]))
+        elif isinstance(value, str) and found["op"] in ("=", "==", "!="):  # a word
+            same = value.strip().casefold() == found["value"].strip().casefold()
+            holds = same if found["op"] != "!=" else not same
+        else:  # a number is no word, and words have no order
+            holds = False
+    return holds != need.startswith("!")
+
+
+def _reads(widgets: list[dict[str, Any]]) -> set[str]:
+    """The sensor keys (and patterns) the widgets read."""
+    keys: set[str] = set()
+    for widget in widgets:
+        if widget.get("sensor"):
+            keys.add(widget["sensor"])
+        if widget.get("mark"):
+            keys.add(widget["mark"])
+        if widget.get("trace"):  # a graph's fine course of its value
+            keys.add(widget["trace"])
+        for need in (widget.get("needs") or "").split(","):
+            need = need_key(need)
+            if need and not need.startswith(SWITCH):  # (a switch is the theme's, no sensor)
+                keys.add(need)
+        if widget["type"] == "weather":
+            keys.add(f"weather.{widget['field']}")
+        elif widget["type"] == "list":
+            keys |= lists.read_keys(widget["items"])
+        elif widget["type"] == "image":
+            keys |= _live_pictures(widget)
+    return keys
+
+
+def _live_pictures(widget: dict[str, Any]) -> set[str]:
+    """The keys of the pictures an image widget takes from a source, not from the theme's
+    folder: ``"@media.cover"`` as its ``src`` or on a line of its ``slides``."""
+    pictures = [widget.get("src") or "", *(widget.get("slides") or "").splitlines()]
+    return {name[1:] for name in map(str.strip, pictures) if name.startswith("@") and len(name) > 1}
+
+
+_UNREAD = object()  # (a picture not kept yet: None is one that could not be read)
+
+
+# The theme's card colour: a frame filled with it is a card, as see-through as the person asks
+# (theme style ``card_opacity``, config.toml card_opacity)
+SURFACE = "@surface"
+
+
+class Renderer:
+    def __init__(
+        self,
+        theme: Theme,
+        animate: bool = False,
+        preview: bool = False,
+        motion: Motion | None = None,
+        backdrop: Image.Image | None = None,
+        dither: bool = False,
+    ) -> None:
+        self.theme = theme
+        # a picture under the theme instead of its own background picture: the panel's part of
+        # one across all panels (arrangement.py), fitted to the theme's size
+        self.backdrop = backdrop
+        self.animate = animate
+        self.preview = preview  # an editor preview or a picture, not the panel
+        # Gliding values, fading colours and graph histories: the main loop's,
+        # kept from theme to theme, or this renderer's own (a preview).
+        self.motion = motion if motion is not None else Motion()
+        self.shown: Image.Image | None = None  # the frame the panel shows (set by the loop)
+        self.toast: tuple[Any, float] | None = None  # the toast on show, its age (the loop)
+        self.snapshot: Snapshot | None = None  # the readings it drew last (context.image)
+        self.warnings: list[str] = []
+        self.moving = False  # True while an animation has not settled yet
+        # when the next frame is due for what moves in steps (a turning globe), while nothing
+        # else moves: a panel may rest until then (MainLoop.rest); None: nothing such
+        self.due: float | None = None
+        # a graph that scrolls steps a reading at a time, gliding, and rests between (config.toml
+        # graph_steps; one with its own fine course, Arena's frame rate, scrolls on)
+        self.graph_steps = False
+        self.sample_before: float | None = None  # when the reading before the last was taken
+        # the person's choice of the theme's switches (Theme.switches): {"frames": False}; one
+        # not chosen is as the theme has it
+        self.switches: dict[str, bool] = {}
+        self._analog_parts: dict[Any, Image.Image] = {}  # faces and second hands (_analog_part)
+        self._analog_halos: dict[Any, tuple[Image.Image | None, int]] = {}  # (_hand_effects)
+        self._fonts: dict[tuple[str, int], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
+        self._digit_width: dict[int, float] = {}
+        # a letter's advance and the band digits fill, by font, measured once (_advance): a
+        # clock's rolling seconds measured them anew in every frame of the roll, a millisecond
+        self._advances: dict[tuple[Any, str], float] = {}
+        self._digit_bands: dict[Any, tuple[float, float, float, float]] = {}
+        # the theme's pictures, fitted (one that could not be read: None)
+        self._images = Kept("renderer.pictures", self.IMAGE_BYTES)
+        # animated pictures' frames, finished (a still: None), and the videos playing
+        self._animations = Kept("renderer.animations", self.ANIMATION_BYTES)
+        self._feeds: dict[Any, moving.VideoFeed] = {}
+        self._began: dict[tuple[str, str], float] = {}  # when an animated picture first showed
+        # a slideshow with pictures that move: the one on show, since when and until when
+        self._shows: dict[str, tuple[int, float, float]] = {}
+        self._moves: dict[str, bool] = {}  # a slideshow's picture: does it move?
+        self._video_infos: dict[str, moving.VideoInfo] = {}  # a video's length, size, fps
+        # [video] direct: the video of this frame, and the frame being it alone across the theme
+        # (the main loop then has the panel take it from its file: app.py)
+        self._video_drawn: tuple[str, str, dict[str, Any], tuple[int, int, int, int]] | None = None
+        self.full_video: tuple[str, str, float] | None = None  # (path, fit, speed)
+        # the frames a second videos are decoded at, no more than each one's own (the main loop
+        # sets it: a streamed panel's, or a few for the app's picture alone where the panel
+        # takes the video from its file; None: moving.VIDEO_FPS)
+        self.video_fps: int | None = None
+        self.video_keys = False  # ... their keyframes alone (that picture: a few a second)
+        self._ffmpeg: str | None = None  # where ffmpeg is ("": not found)
+        self._slide_lists: dict[str, tuple[float, list[str]]] = {}  # widget id -> pictures
+        self._gauge_parts: dict[tuple[Any, ...], Image.Image] = {}  # static rings, colour fields
+        # Video mode (the main loop sets these): every frame goes out, so graphs
+        # scroll between readings and values glide until the next one.
+        self.continuous = False
+        self._dither = dither  # (dither): the main loop sets it with video mode
+        self.sample: tuple[float, float] = (0.0, 1.0)  # (when, seconds to the next)
+        self._strips: dict[str, _Strips] = {}  # graph id -> its strips (video mode)
+        self._ranges: dict[str, _Range] = {}  # graph id -> its own range as it glides
+        self._cache: dict[str, tuple[Any, Piece]] = {}
+        # a gliding list's bars and its text, and the two as one (_joined)
+        self._joins: dict[str, tuple[Piece, Piece, Piece]] = {}
+        # whether a list's text lies on none of its bars (by widget: the text's picture, the
+        # boxes its bars lie in, apart)
+        self._apart_texts: dict[str, tuple[Image.Image, tuple, bool]] = {}
+        self._list_bars = Kept("renderer.list_bars", self.LIST_BAR_BYTES)
+        self._list_bar_ends = Kept("renderer.list_bar_ends", self.LIST_BAR_END_BYTES)
+        self._texts = Kept("renderer.texts", self.TEXT_BYTES)  # pieces by (id, text, colour)
+        self._glyphs = Kept("renderer.glyphs", self.GLYPH_BYTES)
+        # Modules become plain widgets laid out for their cells; the editor
+        # gets one box per module.
+        self.widgets, self.module_boxes = expand_modules(theme)
+        # Finishes other than flat, and the panel's look (render.finish,
+        # render.look); a theme with neither pays nothing for them.
+        self.place: tuple[float, float] | None = None  # your place, for the earth (the loop)
+        self._finishes = finishes.attach(self)  # widget id -> finish
+        self.look: Any = None
+        if theme.look.get("grid"):
+            from libre_panel.render.look import Look
+
+            self.look = Look(self)
+        self._drawers = {wid: _drawing(f, self) for wid, f in self._finishes.items()
+                         if finishes.draws(f)}  # fmt: skip
+        self._modules = {w["id"]: w for w in theme.widgets if w["type"] == "module"}
+        self._slots = self._make_slots(theme)  # modules that show one card of several
+        self._slots_warm = False  # whether their cards have been drawn once
+        self._keys = {w["id"]: json.dumps(w, sort_keys=True) for w in self.widgets}
+        if not preview:  # costly sensors work only while a panel shows them
+            want(self, _reads(self.widgets))
+        self._background = self._load_background()
+        # Frames start from an opaque colour: pieces go on with a paste in place
+        self._opaque = (self.color(theme.background_color) or (0, 0, 0, 0))[3] == 255
+        # and such frames are composed in RGB (Pillow keeps it in four bytes a pixel too, and
+        # pastes RGBA into it as it pastes into RGBA): the frame the panel gets is then a copy
+        # of it, not a conversion (a millisecond and a half less on the 12.3")
+        self._mode = "RGB" if self._opaque else "RGBA"
+        # Incremental compositing: the last frame and the pieces it was made of.
+        # Only regions whose pieces changed are composed again, so a mostly
+        # static screen costs little at 50 fps. The result is pixel-identical.
+        self.incremental = True
+        # What stays the same from frame to frame is kept, made once: the background with its
+        # picture, a lit ring's groove with its whole sweep lit on it (a value only cuts it at
+        # the tip), the names and numbers under a list's turning fans (the fans go over them);
+        # and the parts of a frame go into it as they are. False makes all of that anew every
+        # frame (for tests: the pixels are the same).
+        self.keep_static = True
+        self._last: tuple[list[tuple[str, Piece]], Image.Image] | None = None
+        # the frame handed out last, while the composed one stays as it was (_compose): handed
+        # out again rather than copied anew (a theme at rest, between its readings)
+        self._handed: Image.Image | None = None
+        self._unchanged = False
+        # What changed since the frame before (render): the boxes composed anew, [] nothing,
+        # None all of it or not known; a video panel converts those parts only (devices/yuv.py)
+        self.damage: list[tuple[int, int, int, int]] | None = None
+        self.rendered = 0  # the frames rendered (what the damage is counted against)
+        self.scenes = 0  # of them, frames handed out as their layers (render(scene=True))
+        # the display's engine makes a lit gauge's ring itself (render/lit.py's Ring): its
+        # pieces are made here only where a frame is composed here
+        self.native_rings = False
+        # ... and cuts a scrolling graph's window from its strip, which it keeps (scene.View):
+        # the window's pixels are made here only where a frame is composed here
+        self.native_views = False
+        # ... and makes a turning globe's picture for each step (scene.Globe), likewise
+        self.native_globes = False
+        # ... and lays a fan from its ring and its rotor, which it keeps (scene.Laid), likewise
+        self.native_laid = False
+        # ... and makes those itself, its rotor at each position and its ring (scene.Made of
+        # fan.py's recipes): neither made nor kept here (where it lays them too)
+        self.native_fans = False
+        # ... and a text's or a letter's picture of its mask and ink (scene.MaskRecipe): kept
+        # here as the mask, a quarter of the picture (where it lays them too)
+        self.native_masks = False
+        # ... and makes a lit bar's picture and glow for each value (scene.Bar), likewise
+        self.native_bars = False
+        # ... and a card whose inside is one colour comes as its edges and that colour, which the
+        # engine lays without pixels (render/scene.py's Filled; the fills property)
+        self._fills = False
+        self._fills_looked = 0.0  # when _forget_laid last looked (monotonic seconds)
+        self._held: dict[str, bool] = {}  # the conditions of needs worked out in this frame ...
+        self._held_for: tuple[Any, ...] = ()  # ... for these readings (and pictures)
+        self._composed: list[tuple[int, int, int, int]] | None = None
+        self._finite = _Finite()  # (the readings it found drawable the frame before)
+        # Per region, what lies under the first piece that changes (a graph that
+        # moves every frame over a card): the same pieces need not be laid again.
+        self._underlays = Kept("renderer.underlays", self.UNDERLAY_BYTES)
+        self._grounds: tuple[RGBA | None, Image.Image] | None = None  # (_ground)
+        # Video panels take a frame every 20 ms. With background builds a
+        # changed piece is built in a helper thread while frames keep going out
+        # with the previous piece; the change shows a frame or two later.
+        self.background_builds = False
+        # ... and each of them waits for the gap between two frames first (MainLoop gives it
+        # that wait in video mode, at most a little while): a new reading every second set the
+        # rings, the lists and the texts going at once, and the helper threads, building them
+        # beside the frame under way, held it up (Arena on the 12.3": a frame of 45 to 60 ms
+        # every second, the graph stood and jumped)
+        self.between_frames: Callable[[], Any] | None = None
+        self._builder: _Builder | None = None
+        # the graphs' strips in a thread of their own (they draw no text): a big one takes
+        # tens of milliseconds, and a ring's next picture waited behind it, so the ring
+        # stood still for frames and then jumped (Arena on the 12.3")
+        self._strip_builder: _Builder | None = None
+        # the globes (render/earth.py), and a thread of their own to light them: a big one
+        # takes a fifth of a second, which no ring or list should wait for
+        self._earths: dict[str, _Globe] = {}
+        self._earth_builder: _Builder | None = None
+        self._pending: dict[str, tuple[Any, Future]] = {}
+        # by metric: the piece it drew the frame before, for the reading and muting it drew (as long
+        # as they hold, drawing it again would draw the same: _metric)
+        self._still: dict[str, tuple[Piece | None, Any, Any]] = {}
+        # Plugins (docs/PLUGINS.md): a screen draws the frame under the widgets,
+        # plugin widget types draw themselves.
+        self.fps = 0  # the panel's frame rate, for screens (set by the main loop)
+        self.beats = fan.Beats()  # where the fans stand: the main loop's, for all panels
+        self._breathe: Callable[[], None] | None = None  # between widgets (warming up)
+        self._plugin_types: dict[str, Any] = {}
+        self._screen_last: tuple[Any, Piece] | None = None
+        self._dots: dict[tuple[Any, ...], tuple[Image.Image, int]] = {}  # end dots, by look
+        self._rotors: dict[str, fan.Rotor] = {}  # fan widget id -> how it turns (render/fan.py)
+        # what the user chose for the fans: their look and colours (config.toml [hardware])
+        self.fan_choices = fan.Choices()
+        # the look of the weather symbols and the moon the user chose (config.toml ``symbols``)
+        self.symbols = DEFAULT_SYMBOLS
+        self._fan_shown: dict[str, tuple[Image.Image, Piece]] = {}  # a fan's, while it stands
+        # the turning fans of a list of them as pieces over it (_list_turning): this frame's,
+        # by list id; whether they lie on nothing of the list; each fan's piece and where
+        self._over: dict[str, list[tuple[Piece, str]]] = {}
+        self._fans_clear: dict[str, tuple[Piece, tuple, bool]] = {}
+        self._turning: dict[tuple[str, str], tuple[tuple, Image.Image, Piece]] = {}
+        # a fan's picture laid from its parts, and how the engine lays it (_laid_fan); the
+        # pictures of its rotor the engine keeps (_rotor_kept)
+        self._laid_fans: dict[str, tuple[tuple, Image.Image, Any]] = {}
+        self._rotor_pictures: dict[str, dict[int, Image.Image]] = {}
+        # the pieces of turned widgets last frame, by id: the piece, its turn, the turned one
+        self._turned: dict[str, tuple[Piece, Turn, Piece]] = {}
+        self._downloads: dict[str, tuple[Any, Any]] = {}  # download widget id -> what it shows
+        self.screen = self._make_screen()
+
+    def _make_slots(self, theme: Theme) -> dict[str, Any]:
+        """The slot of every module that shows one card of several (render/slot.py)."""
+        slots: dict[str, Any] = {}
+        for module in self._modules.values():
+            if module["module"] in SLOT_KINDS and module["id"] in self.module_boxes:
+                from libre_panel.render.slot import Slot
+
+                cards = slot_cards(module)
+                slots[module["id"]] = Slot(self, module, cards, self.module_boxes[module["id"]])
+        return slots
+
+    # -- resources ---------------------------------------------------------
+
+    def _warn(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
+            log.warning(message)
+
+    def color(self, value: str | None, alpha_scale: float = 1.0) -> RGBA | None:
+        if value is None:
+            return None
+        if value == COVER_COLOR:  # the colour the cover on show carries, else the accent
+            carried = (
+                cover.dominant(self.snapshot.images.get("media.cover")) if self.snapshot else None
+            )
+            if carried is not None:
+                return (*carried, int(255 * alpha_scale))
+            value = self.theme.palette.get("accent", "#22d3ee")
+        elif value.startswith("@"):
+            value = self.theme.palette.get(value[1:], "#ff00ff")
+        rgb = ImageColor.getrgb(value)
+        alpha = rgb[3] if len(rgb) == 4 else 255
+        return (rgb[0], rgb[1], rgb[2], int(alpha * alpha_scale))
+
+    def font(self, ref: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        ref = ref or self.theme.font or DEFAULT_FONT
+        size = max(4, min(int(size), 512))
+        key = (ref, size)
+        if key not in self._fonts:
+            font = None
+            try:
+                builtin = builtin_font_path(ref)
+                if builtin is not None:
+                    font = truetype(str(builtin), size)
+                elif self.theme.root is not None:
+                    font = truetype(str(resolve_asset(self.theme.root, ref)), size)
+            except (OSError, ThemeError) as exc:
+                self._warn(f"font {ref!r} could not be loaded ({exc}); using the default font")
+            if font is None and ref != DEFAULT_FONT:
+                font = truetype(str(builtin_font_path(DEFAULT_FONT)), size)
+            self._fonts[key] = font or ImageFont.load_default(size)
+        return self._fonts[key]
+
+    IMAGE_BYTES = 64 * MB  # pictures kept fitted: a slideshow of a folder reads the rest again
+    ANIMATION_BYTES = 192 * MB  # the frames of animated pictures (each at most moving.FRAMES_BYTES)
+
+    def _asset_image(
+        self, rel: str, w: int, h: int, fit: str = "stretch", align: str = "center"
+    ) -> Image.Image | None:
+        """The theme's picture ``rel`` fitted to ``w`` x ``h`` (0: as it is), kept: the oldest
+        go beyond ``IMAGE_BYTES`` (the newest stays), as a folder of photos would else be kept
+        whole, each as fitted, for as long as the theme shows. None where it cannot be read."""
+        key = (rel, w, h, fit, align)
+        found = self._images.get(key, _UNREAD)
+        if found is not _UNREAD:
+            return found
+        image = self._read_picture(rel)
+        if image is not None and w > 0 and h > 0:
+            image = _fitted(image, w, h, fit, align)
+        # (a picture that is not there counts too)
+        size = 4096 if image is None else max(4096, image.width * image.height * 4)
+        return self._images.put(key, image, size)
+
+    def _read_picture(self, rel: str) -> Image.Image | None:
+        if not rel or self.theme.root is None:
+            return None
+        try:
+            with Image.open(resolve_asset(self.theme.root, rel)) as src:
+                return ImageOps.exif_transpose(src).convert("RGBA")
+        except (OSError, ThemeError) as exc:
+            self._warn(f"image {rel!r} could not be loaded ({exc})")
+            return None
+
+    @property
+    def _card_opacity(self) -> float:
+        """How much of the background a card covers (its style's ``card_opacity``)."""
+        return float((self.theme.style or {}).get("card_opacity", 1.0))
+
+    @property
+    def dither(self) -> bool:
+        """Whether soft light and gradients made here get a level's worth of noise (render.dither):
+        for the panel's video, where whole levels showed as bands. Changed, what was made with
+        it or without it is made again."""
+        return self._dither
+
+    @dither.setter
+    def dither(self, on: bool) -> None:
+        if on == self._dither:
+            return
+        self._dither = on
+        self._cache.clear()
+        self._underlays.clear()
+        self._grounds, self._last, self._handed = None, None, None
+        self._background = self._load_background()
+
+    @property
+    def fills(self) -> bool:
+        """Whether a card whose inside is all one colour is made as its edges and that colour
+        (render/scene.py's Filled), for an engine that lays it so: its pixels are made here
+        only for a frame composed here. Changed, the cards are made again (the rects alone:
+        Lumen's nine of its 295 pieces)."""
+        return self._fills
+
+    @fills.setter
+    def fills(self, on: bool) -> None:
+        if on != self._fills:
+            self._fills = on
+            for widget in self.widgets:
+                if widget.get("type") == "rect":
+                    self._cache.pop(widget["id"], None)
+
+    def _load_background(self) -> Image.Image | None:
+        """The background picture at the theme's size. Read for it alone, not kept as read
+        (a picture the size of the 12.3" is five megabytes: it was kept twice)."""
+        if self.backdrop is not None:
+            fitted = ImageOps.fit(self.backdrop, (self.theme.width, self.theme.height))
+            return fitted.convert("RGBA")
+        image = self._read_picture(self.theme.background_image or "")
+        if image is not None:
+            image = ImageOps.fit(image, (self.theme.width, self.theme.height))
+        if self.theme.background_gradient is None:
+            return image
+        ground = self._gradient_ground()
+        if image is not None:
+            ground.alpha_composite(image.convert("RGBA"))
+        return ground
+
+    def _gradient_ground(self) -> Image.Image:
+        """The theme's background gradient, the panel's size, worked out in floating point and
+        made 8 bits with the dither in video mode: a dark one spans a handful of levels across
+        the panel (Lumen's: 4 to 6 across 720 rows on the 12.3"), whole levels showed as bands."""
+        import numpy as np
+
+        from libre_panel.render import dither
+
+        w, h = self.theme.width, self.theme.height
+        a, b = (np.asarray(self.color(c) or (0, 0, 0, 255), np.float32)
+                for c in self.theme.background_gradient or ())  # fmt: skip
+        across = self.theme.background_direction == "horizontal"
+        t = np.linspace(0.0, 1.0, w if across else h, dtype=np.float32)
+        line = a[None, :3] + (b - a)[None, :3] * t[:, None]  # (n, 3): from the first to the second
+        rgb = dither.ramp_u8(line, h if across else w, across, self.dither)
+        return Image.fromarray(rgb, "RGB").convert("RGBA")  # (opaque, as a picture is)
+
+    # -- animation ---------------------------------------------------------
+
+    def new_sample(self, at: float, interval: float) -> None:
+        """The main loop took fresh readings at ``at``; the next follow after ``interval`` s."""
+        before = getattr(self, "sample", None)  # (one long before: a start, a graph jumps there)
+        near = before is not None and 0 < at - before[0] <= 3 * max(before[1], interval)
+        self.sample_before = before[0] if near else None
+        self.sample = (at, max(0.001, interval))
+
+    def progress(self, now: float, delay: float = 0.0) -> float:
+        """How far ``now`` is from the last reading to the next, 0 to 1."""
+        at, interval = self.sample
+        return min(1.0, max(0.0, (now - at - delay) / interval))
+
+    def _glide_s(self, widget: dict[str, Any] | None = None) -> float:
+        """How long a value takes to a new reading (theme animation.smoothing_ms, or the
+        widget's own ``glide_ms``; 0: it jumps): 95 % of the way after it, in video mode as
+        on still frames. A reading is there in about half a second and then holds, as the
+        SPUR II mod's values did; a glide stretched to the next reading (about a second)
+        followed half as fast. The volume goes its own way on every screen (SPUR II's): its
+        number follows each step of the wheel at once, its bars and rings glide behind it in
+        a third of a second (:data:`VOLUME_GLIDE_MS`)."""
+        if not self.animate:
+            return 0.0
+        own = self._own_glide_ms(widget) if widget is not None else 0
+        if own is not None and own > 0:
+            return own / 1000
+        if own == 0 and widget is not None and widget.get("sensor") == VOLUME:
+            return 0.0  # the volume's number: at once
+        return max(0, self.theme.smoothing_ms) / 1000
+
+    @staticmethod
+    def _own_glide_ms(widget: dict[str, Any]) -> int | None:
+        """A widget's own glide (ms): its ``glide_ms``, else the volume's (0 for its
+        number: at once), else None (the theme's)."""
+        own = widget.get("glide_ms", 0)
+        if own > 0:
+            return int(own)
+        if widget.get("sensor") == VOLUME:
+            return 0 if widget["type"] == "metric" else VOLUME_GLIDE_MS
+        return None
+
+    @classmethod
+    def _spring(cls, widget: dict[str, Any]) -> str:
+        """Whose glide a widget follows: its sensor's, with the bars, rings and numbers of
+        it; one with a glide of its own (``glide_ms``, the volume's) follows one of its own."""
+        own = cls._own_glide_ms(widget)
+        return f"{widget['sensor']}\0{own}" if own else widget["sensor"]
+
+    def _lead(self) -> float:
+        """The time between two planned frames (0: not known)."""
+        return 1 / self.fps if self.fps > 0 else 0.0
+
+    def _eased(self, widget: dict[str, Any], target: float | None, now: float) -> float | None:
+        """Glide towards new values instead of jumping (widgets with ``smooth``).
+
+        A critically damped spring per sensor (:class:`~libre_panel.render.motion.Motion`):
+        it starts gently, a new reading changes its course without a kink, and
+        all widgets of a sensor glide together, also into the next theme.
+        """
+        glide = self._glide_s(widget)
+        if glide <= 0 or not widget.get("smooth", False):
+            return target
+        state = self.motion.glide(self._spring(widget), target, now, glide, self._lead())
+        if state is None or target is None:
+            return target
+        value, speed = state
+        span = abs(widget.get("max", 100) - widget.get("min", 0)) or 1.0
+        if abs(target - value) < span * 0.002 and abs(speed) * glide < span * 0.002:
+            return target
+        self.moving = True
+        return value
+
+    # -- effects and compositing ------------------------------------------
+
+    def _effects(self, widget: dict[str, Any], piece: Piece) -> Piece:
+        opacity = widget.get("opacity", 1.0)
+        layer = _scale_alpha(piece.layer, opacity)
+        box = piece.box or [piece.x, piece.y, piece.layer.width, piece.layer.height]
+        light = _dimmed(piece.light, opacity)
+        out, pad = self._halo(widget, layer)
+        if out is None and layer is piece.layer:
+            return replace(piece, box=box, light=light)
+        # (another layer: one laid by the engine goes as its pixels, what it was laid of goes)
+        native = None if isinstance(piece.native, scenes.Laid) else piece.native
+        if out is None:
+            return replace(piece, layer=layer, box=box, light=light, native=native)
+        out.alpha_composite(layer, (pad, pad))
+        done = replace(piece, layer=out, x=piece.x - pad, y=piece.y - pad, box=box, light=light,
+                       native=native)  # fmt: skip
+        return _clip_sides(done) if widget.get("clip") else done
+
+    def _halo(
+        self, widget: dict[str, Any], layer: Image.Image, exact: bool = False
+    ) -> tuple[Image.Image | None, int]:
+        """Shadow and glow of ``layer`` (without the layer), ``pad`` pixels larger
+        on every side; None without effects. ``exact``: see :func:`_blur`."""
+        glow = widget.get("glow", 0.0)
+        shadow = widget.get("shadow")
+        if not glow and not shadow:
+            return None, 0
+        pad = 0
+        if glow:
+            pad = max(pad, widget.get("glow_radius", 10) * 2)
+        if shadow:
+            pad = max(pad, widget.get("shadow_blur", 6) * 2 + abs(widget.get("shadow_offset", 3)))
+        size = (layer.width + 2 * pad, layer.height + 2 * pad)
+        out = Image.new("RGBA", size, (0, 0, 0, 0))
+        if shadow:
+            tint = self.color(shadow)
+            silhouette = Image.new("RGBA", layer.size, (*tint[:3], 0))
+            silhouette.putalpha(layer.getchannel("A").point(lambda a: a * tint[3] // 255))
+            offset = widget.get("shadow_offset", 3)
+            base = Image.new("RGBA", size, (0, 0, 0, 0))
+            base.paste(silhouette, (pad + offset, pad + offset))
+            blur = widget.get("shadow_blur", 6)
+            # in floating point, made 8 bits with the dither in the panel's video (a graph's
+            # strips, ``exact``, keep whole levels: a part is the same wherever it is cut)
+            shade = _blur(base, blur, exact) if exact else _soft_light(base, blur, 1.0, self.dither)
+            out.alpha_composite(shade)
+        if glow:
+            base = Image.new("RGBA", size, (0, 0, 0, 0))
+            base.paste(layer, (pad, pad))
+            radius = widget.get("glow_radius", 10)
+            boost = 1.0 + glow * 2.5  # light spills: brighter than the shape's own alpha
+            # made stronger, the alpha's levels would be spread apart, as bands, and a fainter
+            # one keeps fewer of them: worked out in floating point (a graph's strips,
+            # ``exact``, keep whole levels: a part is the same wherever it is cut)
+            if exact:
+                halo = _blur(base, radius, exact)
+                halo.putalpha(halo.getchannel("A").point(lambda a: min(255, int(a * boost * glow))))
+            else:
+                halo = _soft_light(base, radius, boost * glow, self.dither)
+            out.alpha_composite(halo)
+        return out, pad
+
+    @staticmethod
+    def _paste(
+        canvas: Image.Image, layer: Image.Image, x: int, y: int, opaque: bool = False
+    ) -> None:
+        """alpha_composite that tolerates layers hanging off the canvas. Onto an
+        ``opaque`` canvas, a paste through the layer's alpha gives the same
+        colours in place (the canvas's own alpha is not used afterwards); a layer
+        without transparency (a video's frame: moving.solid) is pasted as it is."""
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + layer.width, canvas.width), min(y + layer.height, canvas.height)
+        if x1 <= x0 or y1 <= y0:
+            return
+        solid = moving.solid(layer)
+        if (x0, y0, x1, y1) != (x, y, x + layer.width, y + layer.height):
+            layer = layer.crop((x0 - x, y0 - y, x1 - x, y1 - y))
+        if solid:
+            canvas.paste(layer, (x0, y0))
+        elif opaque:
+            canvas.paste(layer, (x0, y0), layer)
+        else:
+            canvas.alpha_composite(layer, (x0, y0))
+
+    @staticmethod
+    def _composite(
+        canvas: Image.Image,
+        piece: Piece,
+        origin: tuple[int, int] = (0, 0),
+        opaque: bool = False,
+    ) -> None:
+        """Draw ``piece`` onto ``canvas``, whose top left corner is ``origin`` on
+        the panel (``opaque``: see :meth:`_paste`). The same for a frame of layers that the
+        engine composes (render/scene.py)."""
+        ox, oy = origin
+        if piece.backdrop is not None and piece.box is not None:
+            bx, by, bw, bh = piece.box
+            bx, by = bx - ox, by - oy
+            region = (
+                max(bx, 0),
+                max(by, 0),
+                min(bx + bw, canvas.width),
+                min(by + bh, canvas.height),
+            )
+            if region[2] > region[0] and region[3] > region[1]:
+                blurred = canvas.crop(region).filter(
+                    ImageFilter.GaussianBlur(piece.backdrop_radius)
+                )
+                mask = piece.backdrop.crop(
+                    (region[0] - bx, region[1] - by, region[2] - bx, region[3] - by)
+                )
+                canvas.paste(blurred, region[:2], mask)
+        if piece.add:
+            Renderer._add_light(canvas, piece.layer, piece.x - ox, piece.y - oy)
+            return
+        Renderer._paste(canvas, piece.layer, piece.x - ox, piece.y - oy, opaque)
+        if piece.light is not None:
+            light = piece.light
+            Renderer._add_light(canvas, light.layer, light.x - ox, light.y - oy)
+
+    @staticmethod
+    def _add_light(canvas: Image.Image, layer: Image.Image, x: int, y: int) -> None:
+        """Light (a layer whose colour is the light) added onto the canvas, as
+        light adds up; the part on the canvas only."""
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + layer.width, canvas.width), min(y + layer.height, canvas.height)
+        if x1 <= x0 or y1 <= y0:
+            return
+        if (x0, y0, x1, y1) != (x, y, x + layer.width, y + layer.height):
+            layer = layer.crop((x0 - x, y0 - y, x1 - x, y1 - y))
+        if layer.mode != canvas.mode:  # (an RGB frame: the light's colour, as it adds up)
+            layer = layer.convert(canvas.mode)
+        canvas.paste(ImageChops.add(canvas.crop((x0, y0, x1, y1)), layer), (x0, y0))
+
+    @staticmethod
+    def _extent(piece: Piece) -> tuple[int, int, int, int]:
+        """Everything a piece can change on the canvas: its layer, a backdrop
+        box and its light."""
+        if piece.span is not None:
+            return piece.span
+        x0, y0 = piece.x, piece.y
+        x1, y1 = x0 + piece.layer.width, y0 + piece.layer.height
+        if piece.backdrop is not None and piece.box is not None:
+            bx, by, bw, bh = piece.box
+            x0, y0, x1, y1 = min(x0, bx), min(y0, by), max(x1, bx + bw), max(y1, by + bh)
+        if piece.light is not None:
+            light = piece.light
+            x0, y0 = min(x0, light.x), min(y0, light.y)
+            x1, y1 = max(x1, light.x + light.layer.width), max(y1, light.y + light.layer.height)
+        piece.span = (x0, y0, x1, y1)
+        return piece.span
+
+    @staticmethod
+    def _merge(rects: list[list[int]], gap: int = 8) -> list[list[int]]:
+        """Merge rectangles that overlap or nearly touch, until none do."""
+        rects = [r[:] for r in rects]
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(rects)):
+                for j in range(i + 1, len(rects)):
+                    a, b = rects[i], rects[j]
+                    near_x = a[0] - gap < b[2] and b[0] - gap < a[2]
+                    near_y = a[1] - gap < b[3] and b[1] - gap < a[3]
+                    if near_x and near_y:
+                        rects[i] = [
+                            min(a[0], b[0]),
+                            min(a[1], b[1]),
+                            max(a[2], b[2]),
+                            max(a[3], b[3]),
+                        ]
+                        del rects[j]
+                        merged = True
+                        break
+                if merged:
+                    break
+        return rects
+
+    def _dirty(
+        self, before: list[tuple[str, Piece]], after: list[tuple[str, Piece]]
+    ) -> list[tuple[int, int, int, int]]:
+        """The separate regions to compose again (none if nothing changed)."""
+        width, height = self.theme.width, self.theme.height
+        full = [(0, 0, width, height)]
+        old, new = dict(before), dict(after)
+        if [w for w, _ in before if w in new] != [w for w, _ in after if w in old]:
+            return full  # the stacking order changed
+        rects = [
+            list(self._extent(piece))
+            for wid in old.keys() | new.keys()
+            if old.get(wid) is not new.get(wid)
+            for piece in (old.get(wid), new.get(wid))
+            if piece is not None
+        ]
+        backdrops = [
+            self._extent(piece) for _, piece in after if piece.backdrop is not None and piece.box
+        ]
+        rects = self._merge(rects)
+        # A frosted-glass piece blurs what lies beneath its whole box.
+        grown = True
+        while grown and backdrops:
+            grown = False
+            for r in rects:
+                for bx0, by0, bx1, by1 in backdrops:
+                    if bx0 < r[2] and bx1 > r[0] and by0 < r[3] and by1 > r[1]:
+                        wider = [min(r[0], bx0), min(r[1], by0), max(r[2], bx1), max(r[3], by1)]
+                        if wider != r:
+                            r[:] = wider
+                            grown = True
+            if grown:
+                rects = self._merge(rects)
+        clipped = []
+        for x0, y0, x1, y1 in rects:
+            x0, y0, x1, y1 = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
+            if x1 > x0 and y1 > y0:
+                clipped.append((x0, y0, x1, y1))
+        return clipped
+
+    # What lies under the pieces that change, by region: a region of the 12.3" is up to five
+    # megabytes (the newest stays, also alone), a graph's some hundred kilobytes. Lumen's on
+    # the 12.3" fit in 4 MB: 99 % of them are found (16 regions were kept: 71 %); SPUR II's
+    # and the companions' on the 9.2" are larger, and this finds as many of them as the 16 did
+    # (16 regions of the 12.3" were up to 84 MB).
+    UNDERLAY_BYTES = 8 * MB
+
+    def _compose_region(
+        self,
+        pieces: list[tuple[str, Piece]],
+        region: tuple[int, int, int, int],
+        changed: frozenset[str] | set[str] = frozenset(),
+    ) -> Image.Image:
+        """The region, laid piece by piece. What lies under the first ``changed``
+        piece is kept: while those pieces stay the same, the next frame starts
+        from there (the same steps in the same order, so the same pixels)."""
+        x0, y0, x1, y1 = region
+        inside = []
+        for wid, piece in pieces:
+            px0, py0, px1, py1 = piece.span or self._extent(piece)  # (worked out once a piece)
+            if px0 < x1 and px1 > x0 and py0 < y1 and py1 > y0:
+                inside.append((wid, piece))  # outside the region: its pixels are unchanged
+        below = next((i for i, (wid, _) in enumerate(inside) if wid in changed), len(inside))
+        hit = self._underlays.get(
+            region,
+            valid=lambda kept: (
+                len(kept[0]) <= below
+                and all(a is b for a, (_, b) in zip(kept[0], inside, strict=False))
+            ),
+        )  # (used: the last to go)
+        reused = hit is not None
+        if reused:
+            done, part = len(hit[0]), hit[1].copy()
+        elif self.keep_static:
+            done, part = 0, self._ground_of(region)  # (in the frames' mode)
+        else:
+            done = 0
+            part = Image.new("RGBA", (x1 - x0, y1 - y0), self.color(self.theme.background_color))
+            if self._background is not None:  # (in RGB: opaque, laid as it is)
+                under = self._background.crop(region)
+                if under.mode == "RGB":
+                    part.paste(under)
+                else:
+                    part.alpha_composite(under)
+        for i, (wid, piece) in enumerate(inside[done:], done):
+            if i == below and not (reused and done == below):
+                self._keep_underlay(region, [p for _, p in inside[:below]], part)
+            try:
+                self._composite(part, piece, (x0, y0), self._opaque)
+            except Exception as exc:  # one broken widget must not blank the panel
+                self._warn(f"widget {wid!r} failed: {exc}")
+        return part
+
+    def _ground(self) -> Image.Image:
+        """The theme's background colour with its picture laid over it, the size of the panel:
+        made once (and again for another colour: the cover's), and cut for every region that
+        is composed from the ground up (callers must not change it)."""
+        color = self.color(self.theme.background_color)
+        if self._grounds is None or self._grounds[0] != color:
+            self._grounds = None  # (the one before goes first: it is the panel's size)
+            ground, opaque = self._made_ground(color, self._background)
+            if self._mode == "RGB" and opaque:
+                # the picture is its own ground, kept once, the panel's size: its pixels go
+                # where nothing asked for them a while (the engine has them: _forget_laid) and
+                # are made again, the same, when something asks
+                me = weakref.ref(self)  # (no cycle: a renderer let go of goes at once)
+
+                def again_made(color: RGBA | None = color) -> Image.Image:
+                    renderer = me()
+                    if renderer is None:
+                        raise RuntimeError("the ground of a renderer that is gone")
+                    return renderer._made_ground(color, renderer._load_background())[0]
+
+                again = scenes.Again(ground.size, ground.mode, again_made)
+                again.im, again.used = ground.im, time.monotonic()
+                self._background = ground = again
+            self._grounds = (color, ground)
+        return self._grounds[1]
+
+    def _made_ground(
+        self, color: RGBA | None, background: Image.Image | None
+    ) -> tuple[Image.Image, bool]:
+        """The ground of :meth:`_ground` made of ``background`` (the theme's picture, or None),
+        in the frames' mode, and whether that picture was opaque (then the ground is it)."""
+        opaque = background is not None and (
+            background.mode == "RGB" or background.getchannel("A").getextrema()[0] == 255
+        )
+        if opaque:
+            ground = background  # opaque, as a photo is: the colour does not show through
+        else:
+            ground = Image.new("RGBA", (self.theme.width, self.theme.height), color)
+            if background is not None:
+                ground.alpha_composite(background)
+        if self._mode == "RGB" and ground.mode != "RGB":
+            ground = ground.convert("RGB")
+        return ground, bool(opaque)
+
+    def _ground_of(self, region: tuple[int, int, int, int]) -> Image.Image:
+        """The ground of ``region``: its colour alone where the theme has no background picture
+        (no picture the size of the panel is kept for that), else cut from :meth:`_ground`."""
+        color = self.color(self.theme.background_color)
+        if self._background is None and color is not None:
+            size = (region[2] - region[0], region[3] - region[1])
+            return Image.new(self._mode, size, color if self._mode == "RGBA" else color[:3])
+        return self._ground().crop(region)
+
+    def _keep_underlay(self, region: tuple[int, int, int, int], under: list[Piece], part) -> None:
+        # (its bytes are the picture's: the pieces under it are the frame's own)
+        self._underlays.put(region, (under, part.copy()), size_of(part))
+
+    def _compose(self, pieces: list[tuple[str, Piece]]) -> Image.Image:
+        theme = self.theme
+        full = (0, 0, theme.width, theme.height)
+        last = self._last if self.incremental else None
+        regions = [full] if last is None else self._dirty(last[0], pieces)
+        self._unchanged = last is not None and not regions
+        self._composed = None if last is None else list(regions)  # (render: self.damage)
+        if self._unchanged:
+            self._last = (pieces, last[1])
+            return last[1]
+        area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in regions)
+        changed: set[str] = set()
+        if last is not None:
+            before = dict(last[0])
+            changed = {wid for wid, piece in pieces if before.get(wid) is not piece}
+        if last is None or area > 0.6 * theme.width * theme.height:
+            canvas = self._compose_region(pieces, full, changed)
+        else:
+            canvas = last[1]
+            for region in regions:
+                canvas.paste(self._compose_region(pieces, region, changed), region[:2])
+        self._last = (pieces, canvas)
+        return canvas
+
+    def _layered(self, pieces: list[tuple[str, Piece]]) -> bool:
+        """Whether the engine can compose this frame of ``pieces`` as :meth:`_compose` does:
+        on the opaque ground of a frame in RGB (a look's grid is one more piece), of pieces
+        it takes as they are (render/scene.py's ``layerable``)."""
+        return (
+            self.keep_static
+            and self._mode == "RGB"
+            and self._opaque
+            and all(scenes.layerable(piece) for _, piece in pieces)
+        )
+
+    def _scene_frame(self, pieces: list[tuple[str, Piece]]) -> scenes.SceneFrame:
+        """The frame of ``pieces`` for the engine to compose: what changed is the engine's to
+        work out. The frame composed here last goes, with the pieces it was made of (on the
+        12.3" 5.5 MB and some more, kept the whole time the engine composed): one composed
+        here again (a transition, a message drawn here) is composed whole, once. What lay
+        under its pieces goes too: the frames composed here before the engine took them
+        (Lumen's eight at the start on the 12.3") left 7 MB of it, found by none after."""
+        self.damage = None
+        self._handed = None
+        self._last = None
+        if self._underlays.size:
+            self._underlays.clear()
+        self._forget_laid()
+        self.scenes += 1
+        color = self.color(self.theme.background_color)
+        if self._background is None and color is not None:
+            ground: Any = tuple(color[:3])
+        else:
+            ground = self._ground()
+        return scenes.SceneFrame(
+            scenes.Scene((self.theme.width, self.theme.height), ground, tuple(pieces))
+        )
+
+    # The pixels of what the engine lays or makes without them (render/scene.py's Again: a card
+    # it lays as its colour, Filled; the ground, which it keeps; Made, Laid) made here (for a
+    # frame composed here, the app's picture of the panel) go when nothing asked for them this
+    # long
+    FILLS_IDLE_S = 30.0
+
+    def _forget_laid(self) -> None:
+        """The pixels made here (for a frame composed here, the app's picture of the panel) of
+        what the engine lays or makes without them (render/scene.py's Again: the cards it lays
+        as their colour, the ground it keeps, the fans' rotors and rings, the texts of their
+        masks, the layers laid of such) that nothing asked for since :data:`FILLS_IDLE_S`
+        (looked at every few seconds, in frames the engine composes): after the app's window
+        was open, Lumen's 5 MB of cards on the 12.3"; its ground, 5.5 MB there and 3.7 on the
+        9.2"; its fans' rotors, a picture of each position they turned through."""
+        now = time.monotonic()
+        if now - self._fills_looked < 5.0:
+            return
+        self._fills_looked = now
+        scenes.forget_idle(self.FILLS_IDLE_S, now)
+
+    def _as_rgb(self, canvas: Image.Image) -> Image.Image:
+        """The frame of ``canvas``, in RGB: a new picture each time (the loop keeps frames and
+        draws on them). An RGBA picture pasted into an RGB one gives its colours as they are,
+        without a conversion: the RGB picture's fourth byte, which nothing shows or hands on,
+        takes the alpha. On the 12.3" that takes 0.9 ms, the conversion two; the frame before
+        in RGB with the parts new since pasted on it and copied took 0.6 to 0.9 ms, and five
+        megabytes kept for it."""
+        if not self.keep_static:
+            return canvas.convert("RGB")
+        if canvas.mode == "RGB":  # (composed in RGB: the frame is a copy)
+            return canvas.copy()
+        rgb = Image.new("RGB", canvas.size)
+        rgb.paste(canvas)
+        return rgb
+
+    def _cached(
+        self, widget: dict[str, Any], content: Any, build: Callable[[], Piece | None],
+        inline: bool = False,
+    ) -> Piece | None:  # fmt: skip
+        """Reuse the finished layer while the widget and its content stay the same; ``inline``:
+        a piece cheap to make (its pixels made later, if at all) is made here, not in the
+        helper thread."""
+        wid = widget["id"]
+        hit = self._cache.get(wid)
+        if hit is not None and hit[0] == content:
+            return hit[1]
+        if self.background_builds and hit is not None and not inline:
+            return self._cached_later(widget, content, build, hit)
+
+        piece = build()
+        if piece is not None:
+            piece = self._effects(widget, piece)
+            self._cache[wid] = (content, piece)
+        return piece
+
+    def _cached_later(
+        self,
+        widget: dict[str, Any],
+        content: Any,
+        build: Callable[[], Piece | None],
+        hit: tuple[Any, Piece],
+    ) -> Piece | None:
+        """Keep showing ``hit`` while the new piece is built in the helper thread."""
+        wid = widget["id"]
+        pending = self._pending.get(wid)
+        if pending is not None:
+            built_for, future = pending
+            if not future.done():
+                return hit[1]  # the newest content follows once this build is done
+            del self._pending[wid]
+            try:
+                piece = future.result()
+            except Exception as exc:  # one broken widget must not blank the panel
+                self._warn(f"widget {wid!r} failed: {exc}")
+                piece = None
+            if piece is not None:
+                hit = self._cache[wid] = (built_for, piece)
+            if built_for == content:
+                return hit[1]
+        if self._builder is None:
+            self._builder = _Builder(gate=self._gate())
+
+        def job() -> Piece | None:
+            built = build()
+            return None if built is None else self._effects(widget, built)
+
+        self._pending[wid] = (content, self._builder.submit(job))
+        return hit[1]
+
+    def close(self) -> None:
+        """Stop the helper thread and the screen, and let go of the contexts of plugin widget types
+        (a replaced renderer should call this; with the back references of its slots, look and
+        drawing weak, it is then freed with its last reference). What its theme reads is wanted
+        no more from then on, not only once it is freed: a source that works on demand (the
+        processes, a game's frame rates) stops at once."""
+        if not self.preview:
+            want(self, frozenset())
+        if self._builder is not None:
+            self._builder.close()
+            self._builder = None
+        for feed in self._feeds.values():
+            feed.close()
+        self._feeds.clear()
+        if self._strip_builder is not None:
+            self._strip_builder.close()
+            self._strip_builder = None
+        if self._earth_builder is not None:
+            self._earth_builder.close()
+            self._earth_builder = None
+        if self.screen is not None:
+            try:
+                self.screen.close()
+            except Exception as exc:
+                log.warning("screen %s: %s", self.theme.screen["name"], exc)
+            self.screen = None
+        self._plugin_types.clear()  # (their contexts refer to this renderer)
+
+    # -- plugins -----------------------------------------------------------
+
+    def _make_screen(self) -> Any:
+        if self.theme.screen is None:
+            return None
+        from libre_panel.plugins.loader import registry
+        from libre_panel.plugins.render import RenderContext
+
+        name = self.theme.screen["name"]
+        cls = registry().get("screens", name)
+        if cls is None:
+            return None  # the theme loader has warned
+        try:
+            return cls(RenderContext(self, cls), dict(self.theme.screen["options"]))
+        except Exception as exc:  # a broken screen must not blank the panel
+            self._warn(f"screen {name!r} failed to start: {exc}")
+            return None
+
+    def _screen_image(self, snapshot: Snapshot, now: float) -> Image.Image | None:
+        try:
+            image = self.screen.render(snapshot, now)
+        except Exception as exc:
+            self._warn(f"screen {self.theme.screen['name']!r} failed: {exc}")
+            return None
+        if getattr(self.screen, "moving", False):
+            self.moving = True
+        return image
+
+    def _screen_piece(self, image: Image.Image) -> Piece:
+        name = self.theme.screen["name"]
+        if self._screen_last is not None and self._screen_last[0] is image:
+            return self._screen_last[1]  # the same picture: nothing to compose again
+        size = (self.theme.width, self.theme.height)
+        layer = image if image.mode == "RGBA" else image.convert("RGBA")
+        if layer.size != size:
+            self._warn(f"screen {name!r} draws {layer.size[0]}x{layer.size[1]}, not {size}")
+            layer = layer.resize(size)
+        piece = Piece(layer, 0, 0)
+        self._screen_last = (image, piece)
+        return piece
+
+    def _draw_plugin(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        wtype = widget["type"]
+        if wtype not in self._plugin_types:
+            from libre_panel.plugins.loader import registry
+            from libre_panel.plugins.render import RenderContext
+
+            cls = registry().get("widgets", wtype)
+            self._plugin_types[wtype] = (cls(), RenderContext(self, cls)) if cls else None
+        entry = self._plugin_types[wtype]
+        if entry is None:
+            return None  # not installed; the theme loader has warned
+        kind, ctx = entry
+
+        def build() -> Piece | None:
+            result = kind.draw(widget, ctx, snapshot, now)
+            if result is None:
+                return None
+            at = (widget["x"], widget["y"])
+            image, (x, y) = result if isinstance(result, tuple) else (result, at)
+            return Piece(image if image.mode == "RGBA" else image.convert("RGBA"), int(x), int(y))
+
+        return self._cached(widget, ("plugin", kind.key(widget, snapshot, now)), build)
+
+    @property
+    def prepares(self) -> bool:
+        """Whether :meth:`warm` has something to load before the first frame
+        (a screen's ``prepare()``, light layers, the rotors of fans)."""
+        return (
+            self.screen is not None
+            or self.look is not None
+            or bool(self._finishes)
+            or any(w["type"] == "fan" for w in self.widgets)
+        )
+
+    def _prepare_fans(self) -> None:
+        """Every position of the theme's fans: the first frame would read their rotor's
+        144 pictures (render/fan.py), about 200 ms."""
+        for job in self._fan_jobs():
+            job()
+
+    def _prepare_look(self, later: list[Callable[[], Any]] | None = None) -> None:
+        """Load the light layers and build what the finishes and the look draw
+        from, so the first frame loads nothing (SPUR II stalled 118 ms on a
+        layer loaded in a frame). With ``later``, what only a later frame needs (a finish's
+        ``later``: every kind of weather) is put on it instead."""
+        for widget in self.widgets:
+            finish = self._finishes.get(widget["id"])
+            if finish is None:
+                continue
+            if later is not None and finish.later:
+                later += finish.later_jobs(self, widget)
+                continue
+            try:
+                finish.prepare(self, widget)
+            except Exception as exc:  # it is drawn when it comes, or flat
+                self._warn(f"widget {widget['id']!r} failed to prepare: {exc}")
+        if self.look is not None:
+            self.look.prepare()
+
+    def _fan_jobs(self) -> list[Callable[[], Any]]:
+        """The fans' rotors made ready: their layers, and the pictures of their positions where
+        they are drawn here (not where the engine makes them: :attr:`native_fans`, as it is when
+        the job runs)."""
+        jobs: list[Callable[[], Any]] = []
+        for widget in self.widgets:
+            if widget["type"] == "fan":
+                color = self.color(widget["color"])
+                if color is not None:
+                    look, paint = self.fan_choices.for_widget(widget)
+                    k = fan.rotor_size(fan.geometry(widget["w"], widget["h"])[0])
+                    jobs.append(lambda k=k, look=look: fan.rotor_layers(k, look))
+                    jobs += [
+                        lambda job=job: None if self.native_fans else job()
+                        for job in fan.preload_jobs(color[:3], widget["w"], widget["h"], look,
+                                                    paint)
+                    ]  # fmt: skip
+        return jobs
+
+    def _prepare_later(
+        self, jobs: list[Callable[[], Any]], pause: Callable[[], Any] | None
+    ) -> None:
+        """``jobs`` one by one in a thread of their own, each between two frames (``pause``):
+        what the first frame did not need, ready before a later one asks for it (until then
+        a frame makes what it draws itself)."""
+
+        def work() -> None:
+            for job in jobs:
+                if pause is not None:
+                    pause()
+                try:
+                    job()
+                except Exception:  # a frame makes it when it needs it, and says what fails
+                    log.debug("preparing for later frames failed", exc_info=True)
+
+        threading.Thread(target=work, name="theme-later", daemon=True).start()
+
+    def warm(
+        self,
+        snapshot: Snapshot | None,
+        now: float,
+        pause: Callable[[], Any] | None = None,
+        first: bool = False,
+    ) -> None:
+        """Build what the first frames need, away from the render thread: the
+        screen's ``prepare()``, the light layers of the look and the finishes,
+        the fans' rotors, and one frame of the widgets (cards, texts, icons,
+        graph strips). The screen does not draw here: its frames belong to the
+        render thread. ``pause`` runs between widgets (to wait while the render
+        thread draws). ``first``: the theme Libre Panel starts with, whose first frame is
+        waited for: what only a later frame needs (every kind of weather, every position of
+        the fans' rotors, a second or so) is made after it, between frames."""
+        screen = self.screen
+        if screen is not None:
+            try:
+                screen.prepare()
+            except Exception as exc:  # a broken plugin must not keep the theme away
+                self._warn(f"screen {self.theme.screen['name']!r} failed to prepare: {exc}")
+        later: list[Callable[[], Any]] | None = [] if first else None
+        if self.look is not None or self._finishes:
+            self._prepare_look(later)
+        if later is None:
+            self._prepare_fans()
+        else:
+            later += self._fan_jobs()
+        try:
+            if snapshot is None:
+                return
+            self.screen, self._breathe = None, pause
+            try:
+                if self.native_laid:  # (not composed here where the engine composes the frames)
+                    self.render(snapshot, now, scene=True)
+                else:  # (as before: a renderer of a test or a plugin may take no more)
+                    self.render(snapshot, now)
+            finally:
+                self.screen, self._breathe = screen, None
+        finally:
+            if later:
+                self._prepare_later(later, pause)
+
+    def _warm_slots(self, snapshot: Snapshot, now: float) -> None:
+        """Draw every card of every slot once, whichever is on show, so that the first change
+        finds its pieces made (a card's texts, icons and symbols take a few frames' time)."""
+        for slot in self._slots.values():
+            for card in range(len(slot.kinds)):
+                slot.pinned = card
+                self.render(snapshot, now)
+            slot.settle()
+
+    # -- rendering ---------------------------------------------------------
+
+    def render(
+        self, snapshot: Snapshot, now: float | None = None, scene: bool = False
+    ) -> tuple[Image.Image, dict[str, Box]]:
+        """The frame at ``now`` (RGB) and the widgets' boxes. While nothing on it changed, the
+        frame is the one handed out before: callers draw on a copy of it, never on it. With
+        ``scene`` (for an engine that composes frames itself), a frame whose pieces it composes
+        as this does is not composed here: it is a :class:`~libre_panel.render.scene.SceneFrame`,
+        whose pixels are made only when asked for."""
+        now = clock() if now is None else now
+        self.rendered += 1
+        self.damage = None  # (unknown, until the frame is composed)
+        snapshot = self._finite(snapshot)
+        self._held, self._held_for = {}, ()  # (a condition holds or not for the whole frame)
+        if self._slots and self.animate and not self.preview and not self._slots_warm:
+            self._slots_warm = True  # (once, with the first frame, or with the warm-up's)
+            self._warm_slots(snapshot, now)
+        theme = self.theme
+        self.moving = False
+        self.due = None
+        self.snapshot = snapshot
+        self.motion.begin(snapshot.readings, now, self._glide_s(), self._lead())
+        self._video_drawn = None
+        boxes: dict[str, Box] = {}
+        pieces: list[tuple[str, Piece]] = []
+        turns: dict[str, Turn] = {}  # the turned widgets' and modules' ("<id>/")
+        screen = self._screen_image(snapshot, now) if self.screen is not None else None
+        for slot in self._slots.values():  # which card each slot shows, and how far a change is
+            slot.begin(snapshot, now)
+        modules_gone: dict[str, bool] = {}  # a module left out (hidden, or its needs not met)
+        for widget in self.widgets:
+            if not widget.get("visible", True):
+                continue
+            module = self._modules.get(widget.get("_module", ""))
+            slot = how = None
+            if "_card" in widget and module is not None:  # a part of a card in a slot
+                slot = self._slots.get(module["id"])
+                how = slot.shows(widget["_card"]) if slot is not None else None
+                if slot is not None and how is None:
+                    continue  # the card is not on show
+            # (what a card that rolls up shows is what it showed: its conditions held then)
+            if how != "frozen" and self._missing(widget, snapshot):
+                continue
+            if module is not None:  # (worked out once a frame: each of its parts asks)
+                gone = modules_gone.get(module["id"])
+                if gone is None:
+                    gone = not module["visible"] or self._missing(module, snapshot)
+                    modules_gone[module["id"]] = gone
+                if gone:
+                    continue
+            draw = (
+                self._drawers.get(widget["id"])
+                or getattr(self, f"_draw_{widget['type']}", None)
+                or self._draw_plugin
+            )
+            try:
+                if how == "frozen":  # a card rolling up: what it showed before
+                    piece = slot.leave(widget["id"])
+                else:
+                    if widget["type"] == "metric":
+                        piece = self._metric(draw, widget, snapshot, now)
+                    else:
+                        piece = draw(widget, snapshot, now)
+                    if how == "live":
+                        piece = slot.live(widget["id"], piece)
+            except Exception as exc:  # one broken widget must not blank the panel
+                self._warn(f"widget {widget['id']!r} failed: {exc}")
+                continue
+            finally:
+                if self._breathe is not None:
+                    self._breathe()
+            if piece is None:
+                continue
+            pieces.append((widget["id"], piece))
+            turn = self._turn(widget, module, piece)
+            if turn is not None:
+                turns[widget["id"]] = turn
+                if module is not None:  # (and its frame and line of light, over its cards)
+                    turns[f"{module['id']}/"] = turn
+            if slot is None:  # what lies over a bar or a graph: its mark, its end dot
+                over = []
+                if widget["type"] == "bar" and widget.get("mark"):
+                    over.append((self._draw_mark(widget, snapshot), "mark"))
+                if widget["type"] == "bar" and widget.get("end_dot"):
+                    over.append((self._draw_bar_dot(widget, snapshot, now), "dot"))
+                elif widget["type"] == "graph" and widget.get("end_dot"):
+                    over.append((self._draw_end_dot(widget, snapshot, now), "dot"))
+                over += self._over.pop(widget["id"], ())  # (a list's fans)
+                for top, name in over:
+                    if top is not None:
+                        pieces.append((f"{widget['id']}\0{name}", top))
+            if module is not None:
+                boxes[module["id"]] = self.module_boxes[module["id"]]
+                continue
+            if widget["id"].startswith("\0"):  # drawn for the theme (the modules' backdrop)
+                continue
+            boxes[widget["id"]] = piece.box or [
+                piece.x,
+                piece.y,
+                piece.layer.width,
+                piece.layer.height,
+            ]
+        for slot in self._slots.values():  # frame and line of light, over the cards
+            slot.overlay(pieces)
+        if turns or self._turned:
+            self._turn_pieces(pieces, turns, boxes)
+        if self._strips:
+            self._forget_strips(now)
+        kept.tick()  # (what nothing used for a while goes: the weather bodies)
+        self.full_video = self._whole_video(pieces, turns, screen)
+        if screen is not None:
+            alone = not pieces and self.look is None
+            if alone and screen.mode == "RGB" and screen.size == (theme.width, theme.height):
+                # an opaque screen alone is the frame: nothing to compose
+                self._last = None
+                return screen, boxes
+            pieces.insert(0, ("\0screen", self._screen_piece(screen)))  # ids are never empty
+        if self.look is not None:
+            self.look.compose(pieces)  # the grid beneath
+        if scene and self._layered(pieces):
+            return self._scene_frame(pieces), boxes
+        canvas = self._compose(pieces)
+        # what changed since the frame before: the regions composed anew
+        self.damage = self._composed
+        # (the composed frame stays for the next: the panel gets a picture of its own, the one
+        # before again while nothing changed)
+        if self._unchanged and self._handed is not None:
+            frame = self._handed
+        else:
+            frame = self._as_rgb(canvas)
+            self._handed = frame if self.keep_static else None
+        return frame, boxes
+
+    # -- turned widgets ----------------------------------------------------
+
+    def _turn(
+        self, widget: dict[str, Any], module: dict[str, Any] | None, piece: Piece
+    ) -> Turn | None:
+        """How far a widget is turned (``rotate``, degrees clockwise) and about which point: a
+        module's parts about the middle of the module; a text about the point it is aligned
+        at, halfway down its line (its box follows its letters: a value that changes would move
+        it); anything else about the middle of its box. None for one that is not turned."""
+        owner = module if module is not None else widget
+        angle = float(owner.get("rotate") or 0) % 360
+        if not angle:
+            return None
+        if module is not None:
+            x, y, w, h = self.module_boxes[module["id"]]
+            return angle, (x + w / 2, y + h / 2)
+        if "font_size" in widget and "align" in widget and "w" not in widget:
+            font = self.font(widget.get("font", ""), widget["font_size"])
+            ascent, descent = font.getmetrics() if hasattr(font, "getmetrics") else (0, 0)
+            line = ascent + descent or widget["font_size"]
+            return angle, (widget["x"], widget["y"] + line / 2)
+        x, y, w, h = piece.box or [piece.x, piece.y, piece.layer.width, piece.layer.height]
+        return angle, (x + w / 2, y + h / 2)
+
+    def _turn_pieces(
+        self, pieces: list[tuple[str, Piece]], turns: dict[str, Turn], boxes: dict[str, Box]
+    ) -> None:
+        """Turn the pieces of the turned widgets, with what lies over them (a bar's mark and
+        dot, a list's fans) and a module's parts with its frame, and their boxes in the
+        editor. A piece turned as it was the frame before is that frame's again."""
+        before, self._turned = self._turned, {}
+        for index, (wid, piece) in enumerate(pieces):
+            base = wid.split("\0", 1)[0]
+            turn = turns.get(base) or turns.get(base.split("/", 1)[0] + "/")
+            if turn is None:
+                continue
+            hit = before.get(wid)
+            turned = hit[2] if hit and hit[0] is piece and hit[1] == turn else _turned(piece, turn)
+            self._turned[wid] = (piece, turn, turned)
+            pieces[index] = (wid, turned)
+            if wid in boxes and turned.box is not None:
+                boxes[wid] = turned.box
+        for key, turn in turns.items():
+            if key.endswith("/") and key[:-1] in boxes:  # a module: around all of it
+                boxes[key[:-1]] = _turned_box(self.module_boxes[key[:-1]], turn)
+
+    def _gate(self) -> Callable[[], None]:
+        """What the helper threads run before each job: :attr:`between_frames`, while the
+        renderer lives (they must not keep it alive)."""
+        ref = weakref.ref(self)
+
+        def gate() -> None:
+            renderer = ref()
+            wait = renderer.between_frames if renderer is not None else None
+            del renderer
+            if wait is not None:
+                wait()
+
+        return gate
+
+    def _holds(self, need: str, snapshot: Snapshot) -> bool:
+        """Whether a condition of ``needs`` holds (need_holds); one on a switch of the theme
+        (``switch.frames``, ``!switch.frames``) as the person set it, else as the theme does."""
+        held_for = self._held_for  # (the conditions worked out for these readings and pictures)
+        same = (
+            len(held_for) == 3
+            and held_for[0] is snapshot
+            and held_for[1] is snapshot.readings
+            and held_for[2] is snapshot.images
+        )
+        if same:
+            held = self._held.get(need)
+            if held is not None:  # (Arena's frame asks for "game.fps" sixty times)
+                return held
+        body = need.lstrip("!").strip()
+        if not body.startswith(SWITCH):
+            if not same:  # (other readings: worked out anew)
+                self._held, self._held_for = {}, (snapshot, snapshot.readings, snapshot.images)
+            held = self._held[need] = need_holds(need, snapshot)
+            return held
+        name = body[len(SWITCH) :]
+        on = self.switches.get(name, self.theme.switches.get(name, {}).get("on", False))
+        return on != need.startswith("!")
+
+    def _missing(self, widget: dict[str, Any], snapshot: Snapshot) -> bool:
+        for need in _needs_of(widget.get("needs") or ""):  # all of them must hold
+            if not self._holds(need, snapshot):
+                return True
+        if widget["type"] == "module":
+            return False
+        if not widget.get("hide_if_missing"):
+            return False
+        if widget["type"] == "weather":
+            key = f"weather.{widget['field']}"
+        elif widget["type"] == "icon" and widget["icon"] == "weather":
+            key = widget.get("sensor") or "weather.code"
+        elif widget["type"] == "graph":
+            if course_of(snapshot.value(widget["sensor"])) is not None:
+                return False
+            return len(snapshot.history.get(widget["sensor"], [])) < 2
+        else:
+            key = widget.get("sensor") or None  # an icon has an empty one
+        return key is not None and snapshot.value(key) is None
+
+    # -- text --------------------------------------------------------------
+
+    def _digit_cell(self, font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> float:
+        key = id(font)
+        if key not in self._digit_width:
+            self._digit_width[key] = max(font.getlength(d) for d in _DIGITS)
+        return self._digit_width[key]
+
+    def _advance(self, font: ImageFont.FreeTypeFont | ImageFont.ImageFont, ch: str) -> float:
+        """``font.getlength(ch)``, kept for a letter of ASCII: Pillow measures it with the font
+        itself, the same each time (another letter may be drawn with another font once the app's
+        language changes: fonts.fallback)."""
+        if not ch.isascii():
+            return font.getlength(ch)
+        key = (font, ch)
+        found = self._advances.get(key)
+        if found is None:
+            found = self._advances[key] = font.getlength(ch)
+        return found
+
+    def _digit_band(
+        self, font: ImageFont.FreeTypeFont | ImageFont.ImageFont
+    ) -> tuple[float, float, float, float]:
+        """The box the digits fill (``getbbox``, from the top left), kept."""
+        found = self._digit_bands.get(font)
+        if found is None:
+            found = self._digit_bands[font] = font.getbbox(_DIGITS, anchor="la")
+        return found
+
+    def _fit(self, widget: dict[str, Any], text: str) -> tuple[str, int]:
+        """The text and font size that keep within ``max_width``."""
+        size = widget.get("font_size", 24)
+        limit = widget.get("max_width", 0)
+        if limit <= 0 or not text or "\n" in text:
+            return text, size
+        spacing = widget.get("letter_spacing", 0)
+        tabular = widget.get("tabular", False)
+        joined = cursive(text)  # (such text is laid out whole: see _text_piece)
+
+        def width(candidate: str, font: Any) -> float:
+            if joined:
+                return font.getlength(candidate)
+            cell = self._digit_cell(font) if tabular else 0
+            advances = [
+                cell if tabular and ch in _DIGITS else self._advance(font, ch) for ch in candidate
+            ]
+            return sum(advances) + spacing * max(0, len(candidate) - 1)
+
+        font = self.font(widget.get("font", ""), size)
+        measured = width(text, font)
+        if measured <= limit:
+            return text, size
+        if widget.get("fit") == "ellipsis":
+            while len(text) > 1 and width(text.rstrip() + "…", font) > limit:
+                text = text[:-1]
+            return text.rstrip() + "…", size
+        return text, max(6, int(size * limit / measured))
+
+    def _text_piece(
+        self, widget: dict[str, Any], text: str, color: str, laid: bool = True
+    ) -> Piece:
+        """The text as a piece; ``laid``: as the engine lays it where it does (a text pasted on
+        another picture here is not)."""
+        text, size = self._fit(widget, text)
+        if size != widget.get("font_size", 24):
+            widget = {**widget, "font_size": size}
+        letters = self._letters(widget, text, color)
+        if letters is not None:
+            parts = [placed for placed in letters.glyphs if placed is not None]
+            if self.native_laid and parts:  # laid by the engine from the letters it keeps
+                made = scenes.laid(letters.size, parts)
+                return Piece(made.layer, letters.left, letters.y, box=letters.box, native=made)
+            return Piece(self._laid(letters), letters.left, letters.y, box=letters.box)
+        font = self.font(widget.get("font", ""), size)
+        x, y = widget["x"], widget["y"]
+        anchor = _ANCHORS.get(widget.get("align", "left"), "la")
+        measure = ImageDraw.Draw(Image.new("L", (1, 1)))
+        x0, y0, x1, y1 = measure.textbbox((x, y), text, font=font, anchor=anchor)
+        x0, y0 = int(math.floor(x0)), int(math.floor(y0))
+        w, h = max(1, math.ceil(x1) - x0 + 1), max(1, math.ceil(y1) - y0 + 1)
+        fill = self.color(color)
+        if (
+            laid
+            and self.native_masks
+            and self.native_laid
+            and fill is not None
+            and "\n" not in text
+        ):
+            # its mask, filled with its colour by the engine: the same pixels (scene.masked)
+            mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(mask).text((x - x0, y - y0), text, font=font, anchor=anchor, fill=255)
+            made = scenes.laid_masked(mask, fill)
+            return Piece(made.layer, x0, y0, native=made)
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).text((x - x0, y - y0), text, font=font, anchor=anchor, fill=fill)
+        return Piece(layer, x0, y0)
+
+    def _letters(self, widget: dict[str, Any], text: str, color: str) -> _Letters | None:
+        """``text`` laid out by hand, letter by letter: for letter spacing, equal-width
+        digits, a finish's own letters and a clock's rolling digits; None where it is drawn
+        whole. ``widget`` has the font size the text fits in (:meth:`_fit`)."""
+        font = self.font(widget.get("font", ""), widget.get("font_size", 24))
+        fill = self.color(color)
+        x, y = widget["x"], widget["y"]
+        align = widget.get("align", "left")
+        spacing = widget.get("letter_spacing", 0)
+        tabular = widget.get("tabular", False)
+        finish = self._finishes.get(widget.get("id", ""))  # a finish may letter its own way
+        lettered = finish is not None and finish.lettering(self, widget, font, text)
+        rolls = widget.get("digits", "jump") != "jump"  # the clock's: they move one by one
+        if cursive(text) or "\n" in text:  # letters that join: the whole text, as it is
+            return None
+        if not (spacing or lettered or rolls or (tabular and any(c in _DIGITS for c in text))):
+            return None
+        cell = self._digit_cell(font)
+        advances = []
+        for ch in text:
+            advance = cell if tabular and ch in _DIGITS else self._advance(font, ch)
+            advances.append(advance + spacing)
+        total = max(1.0, sum(advances) - spacing)
+        ascent, descent = font.getmetrics()
+        start = {"left": x, "center": x - total / 2, "right": x - total}.get(align, x)
+        margin = max(2, widget.get("font_size", 24) // 6)  # room for overhanging glyphs
+        w, h = math.ceil(total) + 2 * margin, ascent + descent
+        glyphs: list[tuple[Image.Image, int, int] | None] = []
+        inks: list[Any] = []
+        pen = float(margin)
+        for ch, advance in zip(text, advances, strict=True):
+            at = pen + (cell - self._advance(font, ch)) / 2 if tabular and ch in _DIGITS else pen
+            if lettered:  # the finish's letter: (image, left, top), or None for a blank
+                placed = finish.glyph(self, widget, font, ch, fill, at % 1.0)
+                glyphs.append(
+                    None if placed is None else (placed[0], math.floor(at) + placed[1], placed[2])
+                )
+                inks.append(False)
+            else:
+                glyph, gx, ink = self._glyph(font, ch, fill, at, margin, h)
+                glyphs.append((glyph, gx, 0))
+                inks.append(ink)
+            pen += advance
+        left = math.floor(start) - margin
+        box = [left + margin, y, math.ceil(total), h]
+        return _Letters((w, h), left, y, box, glyphs, font, inks)
+
+    def _laid(self, letters: _Letters) -> Image.Image:
+        """``letters`` laid on a clear layer, one after the other, as :meth:`_paste` lays them.
+        The ink of a letter of the renderer's own that lies over no ink laid before goes on as
+        it is, the same pixels: laid over what is clear it is itself, and round its ink it is
+        clear (0, 0, 0, 0), as the layer is. A letter whose ink meets ink is laid over it, as is
+        a finish's letter. Each letter laid over in a picture of its own was most of the time a
+        text piece took."""
+        layer = Image.new("RGBA", letters.size, (0, 0, 0, 0))
+        w, h = letters.size
+        inked: list[tuple[int, int, int, int]] = []  # where there is ink on the layer
+        inks = letters.inks if letters.inks is not None else [False] * len(letters.glyphs)
+        for placed, ink in zip(letters.glyphs, inks, strict=True):
+            if placed is None or ink is None:  # (no letter, or one without ink)
+                continue
+            image, x, y = placed
+            if ink is False:  # (where a finish's letter has ink is not known: all of it)
+                self._paste(layer, image, x, y)
+                inked.append((x, y, x + image.width, y + image.height))
+                continue
+            a, b, c, d = x + ink[0], y + ink[1], x + ink[2], y + ink[3]  # its ink on the layer
+            inside = a >= 0 and b >= 0 and c <= w and d <= h
+            if inside and not any(p < c and a < r and q < d and b < t for p, q, r, t in inked):
+                layer.paste(image.crop(ink), (a, b))
+            else:
+                self._paste(layer, image, x, y)
+            inked.append((a, b, c, d))
+        return layer
+
+    # glyph images kept: a gliding number changes a digit or two at a time (a digit of 60 px is
+    # about 10 kB; Arena on the 12.3" keeps some 3 MB of them)
+    GLYPH_BYTES = 4 * MB
+
+    def _glyph(
+        self, font: Any, ch: str, fill: RGBA, at: float, pad: int, h: int
+    ) -> tuple[Image.Image, int, tuple[int, int, int, int] | None]:
+        """``ch`` drawn at ``at`` (its fraction of a pixel counts) on an image
+        ``pad`` px wider on each side, where its left edge goes, and where its ink
+        lies in it (None: none): kept, so the next text with that character in that
+        place costs no rendering."""
+        whole = math.floor(at)
+        key = (id(font), ch, fill, round(at - whole, 4), pad, h)
+        found = self._glyphs.get(key)  # (the helper thread draws texts too: it is thread-safe)
+        if found is not None:
+            return found[0], whole - pad, found[1]
+        size = (math.ceil(font.getlength(ch)) + 2 * pad + 1, h)
+        if self.native_masks:  # (its mask: the engine fills it with the colour, scene.masked)
+            mask = Image.new("L", size, 0)
+            ImageDraw.Draw(mask).text((at - whole + pad, 0), ch, font=font, fill=255, anchor="la")
+            image: Image.Image = scenes.masked(mask, fill)
+            ink = scenes.masked_alpha(mask, fill[3]).getbbox()
+        else:
+            image = Image.new("RGBA", size, (0, 0, 0, 0))
+            ImageDraw.Draw(image).text((at - whole + pad, 0), ch, font=font, fill=fill, anchor="la")
+            ink = image.getbbox()  # (drawn on what is clear: round its ink it stays (0, 0, 0, 0))
+        self._glyphs.put(key, (image, ink))
+        return image, whole - pad, ink
+
+    def _format(self, widget: dict[str, Any], reading: Any) -> tuple[str, float | None]:
+        if reading is None or reading.value is None:
+            return widget.get("fallback", "--"), None
+        value = reading.value
+        if reading.key in TRANSLATED_READINGS and isinstance(value, str):
+            value = i18n.t(value)  # e.g. "Overcast" -> "Bedeckt"
+        try:
+            text = safe_format(widget["format"], value, reading.unit, reading.label)
+        except FormatError:
+            text = value if isinstance(value, str) else widget.get("fallback", "--")
+        return text, _number(value)
+
+    # text pieces kept: gliding numbers come back to the same texts (Arena's on the 12.3" are
+    # some 40 kB each; 256 of them were kept, 10 MB, and fewer found than with these)
+    TEXT_BYTES = 2 * MB
+
+    def _text_widget(self, widget: dict[str, Any], text: str, color: str) -> Piece | None:
+        """The text as a piece, kept by (text, colour): a number gliding back
+        and forth, or a seconds clock, draws each text once."""
+        wid = widget["id"]
+        piece = self._texts.get((wid, text, color))
+        if piece is not None:
+            self._cache[wid] = ((text, color), piece)
+            return piece
+        piece = self._cached(widget, (text, color), lambda: self._text_piece(widget, text, color))
+        hit = self._cache.get(wid)
+        if hit is not None and (wid, *hit[0]) not in self._texts:  # built now, or earlier
+            self._texts.put((wid, *hit[0]), hit[1])
+        return piece
+
+    def _draw_text(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        text = i18n.t(widget["text"]) if widget.get("translate") else widget["text"]
+        if widget.get("uppercase"):
+            text = text.upper()
+        return self._text_widget(widget, text, widget["color"])
+
+    def _metric(
+        self, draw: Callable[..., Piece | None], widget: dict[str, Any], snapshot: Snapshot,
+        now: float,
+    ) -> Piece | None:  # fmt: skip
+        """A metric as ``draw`` draws it (with its finish), or the piece it drew the frame before
+        where drawing it again would draw the same, as for most of a frame's metrics between two
+        readings: its reading the same object (a new reading is another; the volume's muting
+        too), and then neither its number gliding nor its colour fading, nor its glide to pass
+        its value (a number on the way it did not show) or a new text of it being made in the
+        helper thread. Its glide and colour are told it was drawn now, as drawing it would."""
+        wid, readings = widget["id"], snapshot.readings
+        reading = readings.get(widget["sensor"])
+        muted = readings.get(MUTED) if widget["sensor"] == VOLUME else None
+        moving, self.moving = self.moving, False
+        try:
+            held = self._still.get(wid)
+            if held is not None and held[1] is reading and held[2] is muted:
+                if self._settled(widget, reading, now) and not self.moving:
+                    return held[0]
+            piece = draw(widget, snapshot, now)
+            if self.moving or wid in self._pending or not self._settled(widget, reading, now):
+                self._still.pop(wid, None)
+            else:
+                self._still[wid] = (piece, reading, muted)
+            return piece
+        finally:
+            self.moving = moving or self.moving
+
+    def _settled(self, widget: dict[str, Any], reading: Any, now: float) -> bool:
+        """Whether a metric's number glides no more (or towards its value only), its glide and
+        colour told it was drawn now (with its reading's value, as :meth:`_draw_metric` does)."""
+        value = None if reading is None else _number(reading.value)
+        glide = self._glide_s(widget)
+        if widget.get("smooth") and glide > 0:
+            spring = self._spring(widget)
+            if spring in self.motion.fed:  # (a fine course: its number goes on along it)
+                return False
+            self.motion.glide(spring, value, now, glide, self._lead())
+            if self.motion.passes(spring, now):
+                return False
+        if widget.get("color_rules"):
+            self._rule_step(widget, value, now)
+        return True
+
+    def _draw_metric(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        reading = snapshot.readings.get(widget["sensor"])
+        own = MUTED in (widget.get("needs") or "")  # (a screen that shows muting itself)
+        if widget["sensor"] == VOLUME and not own and snapshot.value(MUTED) == 1:
+            # muted: said at once, on every screen, where the number was (SPUR II's MUTE)
+            colour = self.theme.palette.get("crit") or widget["color"]
+            return self._text_widget(widget, i18n.t("Mute").upper(), colour)
+        text, value = self._format(widget, reading)
+        glide = self._glide_s(widget)
+        if widget.get("smooth") and glide > 0:  # the gliding value, with bars and rings
+            spring = self._spring(widget)
+            state = self.motion.glide(spring, value, now, glide, self._lead())
+            # 25 new texts a second at most, at the graphs' points: as fluid, half the work
+            at = self.motion.value(spring, max(grid(now) / RATE, self.motion.start(spring)))
+            if state is not None and value is not None and at is not None:
+                gliding, shown = self._format(widget, replace(reading, value=at))
+                if gliding != text:  # settled once it reads the same
+                    text, value = gliding, shown
+                    self.moving = True
+        return self._text_widget(widget, text, self._rule_text(widget, value, now))
+
+    # -- thresholds --------------------------------------------------------
+
+    def _rule_step(self, widget: dict[str, Any], value: float | None, now: float) -> float:
+        """Which colour a value shows: 0 the widget's own, i the i-th lowest
+        threshold's. Crossing a threshold fades the colour in a fraction of a
+        second (Motion.fade), the same for every widget of the sensor with the
+        same rules: a bar and its number change together."""
+        rules = sorted(widget.get("color_rules", []), key=lambda r: r["above"])
+        if not rules:
+            return 0.0
+        step = 0 if value is None else sum(1 for rule in rules if value > rule["above"])
+        if not self.animate:
+            return float(step)
+        key = (widget.get("sensor"), tuple((rule["above"], rule["color"]) for rule in rules))
+        shown = self.motion.fade(key, step, now)
+        if shown != step:
+            self.moving = True
+        return shown
+
+    def _rule_mix(self, step: float) -> tuple[int, float]:
+        """The colour step below ``step`` and how far on to the next (eighths)."""
+        low = math.floor(step)
+        return low, round(_smoothstep(step - low) * 8) / 8
+
+    def _rule_text(self, widget: dict[str, Any], value: float | None, now: float) -> str:
+        """The text colour for ``value``: its own, a threshold's, or on the way."""
+        step = self._rule_step(widget, value, now)
+        rules = sorted(widget.get("color_rules", []), key=lambda r: r["above"])
+        colors = [widget["color"], *(rule["color"] for rule in rules)]
+        low, u = self._rule_mix(step)
+        if u <= 0 or low + 1 >= len(colors):
+            return colors[min(low, len(colors) - 1)]
+        mixed = _lerp(self.color(colors[low]), self.color(colors[low + 1]), u)
+        return "#{:02x}{:02x}{:02x}{:02x}".format(*mixed)
+
+    def _rule_paint(
+        self, widget: dict[str, Any], value: float | None, now: float
+    ) -> tuple[RGBA, RGBA | None]:
+        """A bar's or ring's colours for ``value``: its own (``color``, and
+        ``color2`` for a gradient along it), a threshold's (plain), or on the way."""
+        rules = sorted(widget.get("color_rules", []), key=lambda r: r["above"])
+        step = self._rule_step(widget, value, now)
+        low, u = self._rule_mix(step)
+        paints = [self._paint(widget, None), *(self._paint(widget, r["color"]) for r in rules)]
+        if u <= 0 or low + 1 >= len(paints):
+            return paints[min(low, len(paints) - 1)]
+        (a0, b0), (a1, b1) = paints[low], paints[low + 1]
+        if b0 is None and b1 is None:
+            return _lerp(a0, a1, u), None
+        return _lerp(a0, a1, u), _lerp(b0 or a0, b1 or a1, u)
+
+    def _paint(self, widget: dict[str, Any], rule: str | None) -> tuple[RGBA, RGBA | None]:
+        """A bar's colours: a threshold's colour plain, else ``color`` (to ``color2``)."""
+        if rule:
+            return self.color(rule), None
+        return self.color(widget["color"]), self.color(widget["color2"])
+
+    def _draw_weather(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        text, _ = self._format(widget, snapshot.readings.get(f"weather.{widget['field']}"))
+        return self._text_widget(widget, text, widget["color"])
+
+    def _draw_clock(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """The time as a text. With ``digits`` "roll" what changes on the second rolls (the
+        old letter up and out, the new one in from below, soft at the edges) or with "fade"
+        fades, for ``digits_seconds`` after it, as SPUR II's clocks do; at any other time it
+        is the text as it stands, the same pixels as a clock that jumps."""
+        when = self._time(widget, snapshot)  # the planned frame's, to the microsecond
+        text, color = self._clock_format(widget, when), widget["color"]
+        resting = self._text_widget(widget, text, color)
+        kind, seconds = widget.get("digits", "jump"), widget.get("digits_seconds", DIGITS_S)
+        if kind == "jump" or not self.animate or not 0 < seconds <= 1:
+            return resting
+        p = when.microsecond / 1e6 / seconds
+        if p >= 1:
+            return resting
+        before = self._clock_format(widget, when - timedelta(seconds=1))
+        # the new text's letters are made first (in the helper thread on a video panel): a
+        # change starts a frame late rather than holding the frame up
+        made = (widget["id"], text, color) in self._texts
+        if before == text or len(before) != len(text) or not made:
+            return resting
+        piece = self._changing(widget, before, text, color, 1 - (1 - p) ** 3, kind)
+        if piece is None:
+            return resting
+        self.moving = True
+        return self._effects(widget, piece)  # (never kept: it is another one every frame)
+
+    def _changing(
+        self, widget: dict[str, Any], old: str, new: str, color: str, e: float, kind: str
+    ) -> Piece | None:
+        """The clock ``e`` of the way from ``old`` to ``new``, letter by letter: the letters
+        that stay where they stand, those that change rolling or fading. None where the two
+        are not laid out alike (another size, another width)."""
+        old, size = self._fit(widget, old)
+        new, size_new = self._fit(widget, new)
+        if size != size_new:
+            return None
+        if size != widget.get("font_size", 24):
+            widget = {**widget, "font_size": size}
+        before, after = self._letters(widget, old, color), self._letters(widget, new, color)
+        if before is None or after is None or len(old) != len(new):
+            return None
+        if (before.size, before.left) != (after.size, after.left):
+            return None
+        w, h = after.size
+        # the band a digit lives in, with room above and below where the letters fade:
+        # outside the resting digit, so it does not end its roll dimmed and then light up
+        _, top, _, bottom = self._digit_band(after.font)
+        top, bottom = math.floor(top), math.ceil(bottom)
+        edge = max(6, (bottom - top) // 5)
+        band_top, band_h = top - edge, bottom - top + 2 * edge
+        up, down = max(0, -band_top), max(0, band_top + band_h - h)
+        layer = Image.new("RGBA", (w, h + up + down), (0, 0, 0, 0))
+        travel = DIGITS_TRAVEL * band_h
+        # (the renderer's own letters are all in their colour; a finish's are not: no ink known)
+        own_before = before.inks if before.inks is not None else [False] * len(before.glyphs)
+        own_after = after.inks if after.inks is not None else [False] * len(after.glyphs)
+        colour = self.color(color)[:3]
+        for was, comes, one, other, one_ink, other_ink in zip(
+            old, new, before.glyphs, after.glyphs, own_before, own_after, strict=True
+        ):
+            if was == comes:
+                if other is not None:
+                    self._paste(layer, other[0], other[1], other[2] + up)
+                continue
+            shown = [g for g in (one, other) if g is not None]
+            if not shown:
+                continue
+            x0 = min(g[1] for g in shown)
+            x1 = max(g[1] + g[0].width for g in shown)
+            if kind == "fade":  # each where it stands, the old one out as the new one comes in
+                pair = []
+                for glyph in (one, other):
+                    band = Image.new("RGBa", (x1 - x0, h), (0, 0, 0, 0))
+                    if glyph is not None:
+                        band.paste(glyph[0].convert("RGBa"), (glyph[1] - x0, glyph[2]))
+                    pair.append(band)
+                self._paste(layer, Image.blend(*pair, e).convert("RGBA"), x0, up)
+                continue
+            band = Image.new("RGBA", (x1 - x0, band_h), (0, 0, 0, 0))
+            for glyph, ink, dy in (
+                (one, one_ink, -e * travel),
+                (other, other_ink, (1 - e) * travel),
+            ):
+                if glyph is not None:
+                    own = colour if ink is not False else None
+                    image, row = _moved(glyph[0], glyph[2] - band_top + dy, own)
+                    self._paste(band, image, glyph[1] - x0, row)
+            band.putalpha(ImageChops.multiply(band.getchannel("A"), _ramp(x1 - x0, band_h, edge)))
+            self._paste(layer, band, x0, band_top + up)
+        return Piece(layer, after.left, after.y - up, box=after.box)
+
+    def _clock_text(self, widget: dict[str, Any], snapshot: Snapshot) -> str:
+        return self._clock_format(widget, self._time(widget, snapshot))
+
+    def _clock_format(self, widget: dict[str, Any], when: datetime) -> str:
+        try:
+            text = i18n.format_date(when, widget["format"])[:100]
+        except ValueError:
+            text = "--:--"
+        return text.upper() if widget.get("uppercase") else text
+
+    def _time(self, widget: dict[str, Any], snapshot: Snapshot) -> datetime:
+        """The time in the widget's time zone (empty: the computer's)."""
+        name = widget.get("timezone") or ""
+        if not name:
+            return snapshot.now
+        zone = timezones.zone(name)
+        if zone is None:
+            self._warn(f"unknown time zone {name!r} (widget {widget['id']!r})")
+            return snapshot.now
+        return snapshot.now.astimezone(zone).replace(tzinfo=None)
+
+    def _draw_countdown(
+        self, widget: dict[str, Any], snapshot: Snapshot, now: float
+    ) -> Piece | None:
+        text = countdown_text(widget["target"], widget["part"], snapshot.now, widget["done"])
+        return self._text_widget(widget, text, widget["color"])
+
+    def _draw_analog(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """A clock face. Its second hand jumps on the second (``hand`` "tick"), or moves to it
+        in ``digits_seconds`` as rolling digits do ("glide"), or goes round ("sweep"): then the
+        face with the other hands is kept, and the second hand, drawn once, is turned onto it
+        for each frame."""
+        moment = self._time(widget, snapshot)
+        hands = (moment.hour % 12, moment.minute, moment.second if widget["seconds"] else -1)
+        kind = widget.get("hand", "tick")
+        if kind == "tick" or hands[2] < 0 or not self.animate:
+            return self._cached(widget, hands, lambda: self._analog_piece(widget, *hands))
+        part = moment.microsecond / 1e6
+        seconds = widget.get("digits_seconds", DIGITS_S)
+        if kind == "sweep":
+            at = moment.second + part
+        elif 0 < seconds <= 1 and part < seconds:
+            at = moment.second - 1 + 1 - (1 - part / seconds) ** 3  # as the digits roll
+        else:
+            at = float(moment.second)
+        # the face with the hour and minute hands: the minute hand moves on every 5 seconds
+        shown = (hands[0], hands[1], moment.second // 5 * 5)
+        content = ("hand", shown, at)
+        hit = self._cache.get(widget["id"])
+        if hit is not None and hit[0] == content:
+            return hit[1]
+        face = self._analog_part(widget, shown)
+        layer = face.copy()
+        hand, at_x, at_y = self._second_hand(widget, at)
+        layer.alpha_composite(hand, (at_x, at_y))
+        x, y = widget["x"], widget["y"]
+        piece = Piece(layer, x, y, [x, y, layer.width, layer.height])
+        piece = self._hand_effects(widget, piece, (face, shown))
+        if kind == "sweep" or at != moment.second:
+            self.moving = True
+        else:  # at rest for the rest of the second (made here: a hand must not step back)
+            self._cache[widget["id"]] = (content, piece)
+        return piece
+
+    def _analog_part(self, widget: dict[str, Any], hands: tuple[int, int, int]) -> Image.Image:
+        """The face with its hour and minute hands at ``hands`` and no second hand, kept while
+        the widget stays the same."""
+        key = (widget["id"], json.dumps(widget, sort_keys=True, default=str), hands)
+        found = self._analog_parts.get(key)
+        if found is None:
+            found = self._analog_piece(widget, *hands, part="face").layer
+            self._analog_parts[key] = found
+            while len(self._analog_parts) > 8:
+                self._analog_parts.pop(next(iter(self._analog_parts)))
+        return found
+
+    def _hand_effects(
+        self, widget: dict[str, Any], piece: Piece, face: tuple[Image.Image, Any]
+    ) -> Piece:
+        """:meth:`_effects` for a face whose second hand moves (``piece``: the face with the hand
+        on it): on a face that is not see-through the hand adds nothing to the shape its shadow
+        and glow are of (it lies on the face), so those of ``face`` (its layer and its hands, as
+        :meth:`_analog_part` keeps them) are kept as long as it is. The glow of the whole face
+        made anew each frame the hand moved was most of a frame's work on Terra's 12.3" (four
+        faces, two milliseconds each, in the same frames). A see-through face's are made whole,
+        as before."""
+        solid = bool(widget["face"]) and self.color(widget["face"])[3] == 255
+        if not solid or (not widget.get("glow") and not widget.get("shadow")):
+            return self._effects(widget, piece)
+        opacity = widget.get("opacity", 1.0)
+        key = (widget["id"], json.dumps(widget, sort_keys=True, default=str), face[1])
+        kept = self._analog_halos.get(key)
+        if kept is None:
+            kept = self._analog_halos[key] = self._halo(widget, _scale_alpha(face[0], opacity))
+            while len(self._analog_halos) > 8:
+                self._analog_halos.pop(next(iter(self._analog_halos)))
+        halo, pad = kept
+        if halo is None:  # (no effects after all)
+            return self._effects(widget, piece)
+        out = halo.copy()
+        out.alpha_composite(_scale_alpha(piece.layer, opacity), (pad, pad))
+        done = replace(piece, layer=out, x=piece.x - pad, y=piece.y - pad,
+                       light=_dimmed(piece.light, opacity))  # fmt: skip
+        return _clip_sides(done) if widget.get("clip") else done
+
+    def _second_hand(self, widget: dict[str, Any], at: float) -> tuple[Image.Image, int, int]:
+        """The second hand at ``at`` seconds (a fraction too) with the dot in the middle, drawn
+        in its own small box (where it is on the face): a few milliseconds a frame."""
+        w, h = max(8, widget["w"]), max(8, widget["h"])
+        r, cx, cy = min(w, h) / 2, w / 2, h / 2
+        a = math.radians(at * 6 - 90)
+        tip = (cx + r * 0.84 * math.cos(a), cy + r * 0.84 * math.sin(a))
+        tail = (cx - r * 0.18 * math.cos(a), cy - r * 0.18 * math.sin(a))
+        width, dot = r * 0.022, r * 0.065
+        pad = max(width / 2, dot) + 2
+        x0 = max(0, math.floor(min(tip[0], tail[0], cx) - pad))
+        y0 = max(0, math.floor(min(tip[1], tail[1], cy) - pad))
+        x1 = min(w, math.ceil(max(tip[0], tail[0], cx) + pad))
+        y1 = min(h, math.ceil(max(tip[1], tail[1], cy) + pad))
+        s = SUPERSAMPLE
+        layer = Image.new("RGBA", ((x1 - x0) * s, (y1 - y0) * s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        accent = self.color(widget["color2"])
+
+        def at_s(px: float, py: float) -> tuple[float, float]:
+            return (px - x0) * s, (py - y0) * s
+
+        draw.line([at_s(*tail), at_s(*tip)], fill=accent, width=max(1, round(width * s)))
+        for px, py in (at_s(*tail), at_s(*tip)):
+            half = width * s / 2
+            draw.ellipse([px - half, py - half, px + half, py + half], fill=accent)
+        mx, my = at_s(cx, cy)
+        draw.ellipse([mx - dot * s, my - dot * s, mx + dot * s, my + dot * s], fill=accent)
+        return self._down(layer, x1 - x0, y1 - y0), x0, y0
+
+    def _analog_piece(self, widget: dict[str, Any], hour: int, minute: int, second: int,
+                      part: str = "all") -> Piece:  # fmt: skip
+        """The clock face with its hands; ``part`` "face" without the second hand and the
+        dot in the middle, "hand" those alone (the second hand at ``second``)."""
+        x, y, w, h = widget["x"], widget["y"], max(8, widget["w"]), max(8, widget["h"])
+        s = SUPERSAMPLE
+        layer, draw = self._canvas(w, h)
+        r = min(w, h) * s / 2
+        cx, cy = w * s / 2, h * s / 2
+
+        def at(angle: float, length: float) -> tuple[float, float]:
+            a = math.radians(angle - 90)
+            return cx + length * math.cos(a), cy + length * math.sin(a)
+
+        def hand(angle: float, length: float, width: float, color: RGBA, tail: float = 0) -> None:
+            start, end = at(angle + 180, tail), at(angle, length)
+            draw.line([start, end], fill=color, width=max(1, round(width)))
+            for px, py in (start, end):
+                draw.ellipse([px - width / 2, py - width / 2, px + width / 2, py + width / 2],
+                             fill=color)  # fmt: skip
+
+        if widget["face"] and part != "hand":
+            draw.ellipse([cx - r, cy - r, cx + r - 1, cy + r - 1], fill=self.color(widget["face"]))
+        if widget["marks"] and part != "hand":
+            marks = self.color(widget["marks"])
+            # a faint rim, as the lit rings have an edge: the face stands off the card
+            rim = (*marks[:3], round(marks[3] * 0.4))
+            draw.ellipse([cx - r, cy - r, cx + r - 1, cy + r - 1], outline=rim,
+                         width=max(1, round(r * 0.012)))  # fmt: skip
+            fine = min(w, h) >= 110
+            for tick in range(60):
+                hourly = tick % 5 == 0
+                if not hourly and not fine:
+                    continue
+                inner = r * (0.8 if tick % 15 == 0 else 0.84 if hourly else 0.9)
+                width = r * (0.055 if tick % 15 == 0 else 0.04 if hourly else 0.014)
+                hand(tick * 6, r * 0.93, width, marks, -inner)
+        color = self.color(widget["color"])
+        accent = self.color(widget["color2"])
+        if part != "hand":
+            hand((hour + minute / 60) * 30, r * 0.5, r * 0.085, color, r * 0.08)
+            hand((minute + max(0, second) / 60) * 6, r * 0.76, r * 0.055, color, r * 0.08)
+        if part == "face":
+            return Piece(self._down(layer, w, h), x, y, [x, y, w, h])
+        if second >= 0:
+            hand(second * 6, r * 0.84, r * 0.022, accent, r * 0.18)
+        dot = r * 0.065
+        draw.ellipse([cx - dot, cy - dot, cx + dot, cy + dot], fill=accent)
+        return Piece(self._down(layer, w, h), x, y, [x, y, w, h])
+
+    def pack(self, widget: dict[str, Any]) -> str:
+        """The look of a symbol or moon widget: its own, else the one the user chose."""
+        own = widget.get("pack", "auto")
+        return own if own in SYMBOL_PACKS else self.symbols
+
+    MOON_STEP = 10.0  # how often a moving moon's halo changes, per second
+
+    def _draw_moon(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """The moon at its phase: a disc and its lit side in the first look; in the second the
+        moon as it looks, lit from the right side (render/moon.py), its halo breathing slowly
+        where the panel is driven faster than once a second."""
+        phase = _number(snapshot.value(widget["sensor"]))
+        if phase is None:
+            return None
+        phase = round(phase % 1.0, 3)
+        if self.pack(widget) == "classic":
+            return self._cached(widget, phase, lambda: self._moon_classic(widget, phase))
+        from libre_panel.render import moon
+
+        step = round(now * self.MOON_STEP) if self.animate else None
+        if step is not None:
+            self.moving = True
+        # (made, with its glow, only when the halo's strength changed: a few times in a breath)
+        level = moon.halo_level(phase, None if step is None else step / self.MOON_STEP)
+        return self._cached(widget, (phase, level), lambda: self._moon_piece(widget, phase, step))
+
+    def _moon_classic(self, widget: dict[str, Any], phase: float) -> Piece:
+        """The moon lit as at ``phase`` (0 new, 0.5 full): a disc, its lit side
+        bounded by the terminator, an ellipse."""
+        size = max(8, widget["size"])
+        s = SUPERSAMPLE
+        layer, draw = self._canvas(size, size)
+        r = size * s / 2 - s
+        c = size * s / 2
+        if widget["color2"]:
+            draw.ellipse([c - r, c - r, c + r, c + r], fill=self.color(widget["color2"]))
+        turn = math.cos(2 * math.pi * phase)
+        waxing = phase <= 0.5
+        if widget["mirror"]:
+            waxing = not waxing
+        right, left = [], []
+        steps = 90
+        for i in range(steps + 1):
+            dy = -r + 2 * r * i / steps
+            half = math.sqrt(max(0.0, r * r - dy * dy))
+            if waxing:  # lit on the right, from the terminator to the edge
+                right.append((c + half, c + dy))
+                left.append((c + half * turn, c + dy))
+            else:
+                left.append((c - half, c + dy))
+                right.append((c - half * turn, c + dy))
+        if 0.004 < phase < 0.996:
+            draw.polygon(right + left[::-1], fill=self.color(widget["color"]))
+        x, y = widget["x"], widget["y"]
+        return Piece(self._down(layer, size, size), x, y, [x, y, size, size])
+
+    def _moon_piece(self, widget: dict[str, Any], phase: float, step: int | None = None) -> Piece:
+        from libre_panel.render import moon
+
+        size = max(8, widget["size"])
+        night = self.color(widget["color2"]) if widget["color2"] else None
+        t = None if step is None else step / self.MOON_STEP
+        image = moon.picture(size, phase, self.color(widget["color"]), night, widget["mirror"], t)
+        x, y = widget["x"], widget["y"]
+        return Piece(image, x, y, [x, y, size, size])
+
+    # -- the earth ---------------------------------------------------------
+
+    def _due_at(self, at: float) -> None:
+        """Something wants a new frame at ``at`` (its next step), not before."""
+        self.due = at if self.due is None else min(self.due, at)
+
+    def _draw_earth(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """The earth as it is now (render/earth.py): a globe that faces your place, made again
+        when its day has moved a pixel at its rim; or, with ``spin`` where the panel moves, one
+        that turns, a pixel at its middle a step, with a frame for each step only (the panel
+        may rest between). Each is lit in a thread of its own once it shows."""
+        from libre_panel.render import earth
+
+        wid, x, y = widget["id"], widget["x"], widget["y"]
+        size = max(8, widget["size"])
+        place = self.place
+        mark = place if widget["place"] else None
+        look = (self.color(widget["color"])[:3], self.color(widget["color2"])[:3],
+                widget["clouds"], widget["lights"])  # fmt: skip
+        every = earth.redraw_s(size)
+        # the moment it is lit for, on the wall clock (``now`` is the frame clock's)
+        moment = math.floor(snapshot.now.timestamp() / every) * every
+        held = self._earths.get(wid)
+        if widget["spin"] > 0 and self.animate:
+            lat = earth.turn_latitude(place)
+            key: tuple[Any, ...] = ("turn", size, lat, look)
+            if held is None or held.key != key:
+                turning = earth.Turning(size, lat, *look)
+                # it begins with your place in the middle (or your time zone's longitude)
+                begin = turning.step_at(earth.view_of(place)[1])
+                offset = begin - turning.step_of(now, widget["spin"])[0]
+                held = self._earths[wid] = _Globe(key, turning, offset=offset)
+            globe = held.turning
+            if held.lit != moment:
+                self._light_globe(held, moment, lambda: globe.lit(moment), globe.use)
+            step, due = globe.step_of(now, widget["spin"], held.offset)  # (the frame clock's)
+            self._due_at(due)
+            if held.piece is None or held.step != step or held.shown != globe.lit_at:
+                box = [x, y, size, size]
+                if self.native_globes and not self._has_effects(widget):  # made by the engine
+                    made = scenes.turned_globe(globe, step, mark)
+                    held.piece = Piece(made.layer, x, y, box, native=made)
+                else:
+                    held.piece = self._effects(widget, Piece(globe.frame(step, mark), x, y, box))
+                held.step, held.shown = step, globe.lit_at
+            return held.piece
+        centre = earth.view_of(place)
+        key = ("stand", size, centre, mark, look)
+        if held is None or held.key != key:
+            held = self._earths[wid] = _Globe(key)
+
+        def made(t: float, image: Image.Image) -> None:
+            held.piece = self._effects(widget, Piece(image, x, y, [x, y, size, size]))
+
+        if held.lit != moment:
+            self._light_globe(held, moment,
+                              lambda: earth.picture(size, moment, centre, mark, *look),
+                              made)  # fmt: skip
+        return held.piece
+
+    @staticmethod
+    def _has_effects(widget: dict[str, Any]) -> bool:
+        """Whether :meth:`_effects` changes a widget's picture (a halo, a fade, cut sides)."""
+        return bool(widget.get("glow") or widget.get("shadow") or widget.get("clip")
+                    or widget.get("opacity", 1.0) < 0.999)  # fmt: skip
+
+    def _light_globe(self, held: _Globe, moment: float, job: Callable[[], Any],
+                     use: Callable[[float, Any], None]) -> None:  # fmt: skip
+        """Light ``held`` for ``moment``: here the first time (or where nothing is built
+        aside), else in the globes' thread while the one before stays on show."""
+        if held.lit is None or not self.background_builds:
+            use(moment, job())
+            held.lit = moment
+            return
+        if held.pending is None:
+            if self._earth_builder is None:
+                self._earth_builder = _Builder("render-earth", self._gate())
+            held.pending = (moment, self._earth_builder.submit(job))
+            return
+        for_moment, future = held.pending
+        if not future.done():
+            return
+        held.pending = None
+        held.lit = for_moment  # (failed or not: not asked again until the next moment)
+        try:
+            use(for_moment, future.result())
+        except Exception as exc:  # a broken globe must not blank the panel
+            self._warn(f"the earth: {exc}")
+
+    # -- AI agents ---------------------------------------------------------
+
+    def _draw_agent(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """The sign of an AI agent at work (render/agent.py) for the state its reading says
+        (``ai.claude.state``): it moves while the agent works or waits for you."""
+        from libre_panel.render import agent
+
+        state = snapshot.value(widget["sensor"])
+        state = state if state in ("working", "waiting", "idle") else "off"
+        at = agent.step(state, now) if self.animate else None
+        if at is not None:
+            self.moving = True
+        size = max(8, widget["size"])
+        colors = tuple(self.color(widget[field]) for field in ("color", "color2", "muted"))
+        x, y = widget["x"], widget["y"]
+
+        def build() -> Piece:
+            image = agent.picture(size, state, at, *colors)
+            return Piece(image, x, y, [x, y, size, size])
+
+        return self._cached(widget, (state, at, colors, size), build)
+
+    def _draw_sunpath(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """The sun's way over the sky today (render/sunpath.py): the day gone and the sun where
+        it stands (``sun.progress``); by night the moon over the way, and under the midnight
+        sun the sun at its height. Nothing where the sun's times are not known."""
+        from libre_panel.render import sunpath
+
+        at = sunpath.step(snapshot.value(widget["sensor"]))
+        up = snapshot.value("sun.up")
+        if at is None and up is None:
+            return None  # (no place: no sun's times)
+        if at is None and _number(up) == 1:  # the midnight sun: up all day
+            at = sunpath.STEPS // 2
+        w, h = max(8, widget["w"]), max(6, widget["h"])
+        colour = self.color(widget["color"]) or (245, 196, 107, 255)
+        deep = self.color(widget["color2"]) or (
+            *(round(c * 0.62 + d * 0.38) for c, d in zip(colour[:3], (60, 24, 8), strict=True)),
+            255,
+        )
+        track = self.color(widget["background"]) or (42, 54, 68, 255)
+        moon = self.color(widget["night"]) or (201, 211, 222, 255)
+        thick = max(1.0, float(widget["thickness"]))
+        x, y = widget["x"], widget["y"]
+
+        def build() -> Piece:
+            image = sunpath.ground(w, h, thick, track)
+            if at is None:
+                image.alpha_composite(sunpath.night(w, h, thick, moon))
+            else:
+                image.alpha_composite(sunpath.day(w, h, thick, at / sunpath.STEPS, colour, deep))
+            return Piece(image, x, y, [x, y, w, h])
+
+        return self._cached(widget, (at, colour, deep, track, moon, w, h, thick), build)
+
+    # -- fans --------------------------------------------------------------
+
+    # the bars of lists kept: a core's bar that holds costs a lookup. Each is kept as the part
+    # round the end of its fill (_Bar), a kilobyte or two; whole, a bar of Lumen Companion's on
+    # the 9.2" was 32 kB, and a gliding list asked for a thousand of them
+    LIST_BAR_BYTES = 4 * MB
+    LIST_BAR_END_BYTES = 2 * MB  # each look's bar empty and full, which the rest of a bar is
+
+    def _draw_fan(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """A rotor that turns with the sensor's RPM, in a ring that shows the load. Its
+        turn is worked out from the planned time of the frame (render/fan.py)."""
+        wid, x, y, w, h = widget["id"], widget["x"], widget["y"], widget["w"], widget["h"]
+        rpm = _number(snapshot.value(widget["sensor"]))
+        look, paint = self.fan_choices.for_widget(widget)
+        rotor = self._rotors.get(wid)
+        if rotor is None:
+            rotor = self._rotors[wid] = fan.Rotor(wid)
+        rotor.blades = fan_looks.look(look).blades
+        if self.animate:
+            rotor.beat = self.beats.of(widget["sensor"], self.fps, rotor.blades)  # (every panel's)
+            rotor.advance(rpm, widget["max_rpm"], now)
+            self.moving = self.moving or rotor.turning
+        else:  # a preview or a picture: how it looks at this speed, standing
+            rotor.settle(rpm, widget["max_rpm"])
+        color = self.color(widget["color"])[:3]
+        # laid from its ring and its rotor, each kept by itself, as a list's fans are: a fan
+        # turning while its ring changes is no new picture to keep at every position (four of
+        # Lumen's, the pictures of all of them kept, found 61 in a hundred: 8 MB, and 6 more);
+        # made by the engine where it makes them, of what they are made of
+        made = self.native_fans and self.native_laid
+        parts = fan.made_parts(color, w, h, rotor, widget["frame"], look, paint) if made else None
+        if parts is None:
+            parts = fan.fan_parts(color, w, h, rotor, widget["frame"], look, paint)
+        canvas = fan.geometry(w, h)[2]
+        image = self._laid_fan(wid, parts, canvas, self.native_laid)
+        hit = self._fan_shown.get(wid)
+        if hit is not None and hit[0] is image:
+            return hit[1]  # (it stands: the same piece)
+        at = (x + (w - canvas) // 2, y + (h - canvas) // 2)
+        laid = self._laid_fans[wid][2]  # (laid by the engine: scene.Laid)
+        piece = self._effects(widget, Piece(image, at[0], at[1], [x, y, w, h], native=laid))
+        self._fan_shown[wid] = (image, piece)
+        return piece
+
+    # -- weather symbols ---------------------------------------------------
+
+    def _draw_symbol(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """A weather symbol drawn flat; the ``lit`` finish draws it from Blender's bodies.
+        Both are layers that move with the planned time of the frame (render/symbols.py)."""
+        from libre_panel.render import symbols
+
+        return symbols.draw(self, widget, snapshot, now)
+
+    # -- downloads ---------------------------------------------------------
+
+    def _draw_downloads(
+        self, widget: dict[str, Any], snapshot: Snapshot, now: float
+    ) -> Piece | None:
+        """A download card (render/download.py), its progress a flat bar; the ``lit``
+        finish makes it light in its groove."""
+        from libre_panel.render import download
+
+        return download.draw(self, widget, snapshot, now)
+
+    # -- pictures ----------------------------------------------------------
+
+    def _draw_image(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        pictures = self._slides(widget)
+        rel = self._slide(widget, pictures, snapshot, now) if pictures else ""
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        if rel.startswith("@"):  # a picture a sensor source or service has (an album cover)
+            return self._live_image(widget, snapshot.images.get(rel[1:]))
+        if moving.is_video(rel):
+            return self._draw_video(widget, rel, now)
+        animation = self._animation(widget, rel)
+        if animation is not None:  # an animated picture: the frame of the moment, from its first
+            began = self._began.setdefault((widget["id"], rel), now)
+            n = animation.index((now - began) * moving.speed_of(widget.get("speed", 1)))
+            if self.animate:
+                self.moving = True
+            frame = animation.frames[n]
+            return self._cached(widget, (rel, id(animation), n), lambda: Piece(frame, x, y))
+
+        def build() -> Piece:
+            image = self._asset_image(rel, w, h, widget["fit"], widget.get("align", "center"))
+            if image is None:
+                empty = Image.new("RGBA", (max(w, 1), max(h, 1)), (0, 0, 0, 0))
+                return Piece(empty, x, y)
+            if widget.get("blur", 0) > 0:
+                image = _blurred(image, widget["blur"])
+            if widget["radius"] > 0:
+                image = _rounded(image, widget["radius"])
+            return Piece(image, x, y)
+
+        return self._cached(widget, rel, build)
+
+    def _finish(self, widget: dict[str, Any]) -> Callable[[Image.Image], Image.Image]:
+        """What becomes of a picture in the widget: fitted, blurred, rounded."""
+        w, h = widget["w"], widget["h"]
+        fit, align = widget["fit"], widget.get("align", "center")
+        blur, radius = widget.get("blur", 0), widget["radius"]
+
+        def finish(image: Image.Image) -> Image.Image:
+            if blur > 0:
+                image = _blurred(image, blur, w, h, fit, align)
+            elif w > 0 and h > 0:
+                image = _fitted(image, w, h, fit, align)
+            return _rounded(image, radius) if radius > 0 else image
+
+        return finish
+
+    def _animation(self, widget: dict[str, Any], rel: str) -> moving.Animation | None:
+        """The frames of an animated picture (GIF, WebP, PNG) as the widget shows them, kept;
+        None for a still picture (drawn as one) or one that cannot be read."""
+        if not rel.lower().endswith((".gif", ".webp", ".png")) or self.theme.root is None:
+            return None
+        key = (rel, widget["w"], widget["h"], widget["fit"], widget.get("align", "center"),
+               widget.get("blur", 0), widget["radius"])  # fmt: skip
+        found = self._animations.get(key, _UNREAD)
+        if found is not _UNREAD:
+            return found
+        try:
+            found = moving.read_animation(resolve_asset(self.theme.root, rel),
+                                          self._finish(widget))  # fmt: skip
+        except (OSError, ThemeError, ValueError):
+            found = None  # (drawn as a still, which says what is wrong)
+        return self._animations.put(key, found, 4096 if found is None else found.size)
+
+    def _ffmpeg_path(self) -> str:
+        if self._ffmpeg is None:
+            from libre_panel.devices.base import DeviceError
+            from libre_panel.devices.h264 import find_ffmpeg
+
+            try:
+                self._ffmpeg = find_ffmpeg()
+            except DeviceError as exc:
+                self._ffmpeg = ""
+                self._warn(f"a video needs ffmpeg ({exc})")
+        return self._ffmpeg
+
+    def _video_info(self, rel: str, path: Path) -> moving.VideoInfo:
+        found = self._video_infos.get(rel)
+        if found is None:
+            found = self._video_infos[rel] = moving.video_info(self._ffmpeg_path(), path)
+        return found
+
+    def _draw_video(self, widget: dict[str, Any], rel: str, now: float) -> Piece | None:
+        """A video, round and round: its frame of the moment ``now`` (moving.VideoFeed); in a
+        preview or until the first one comes, its first frame. Without a size of its own (0, as a
+        picture added in Design starts) at the video's, within the theme's (#33: a picture
+        of 0 x 0 showed nothing where it was a video)."""
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        if self.theme.root is None or not self._ffmpeg_path():
+            return None
+        try:
+            path = resolve_asset(self.theme.root, rel)
+        except ThemeError as exc:
+            self._warn(f"video {rel!r}: {exc}")
+            return None
+        if w <= 0 or h <= 0:
+            own = self._video_info(rel, path).size
+            if own is None:
+                self._warn(f"video {rel!r}: ffmpeg cannot read it")
+                return None
+            room = min(1.0, self.theme.width / own[0], self.theme.height / own[1])
+            w, h = max(1, round(own[0] * room)), max(1, round(own[1] * room))
+            widget = {**widget, "w": w, "h": h}
+        fit, finish = widget["fit"], self._finish({**widget, "fit": "stretch"})
+        speed = moving.speed_of(widget.get("speed", 1))
+        self._video_drawn = (widget["id"], str(path), widget, (x, y, w, h))
+        rate = self.video_fps or moving.VIDEO_FPS
+        own = None if self.preview else self._video_info(rel, path).fps
+        if own:  # no faster than the video's own: no frame twice (29.97 is 30)
+            rate = min(rate, max(1, math.ceil(own - 0.05)))
+        keys = self.video_keys
+        key = (rel, w, h, fit, speed, rate, keys)
+        frame, count = None, -1
+        if not self.preview:
+            feed = self._feeds.get(key)
+            if feed is None:
+                feed = self._feeds[key] = moving.VideoFeed(self._ffmpeg_path(), path, w, h, fit,
+                                                           fps=rate, speed=speed,
+                                                           keys=keys)  # fmt: skip
+            count, frame = feed.frame(now)
+            if self.animate:
+                self.moving = True
+        if frame is None:  # a preview, or the video has not begun yet: its first frame
+            poster = self._images.get((rel, w, h, fit, "first"), _UNREAD)
+            if poster is _UNREAD:
+                poster = moving.first_frame(self._ffmpeg_path(), path, w, h, fit)
+                self._images.put((rel, w, h, fit, "first"), poster, w * h * 4)
+            frame, count = poster, -1
+        if frame is None:
+            return None
+        # (ffmpeg fitted it already: as it is, unless blurred or rounded)
+        same = frame.size == (w, h) and not widget.get("blur", 0) and not widget["radius"]
+        return self._cached(widget, (rel, key, count, id(frame)),
+                            lambda: Piece(frame if same else finish(frame), x, y))  # fmt: skip
+
+    def _whole_video(
+        self,
+        pieces: list[tuple[str, Piece]],
+        turns: dict[str, Any],
+        screen: Image.Image | None,
+    ) -> tuple[str, str, float] | None:
+        """The video of this frame, ``(path, fit, speed)``, where the frame is that video alone:
+        drawn edge to edge across the theme and nothing else with it (a look, a screen's
+        picture, a turn, a rounded or blurred corner, an effect, a picture behind one that is
+        contained); None otherwise. [video] direct has the panel take it from its file then."""
+        drawn = self._video_drawn
+        if drawn is None or screen is not None or self.look is not None or turns:
+            return None
+        wid, path, widget, box = drawn
+        whole = (0, 0, self.theme.width, self.theme.height)
+        if [name for name, _piece in pieces] != [wid] or box != whole:
+            return None
+        if widget.get("radius") or widget.get("blur") or widget.get("glow") or widget.get("shadow"):
+            return None
+        if widget.get("opacity", 1) != 1 or (
+            widget["fit"] == "contain" and self.theme.background_image
+        ):
+            return None
+        return path, widget["fit"], moving.speed_of(widget.get("speed", 1))
+
+    def _live_image(self, widget: dict[str, Any], image: Any) -> Piece | None:
+        if image is None:
+            return None
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+
+        def build() -> Piece:
+            picture = image.convert("RGBA")
+            blur, align = widget.get("blur", 0), widget.get("align", "center")
+            if blur > 0:
+                picture = _blurred(picture, blur, w, h, widget["fit"], align)
+            elif w > 0 and h > 0:
+                picture = _fitted(picture, w, h, widget["fit"], align)
+            if widget["radius"] > 0:
+                picture = _rounded(picture, widget["radius"])
+            return Piece(picture, x, y)
+
+        # (the picture is part of what the piece is made of, so it is kept as long as the piece is:
+        # another picture could else be made where it was, and be taken for it by its id)
+        return self._cached(widget, (id(image), image), build)
+
+    def _slide(self, widget: dict[str, Any], pictures: list[str], snapshot: Snapshot,
+               now: float) -> str:  # fmt: skip
+        """The picture on show. Still pictures take turns by the clock, ``seconds`` each; in a
+        slideshow with one that moves (a video, an animated picture), each that moves plays
+        whole rounds, as many as take ``seconds`` at least (a longer video: to its end), and
+        begins at its start."""
+        seconds = max(1, widget["seconds"])
+        if len(pictures) == 1 or not any(self._moving(rel) for rel in pictures):
+            return pictures[int(snapshot.now.timestamp() // seconds) % len(pictures)]
+        index, began, ends = self._shows.get(widget["id"], (-1, now, now))
+        if index < 0 or now >= ends or now < began or index >= len(pictures):
+            index = (index + 1) % len(pictures)
+            rel = pictures[index]
+            self._shows[widget["id"]] = (index, now, now + self._slide_seconds(widget, rel))
+            self._began[(widget["id"], rel)] = now  # (an animated picture: from its first frame)
+            for key, feed in self._feeds.items():
+                if key[0] == rel:  # (a video: from its start)
+                    feed.from_start()
+        return pictures[index]
+
+    def _moving(self, rel: str) -> bool:
+        """Does the slideshow's picture move: a video, or a picture of more than one frame?"""
+        found = self._moves.get(rel)
+        if found is None:
+            found = moving.is_video(rel)
+            if not found and rel.lower().endswith((".gif", ".webp", ".png")) and self.theme.root:
+                try:
+                    with Image.open(resolve_asset(self.theme.root, rel)) as picture:
+                        found = getattr(picture, "n_frames", 1) > 1
+                except (OSError, ThemeError, ValueError):
+                    found = False
+            self._moves[rel] = found
+        return found
+
+    def _slide_seconds(self, widget: dict[str, Any], rel: str) -> float:
+        """How long a picture of a slideshow shows: ``seconds``; one that moves whole rounds,
+        as many as take that long at least."""
+        seconds = max(1, widget["seconds"])
+        if not self._moving(rel) or self.theme.root is None:
+            return seconds
+        speed = moving.speed_of(widget.get("speed", 1))
+        if moving.is_video(rel):
+            try:
+                path = resolve_asset(self.theme.root, rel)
+            except ThemeError:
+                path = None
+            ready = path is not None and self._ffmpeg_path()
+            length = self._video_info(rel, path).length if ready else None
+        else:
+            animation = self._animation(widget, rel)
+            length = animation.length if animation is not None else None
+        if not length:
+            return seconds
+        length /= speed
+        return math.ceil(seconds / length - 1e-6) * length if length < seconds else length
+
+    def _slides(self, widget: dict[str, Any]) -> list[str]:
+        """The picture and the slideshow's others, folders read every half minute."""
+        key = widget["id"]
+        hit = self._slide_lists.get(key)
+        if hit is not None and time.monotonic() - hit[0] < 30:
+            return hit[1]
+        found = [widget["src"]] if widget["src"] else []
+        root = self.theme.root
+        for line in (widget.get("slides") or "").splitlines():
+            line = line.strip()
+            if line.startswith("@"):
+                found.append(line)
+            elif not line or root is None:
+                continue
+            elif any(ch in line for ch in "*?["):
+                matches = sorted(p for p in root.glob(line) if p.is_file())
+                for path in matches:
+                    try:
+                        resolve_asset(root, path.relative_to(root).as_posix())
+                    except (ThemeError, ValueError):
+                        continue  # nothing outside the theme folder
+                    if path.suffix.lower() in (
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".webp",
+                        *moving.VIDEO_SUFFIXES,
+                    ):
+                        found.append(path.relative_to(root).as_posix())
+            else:
+                found.append(line)
+        self._slide_lists[key] = (time.monotonic(), found)
+        return found
+
+    def _icon_name(self, widget: dict[str, Any], snapshot: Snapshot) -> str:
+        """The icon to show: the widget's, or for ``weather`` the weather's now."""
+        name = widget["icon"]
+        if name == "link":  # the network connection: a cable, or Wi-Fi as strong as it is
+            return link_icon(snapshot.value(widget.get("sensor") or "net.link.kind"),
+                             snapshot.value("net.wifi.signal"))  # fmt: skip
+        if name == "weather":
+            key = widget.get("sensor") or "weather.code"
+            # day or night: the forecast says so for its hours (weather.hour.3.day),
+            # Open-Meteo for now (weather.is_day); else the clock decides
+            daylight = snapshot.value(
+                key[: -len(".code")] + ".day" if key.endswith(".code") else ""
+            )
+            if daylight is None and key == "weather.code":
+                daylight = snapshot.value("weather.is_day")
+            night = not 6 <= snapshot.now.hour < 20 if daylight is None else not daylight
+            name = weather_icon_name(snapshot.value(key), night)
+        return name
+
+    def _draw_icon(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        name = self._icon_name(widget, snapshot)
+        color = self.color(widget["color"])
+
+        def build() -> Piece:
+            icon = draw_icon(name, widget["size"], color, float(widget["stroke"]))
+            return Piece(icon, widget["x"], widget["y"])
+
+        return self._cached(widget, (name, color), build)
+
+    def _draw_calendar(
+        self, widget: dict[str, Any], snapshot: Snapshot, now: float
+    ) -> Piece | None:
+        today = snapshot.now.date()
+        colors = (widget["color"], widget["color2"], widget["muted"])
+        language = i18n.language()
+        return self._cached(
+            widget, (today, colors, language), lambda: self._calendar_piece(widget, today)
+        )
+
+    def _calendar_piece(self, widget: dict[str, Any], today: Any) -> Piece:
+        w, h = max(14, widget["w"]), max(14, widget["h"])
+        first = today.replace(day=1)
+        start = 0 if widget["first_day"] == "monday" else 6  # weekday() of the first column
+        lead = (first.weekday() - start) % 7
+        days = calendar.monthrange(today.year, today.month)[1]
+        weeks = (lead + days + 6) // 7
+        cell_w, cell_h = w / 7, h / (weeks + 1)
+        size = max(6, min(widget["font_size"], int(cell_h * 0.62), int(cell_w * 0.5)))
+        font = self.font(widget.get("font", ""), size)
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        fill, mark, muted = (
+            self.color(c) for c in (widget["color"], widget["color2"], widget["muted"])
+        )
+        monday = today - timedelta(days=today.weekday())
+        for column in range(7):
+            day = monday + timedelta(days=(start + column) % 7)
+            name = i18n.format_date(datetime.combine(day, datetime.min.time()), "%a")[:2]
+            draw.text(
+                ((column + 0.5) * cell_w, cell_h / 2), name, font=font, fill=muted, anchor="mm"
+            )
+        r, g, b, _a = mark
+        light = 0.299 * r + 0.587 * g + 0.114 * b > 150
+        for number in range(1, days + 1):
+            slot = lead + number - 1
+            cx = (slot % 7 + 0.5) * cell_w
+            cy = (slot // 7 + 1.5) * cell_h
+            color = fill
+            if number == today.day:  # a smooth dot: drawn larger, then reduced
+                radius = min(cell_w, cell_h) * 0.46
+                side = max(2, round(radius * 2))
+                dot = Image.new("L", (side * 4, side * 4), 0)
+                ImageDraw.Draw(dot).ellipse([0, 0, side * 4 - 1, side * 4 - 1], fill=255)
+                dot = dot.resize((side, side), Image.Resampling.LANCZOS)
+                corner = (round(cx - side / 2), round(cy - side / 2))
+                layer.paste(Image.new("RGBA", (side, side), mark), corner, dot)
+                color = (12, 16, 22, 255) if light else (255, 255, 255, 255)
+            draw.text((cx, cy), str(number), font=font, fill=color, anchor="mm")
+        return Piece(layer, widget["x"], widget["y"])
+
+    # -- lists -------------------------------------------------------------
+
+    def _draw_list(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        items = lists.pick(widget, snapshot.readings)
+        if widget["hide_unused"]:  # (a mainboard's fan headers with nothing on them)
+            items = [item for item in items if lists.used(item)]
+        items = items[: self._list_room(widget, len(items))]
+        lo, hi = widget["min"], widget["max"]
+        if hi <= lo:  # the largest value shown fills the bar
+            hi = max([lo + 1e-9] + [i.number for i in items if i.number is not None])
+        # the bars glide to a new reading, with the other bars and rings of its sensor
+        glide = widget["smooth"] and widget["levels"] and widget["style"] != "fans"
+        rows = []
+        for item in items:
+            reading = item.reading
+            try:
+                if widget["format"] in ("", "auto"):
+                    text = auto_format(reading.value, reading.unit)
+                else:
+                    text = safe_format(widget["format"], reading.value, reading.unit, item.name)
+            except FormatError:
+                text = reading.value if isinstance(reading.value, str) else "--"
+            detail = ""
+            if item.detail is not None and item.detail.value is not None:
+                try:
+                    detail = safe_format(
+                        widget["detail_format"], item.detail.value, item.detail.unit, item.name
+                    )
+                except FormatError:
+                    detail = ""
+            number = item.number
+            if glide and number is not None:
+                spring = {"type": "list", "sensor": item.key, "smooth": True, "min": lo, "max": hi}
+                number = self._eased(spring, number, now)
+            frac = _fraction(number, lo, hi, widget["scale"])
+            rows.append((item.name, detail, text, round(frac, 3), _rule_color(widget, item.number)))
+        texts = tuple(row[:3] + row[4:] for row in rows)  # what the text shows
+        if widget["style"] == "fans":  # the names and numbers stay; the fans turn on them
+            piece = self._cached(widget, texts, lambda: self._list_piece(widget, rows))
+            return self._list_turning(widget, piece, items, hi, now) if piece and items else piece
+        if not (glide and self.animate):
+            return self._cached(widget, tuple(rows), lambda: self._list_piece(widget, rows))
+        # gliding bars: drawn anew while they move, on their own; the text stays as it is
+        wid = widget["id"]
+        text = self._cached(widget, texts, lambda: self._list_piece(widget, rows, "text"))
+        levels = self._cached({**widget, "id": f"{wid}\0levels"}, tuple(rows),
+                              lambda: self._list_piece(widget, rows, "levels"))  # fmt: skip
+        if self.keep_static and "_card" not in widget and self._text_apart(widget, levels, text):
+            self._over[wid] = [(text, "text")]  # (laid over the bars by the frame)
+            return levels
+        return self._joined(wid, levels, text)
+
+    def _text_apart(self, widget: dict[str, Any], levels: Piece | None,
+                    text: Piece | None) -> bool:  # fmt: skip
+        """Whether a list's names and numbers lie on none of its bars (in no box a bar lies
+        in): then the bars laid on the frame and the text over them give the pixels the two
+        joined give (where one is transparent, the other is the join), and only the bars go
+        anew while they glide, the text staying as it is (Arena's temperatures and cores on the
+        12.3": the join was a fifth of the main loop). Not with effects (a halo reaches past
+        the bars) or where the two are not laid alike."""
+        if levels is None or text is None or text.layer.mode != "RGBA":
+            return False
+        if widget.get("glow") or widget.get("shadow") or widget.get("clip"):
+            return False
+        if widget.get("opacity", 1.0) < 0.999:
+            return False
+        if (levels.x, levels.y, levels.layer.size) != (text.x, text.y, text.layer.size):
+            return False
+        boxes = levels.layer.info.get("bars")
+        if boxes is None:
+            return False
+        hit = self._apart_texts.get(widget["id"])
+        if hit is not None and hit[0] is text.layer and hit[1] == boxes:
+            return hit[2]
+        alpha = text.layer.getchannel("A")
+        apart = all(alpha.crop(box).getbbox() is None for box in boxes)
+        self._apart_texts[widget["id"]] = (text.layer, boxes, apart)
+        return apart
+
+    def _joined(self, wid: str, below: Piece | None, above: Piece | None) -> Piece | None:
+        """Two pieces of a widget as one, ``above`` on ``below`` (kept while both stay)."""
+        if below is None or above is None:
+            return below or above
+        hit = self._joins.get(wid)
+        if hit is not None and hit[0] is below and hit[1] is above:
+            return hit[2]
+        x0, y0 = min(below.x, above.x), min(below.y, above.y)
+        x1 = max(below.x + below.layer.width, above.x + above.layer.width)
+        y1 = max(below.y + below.layer.height, above.y + above.layer.height)
+        if (x0, y0, x1 - x0, y1 - y0) == (below.x, below.y, *below.layer.size):
+            layer = below.layer.copy()
+        else:
+            layer = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+            layer.alpha_composite(below.layer, (below.x - x0, below.y - y0))
+        layer.alpha_composite(above.layer, (above.x - x0, above.y - y0))
+        piece = replace(below, layer=layer, x=x0, y=y0)
+        self._joins[wid] = (below, above, piece)
+        return piece
+
+    def _list_room(self, widget: dict[str, Any], count: int) -> int:
+        """How many items fit."""
+        w, h, fs = max(1, widget["w"]), max(1, widget["h"]), max(6, widget["font_size"])
+        limit = widget["max_items"] or lists.MAX_ITEMS
+        style = widget["style"]
+        if style == "columns":
+            room = int(w // max(4, fs * 0.45))
+        elif style == "cells":
+            room = int((w // 12) * (h // 12))
+        elif style == "fans":
+            room = self._list_fan_grid(widget, limit)[5]
+        else:
+            columns, _w, per_column, _h, _beside = self._list_layout(widget, count)
+            room = columns * per_column
+        return max(0, min(count, limit, room))
+
+    @staticmethod
+    def _list_layout(widget: dict[str, Any], count: int) -> tuple[int, float, int, float, bool]:
+        """Rows and bars: columns, their width, rows per column, row height and
+        whether bars stand beside the names (else below them)."""
+        w, h, fs = max(1, widget["w"]), max(1, widget["h"]), max(6, widget["font_size"])
+        gap = fs * 1.2
+        bars = widget["style"] == "bars" and widget["levels"]
+        if widget["columns"] > 0:
+            choices = [widget["columns"]]
+        else:  # as few as hold them all, each at least ten font sizes wide
+            choices = list(range(1, max(1, int((w + gap) // (fs * 10 + gap))) + 1))
+        for columns in choices:
+            column_w = (w - (columns - 1) * gap) / columns
+            beside = bars and not widget["detail"] and column_w >= fs * 15
+            row_h = fs * (1.8 if beside else 2.5 if bars else 1.75)
+            per_column = int(h // row_h)
+            if per_column * columns >= count or columns == choices[-1]:
+                break
+        return columns, column_w, per_column, row_h, beside
+
+    def _list_text(self, layer: Image.Image | None, text: str, x: float, cap_top: float,
+                   size: float, color: str, font: str, align: str = "left", width: float = 0,
+                   label: bool = False) -> None:  # fmt: skip
+        """Text on a list's layer, its capitals' top at ``cap_top`` (no layer: none)."""
+        if not text or layer is None:
+            return
+        size = max(6, round(size))
+        part = {
+            "x": round(x), "y": round(cap_top - 0.3 * size), "font": font, "font_size": size,
+            "align": align, "max_width": max(0, round(width)), "fit": "ellipsis",
+            "letter_spacing": max(1, round(size * 0.12)) if label else 0, "tabular": not label,
+        }  # fmt: skip
+        piece = self._text_piece(part, text, color, laid=False)
+        self._paste(layer, piece.layer, piece.x, piece.y)
+
+    def _list_bar(self, layer: Image.Image | None, widget: dict[str, Any], frac: float,
+                  rule: str | None, box: tuple[float, float, float, float],
+                  direction: str = "right") -> None:  # fmt: skip
+        x, y, w, h = (round(v) for v in box)
+        if w < 2 or h < 2 or layer is None:
+            return
+        steps = (h if direction in ("up", "down") else w) * SUPERSAMPLE
+        frac = round(frac * steps) / steps  # (to what can be seen: a gliding bar's are kept)
+        look = (w, h, direction, rule, widget["color2"], widget["background"])
+        kept = self._list_bars.get((*look, frac))
+        if kept is not None:
+            if isinstance(layer, _Levels):
+                layer.put_bar(kept, x, y)
+            else:
+                kept.paste(self, layer, x, y)
+            return
+        accent = self.color(widget["color2"])
+        track = self.color(widget["background"])
+        deep = _lerp(accent, track, 0.55) if track else accent
+        bar = {
+            "radius": min(w, h) // 2, "direction": direction, "segments": 0,
+            "segment_gap": 0, "color": "#{:02x}{:02x}{:02x}{:02x}".format(*deep),
+            "color2": widget["color2"], "background": widget["background"],
+        }  # fmt: skip
+        paint = self._paint(bar, rule)
+        image = self._bar_piece(bar, frac, paint, x, y, w, h).layer
+
+        def ends() -> tuple:
+            empty, full = (self._bar_piece(bar, f, paint, x, y, w, h).layer for f in (0.0, 1.0))
+            planes = _planes(empty), _planes(full)
+            # (pictures, their arrays, and those as pictures: what an engine cuts, _Levels)
+            return empty, full, *planes, *(Image.fromarray(a, "RGBA") for a in planes)
+
+        kept = _Bar.of(image, frac, direction, bar["radius"],
+                       lambda: self._list_bar_ends.make(look, ends))  # fmt: skip
+        self._list_bars.put((*look, frac), kept)
+        if isinstance(layer, _Levels):
+            layer.put_bar(kept, x, y)
+        else:
+            self._paste(layer, image, x, y)
+
+    def _list_piece(self, widget: dict[str, Any], rows: list[tuple],
+                    part: str = "all") -> Piece:  # fmt: skip
+        """The list drawn: all of it, or its ``part`` alone, the "text" or the "levels" (bars
+        and tiles; they glide, the text stays: :meth:`_draw_list`)."""
+        w, h = max(1, widget["w"]), max(1, widget["h"])
+        margin = max(2, widget["font_size"] // 3)  # room for glyphs that overhang
+        x, y = widget["x"], widget["y"]
+        if part == "levels" and rows and widget["style"] != "cells":  # (the bars of rows, columns)
+            size = (w + 2 * margin, h + 2 * margin)
+            levels = _Levels(size, (margin, margin), (w, h), cut=self.native_views)
+            if widget["style"] == "columns":
+                self._list_columns(None, levels, widget, rows)
+            elif widget["style"] != "fans":
+                self._list_rows(None, levels, widget, rows)
+            if levels.cuts:  # cut by the engine from the bars' parts it keeps, each sent once
+                view = scenes.viewed(size, levels.cuts)
+                view.layer.info["bars"] = tuple(levels.boxes)  # (where its bars lie: _text_apart)
+                return Piece(view.layer, x - margin, y - margin, [x, y, w, h], native=view)
+            image = levels.image()
+            image.info["bars"] = tuple(levels.boxes)  # (where its bars lie: _text_apart)
+            return Piece(image, x - margin, y - margin, [x, y, w, h])
+        layer = Image.new("RGBA", (w + 2 * margin, h + 2 * margin), (0, 0, 0, 0))
+        inner = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        texts = inner if part != "levels" else None
+        levels = inner if part != "text" else None
+        if not rows:
+            if widget["empty"]:
+                size = max(7, widget["font_size"] * 0.7)
+                self._list_text(texts, widget["empty"], w / 2, h / 2 - 0.35 * size, size,
+                                widget["muted"], widget["label_font"], "center", w)  # fmt: skip
+        elif widget["style"] == "columns":
+            self._list_columns(texts, levels, widget, rows)
+        elif widget["style"] == "cells":
+            self._list_cells(texts, levels, widget, rows)
+        elif widget["style"] == "fans":
+            self._list_fan_texts(texts, widget, rows)
+        else:
+            self._list_rows(texts, levels, widget, rows)
+        layer.alpha_composite(inner, (margin, margin))
+        return Piece(layer, x - margin, y - margin, [x, y, w, h])
+
+    def _list_name(self, widget: dict[str, Any], name: str) -> str:
+        return name.upper() if widget["uppercase"] else name
+
+    def _list_rows(self, layer: Image.Image | None, levels: Image.Image | None,
+                   widget: dict[str, Any], rows: list[tuple]) -> None:  # fmt: skip
+        h, fs = widget["h"], max(6, widget["font_size"])
+        columns, column_w, _per, row_h, beside = self._list_layout(widget, len(rows))
+        columns = max(1, min(columns, len(rows)))
+        gap = fs * 1.2
+        if widget["columns"] <= 0:  # automatic: the columns share the width
+            column_w = (widget["w"] - (columns - 1) * gap) / columns
+        per_column = -(-len(rows) // columns)
+        pitch = min(h / per_column, row_h * 1.45)
+        ls = max(7, fs * 0.62)  # names
+        bars = widget["style"] == "bars" and widget["levels"]
+        bar_h = max(3, round(fs * 0.26))
+        font = self.font(widget["font"], fs)
+        cell = self._digit_cell(font)
+        widest = max(
+            sum(cell if ch in _DIGITS else self._advance(font, ch) for ch in row[2]) for row in rows
+        )
+        value_w = min(widest + fs * 0.2, column_w * (0.5 if bars else 0.62))
+        for i, (name, detail, text, frac, rule) in enumerate(rows):
+            col, row = divmod(i, per_column)
+            x0 = col * (column_w + gap)
+            top = row * pitch + (pitch - row_h) / 2
+            color = rule or widget["color"]
+            if beside:  # name | bar | value
+                mid = top + row_h / 2
+                name_w = column_w * 0.3
+                self._list_text(layer, self._list_name(widget, name), x0, mid - 0.35 * ls, ls,
+                                widget["muted"], widget["label_font"], width=name_w - fs * 0.4,
+                                label=widget["uppercase"])  # fmt: skip
+                self._list_bar(levels, widget, frac, rule,
+                               (x0 + name_w, mid - bar_h / 2,
+                                column_w - name_w - value_w - fs * 0.5, bar_h))  # fmt: skip
+                self._list_text(layer, text, x0 + column_w, mid - 0.35 * fs, fs, color,
+                                widget["font"], "right", value_w)  # fmt: skip
+                continue
+            cap = top + (row_h - (0.7 * fs + (fs * 0.45 + bar_h if bars else 0))) / 2
+            name_text = self._list_name(widget, name)
+            name_w = column_w - value_w - fs * 0.6
+            name_cap = cap + 0.35 * (fs - ls)
+            muted, label_font = widget["muted"], widget["label_font"]
+            self._list_text(layer, name_text, x0, name_cap, ls, muted, label_font, width=name_w,
+                            label=widget["uppercase"])  # fmt: skip
+            if detail:
+                font = self.font(widget["label_font"], round(ls))
+                spacing = max(1, round(ls * 0.12)) if widget["uppercase"] else 0
+                used = font.getlength(name_text) + spacing * len(name_text) + ls * 0.7
+                if used < name_w - ls * 3:
+                    self._list_text(layer, detail, x0 + used, name_cap, ls,
+                                    widget["muted"], widget["label_font"],
+                                    width=name_w - used)  # fmt: skip
+            self._list_text(layer, text, x0 + column_w, cap, fs, color, widget["font"], "right",
+                            column_w * 0.6)  # fmt: skip
+            if bars:
+                self._list_bar(levels, widget, frac, rule,
+                               (x0, cap + 0.7 * fs + fs * 0.45, column_w, bar_h))  # fmt: skip
+
+    def _list_columns(self, layer: Image.Image | None, levels: Image.Image | None,
+                      widget: dict[str, Any], rows: list[tuple]) -> None:  # fmt: skip
+        """Upright bars side by side (the cores of a processor)."""
+        w, h, fs = widget["w"], widget["h"], max(6, widget["font_size"])
+        slot = w / len(rows)
+        ls = max(6, min(fs * 0.62, slot * 0.5))
+        names = lists.short_names([r[0] for r in rows])
+        show_names = slot >= ls * 1.4 and max(len(n) for n in names) * ls * 0.62 <= slot
+        vs = min(fs, slot / 2.3)  # the values over the columns
+        show_values = vs >= 7
+        top = vs * 0.7 + vs * 0.6 if show_values else 0
+        bottom = h - (ls * 0.7 + ls * 0.6 if show_names else 0)
+        bar_w = max(2, min(slot * 0.62, slot - 2, fs * 1.3))
+        for i, (_name, _detail, text, frac, rule) in enumerate(rows):
+            cx = slot * i + slot / 2
+            self._list_bar(levels, widget, frac, rule,
+                           (cx - bar_w / 2, top, bar_w, bottom - top), "up")  # fmt: skip
+            if show_values:
+                self._list_text(layer, text, cx, 0, vs, rule or widget["color"], widget["font"],
+                                "center", slot)  # fmt: skip
+            if show_names:
+                self._list_text(layer, names[i], cx, h - ls * 0.7, ls, widget["muted"],
+                                widget["label_font"], "center", slot)  # fmt: skip
+
+    @staticmethod
+    def _list_fan_grid(widget: dict[str, Any],
+                       count: int) -> tuple[int, int, float, float, int, int]:  # fmt: skip
+        """Fans side by side, as Lumen's (a 50 px fan beside a 26 px number): for ``count`` of
+        them the columns and lines (as even as they go: 2 + 2, not 3 + 1), the width and
+        height of each place, the fan's size, and how many fit at most."""
+        w, h, fs = max(1, widget["w"]), max(1, widget["h"]), max(6, widget["font_size"])
+        size = max(12, round(fs * 1.9))
+        fit = widget["columns"] if widget["columns"] > 0 else max(1, int(w // (size + fs * 5)))
+        lines = max(1, int((h + fs * 0.6) // (size + fs * 0.6)))
+        count = max(1, min(count, fit * lines))
+        used = -(-count // fit)
+        columns = fit if widget["columns"] > 0 else -(-count // used)
+        pitch = min(h / used, (size + fs * 0.6) * 1.5)
+        return columns, used, w / columns, pitch, size, fit * lines
+
+    def _list_fan_places(self, widget: dict[str, Any], count: int) -> list[tuple[float, float]]:
+        """Where each fan stands (its top left on the list), the lines in the middle."""
+        columns, used, cell_w, pitch, size, _room = self._list_fan_grid(widget, count)
+        top = (widget["h"] - pitch * used) / 2 + (pitch - size) / 2
+        return [((i % columns) * cell_w, top + (i // columns) * pitch) for i in range(count)]
+
+    def _list_fan_texts(self, layer: Image.Image | None, widget: dict[str, Any],
+                        rows: list[tuple]) -> None:  # fmt: skip
+        """Each fan's name and number beside the place it turns in (:meth:`_list_turning`)."""
+        fs = max(6, widget["font_size"])
+        _c, _l, cell_w, _p, size, _r = self._list_fan_grid(widget, len(rows))
+        ls = max(6, fs * 0.62, min(fs * 0.72, 11))  # names (small fans: a little larger)
+        block = 0.7 * ls + 0.55 * fs + 0.7 * fs
+        width = cell_w - size - fs * 0.65
+        places = self._list_fan_places(widget, len(rows))
+        for (x0, y0), (name, _detail, text, _frac, rule) in zip(places, rows, strict=True):
+            x, cap = x0 + size + fs * 0.35, y0 + (size - block) / 2
+            name = self._list_name(widget, name)
+            self._list_text(layer, name, x, cap, ls, widget["muted"], widget["label_font"],
+                            width=width, label=widget["uppercase"])  # fmt: skip
+            self._list_text(layer, text, x, cap + 0.7 * ls + 0.55 * fs, fs,
+                            rule or widget["color"], widget["font"], width=width)  # fmt: skip
+
+    def _list_turning(self, widget: dict[str, Any], piece: Piece, items: list[lists.Item],
+                      max_rpm: float, now: float) -> Piece:  # fmt: skip
+        """The fans of a list of them, each turning with its speed (as a fan widget does),
+        on the names and numbers (``piece``, kept while they stay the same). Where no name or
+        number lies under a fan, the fans go over the list as pieces of their own (the frame
+        lays them on it: :attr:`_over`) and the names and numbers stay as they are: a frame
+        composes the fans again, not the whole list (Arena's on the 12.3"), the same pixels.
+        Each fan is laid from its ring and its rotor (:func:`fan.fan_parts`, :meth:`_laid_fan`):
+        six fans of 48 positions each, their rings changing, did not stay in the pictures kept
+        as pictures of the whole fan and were made anew at every other frame."""
+        size = self._list_fan_grid(widget, len(items))[4]
+        color = self.color(widget["color2"])[:3]
+        frame = "ring" if widget["levels"] else "none"
+        ox, oy = widget["x"] - piece.x, widget["y"] - piece.y
+        fans, lays = [], []
+        for (x0, y0), item in zip(self._list_fan_places(widget, len(items)), items, strict=True):
+            key = f"{widget['id']}\0{item.key}"
+            rotor = self._rotors.get(key)
+            if rotor is None:
+                rotor = self._rotors[key] = fan.Rotor(key)
+            look, paint = self.fan_choices.for_widget({"sensor": item.key})
+            rotor.blades = fan_looks.look(look).blades
+            if self.animate:
+                rotor.beat = self.beats.of(item.key, self.fps, rotor.blades)
+                rotor.advance(item.number, max_rpm, now)
+                self.moving = self.moving or rotor.turning
+            else:
+                rotor.settle(item.number, max_rpm)
+            apart = self.keep_static and "_card" not in widget  # (it may go over the list)
+            made = apart and self.native_laid and self.native_fans  # (made by the engine)
+            parts = fan.made_parts(color, size, size, rotor, frame, look, paint) if made else None
+            if parts is None:
+                parts = fan.fan_parts(color, size, size, rotor, frame, look, paint)
+            canvas = fan.geometry(size, size)[2]
+            image = self._laid_fan(key, parts, canvas, apart and self.native_laid)
+            x, y = ox + x0 + (size - image.width) / 2, oy + y0 + (size - image.height) / 2
+            fans.append((image, round(x), round(y)))
+            lays.append(self._laid_fans[key][2])
+        if self.keep_static and "_card" not in widget and self._fans_apart(widget, piece, fans):
+            self._over[widget["id"]] = self._fan_pieces(widget["id"], piece, fans, lays)
+            return piece
+        layer = piece.layer.copy()
+        for image, x, y in fans:
+            self._paste(layer, image, x, y)
+        return replace(piece, layer=layer)
+
+    # the pictures of a fan's rotor (and its ring) the engine keeps for it, the latest: a rotor
+    # turning steadily shows 48 of them, each sent to the engine once
+    KEPT_ROTORS = 64
+
+    def _laid_fan(
+        self, key: str, parts: list[tuple[Image.Image, int]], canvas: int, native: bool = False
+    ) -> Image.Image:
+        """The picture of a fan, its ``parts`` laid one on the other (as :func:`fan.fan_image`
+        lays them): the one before while they are the same (a fan that stands), else laid anew
+        (a small picture, not kept beyond the frame). ``native``: one the engine lays from its
+        parts (scene.Laid, kept in :attr:`_laid_fans` with it), its pixels made here only when
+        something asks for them."""
+        images = tuple(image for image, _at in parts)
+        hit = self._laid_fans.get(key)
+        if hit is not None and len(hit[0]) == len(images) and (hit[2] is not None) == native:
+            if all(a is b for a, b in zip(hit[0], images, strict=True)):
+                return hit[1]
+        if native:
+            placed = [(image, at, at) for image, at in parts]
+            # (pictures the engine makes itself it need not keep: they are made again)
+            made_there = all(isinstance(image, scenes.Made) for image in images)
+            kept = () if made_there else self._rotor_kept(key, images)
+            made = scenes.laid((canvas, canvas), placed, kept)
+            self._laid_fans[key] = (images, made.layer, made)
+            return made.layer
+        first, at = parts[0]
+        # its ring as it is, the rotor over it (the ring's clear pixels keep their colour: what
+        # is clear shows nothing, laid on the frame here or by the engine)
+        if at == 0 and first.size == (canvas, canvas):
+            laid, rest = first.copy(), parts[1:]
+        else:
+            laid, rest = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0)), parts
+        for image, at in rest:
+            laid.alpha_composite(image, (at, at))
+        self._laid_fans[key] = (images, laid, None)
+        return laid
+
+    def _rotor_kept(self, key: str, images: tuple[Image.Image, ...]) -> tuple[Image.Image, ...]:
+        """The latest :data:`KEPT_ROTORS` pictures fan ``key`` was laid from, ``images`` the
+        newest: the engine keeps them, so a position the rotor comes back to is not sent again."""
+        kept = self._rotor_pictures.setdefault(key, {})
+        for image in images:
+            kept.pop(id(image), None)  # (an old one: the newest again)
+            kept[id(image)] = image
+        while len(kept) > self.KEPT_ROTORS:
+            kept.pop(next(iter(kept)))
+        return tuple(kept.values())
+
+    @staticmethod
+    def _within(layer: Image.Image, image: Image.Image, x: int, y: int) -> tuple[int, ...] | None:
+        """The part of ``layer`` that ``image`` at (x, y) covers (as :meth:`_paste` lays it)."""
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + image.width, layer.width), min(y + image.height, layer.height)
+        return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+
+    def _fans_apart(self, widget: dict[str, Any], piece: Piece, fans: list[tuple]) -> bool:
+        """Whether the fans lie apart from each other and on nothing of ``piece`` (its names
+        and numbers): then laid over it one by one, they give the pixels they give laid on it
+        (kept while the piece and the places stay the same)."""
+        boxes = tuple(self._within(piece.layer, image, x, y) for image, x, y in fans)
+        hit = self._fans_clear.get(widget["id"])
+        if hit is not None and hit[0] is piece and hit[1] == boxes:
+            return hit[2]
+        shown = [box for box in boxes if box is not None]
+        apart = all(
+            a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1]
+            for i, a in enumerate(shown) for b in shown[i + 1 :]
+        )  # fmt: skip
+        alpha = piece.layer.getchannel("A")
+        clear = apart and all(alpha.crop(box).getbbox() is None for box in shown)
+        self._fans_clear[widget["id"]] = (piece, boxes, clear)
+        return clear
+
+    def _fan_pieces(
+        self, wid: str, piece: Piece, fans: list[tuple], lays: list[Any] | None = None
+    ) -> list[tuple[Piece, str]]:
+        """The fans of a list as pieces over it, each cut as it lies on the list: the same
+        piece while a fan shows the same picture in the same place (a fan that stands). A fan
+        the engine lays (``lays``: its scene.Laid, else None) is cut as its parts are laid."""
+        out = []
+        for i, (image, x, y) in enumerate(fans):
+            box = self._within(piece.layer, image, x, y)
+            if box is None:
+                continue
+            name, place = f"fan{i}", (box, piece.x, piece.y)
+            hit = self._turning.get((wid, name))
+            if hit is None or hit[0] != place or hit[1] is not image:
+                cx, cy = box[0] - x, box[1] - y  # (where the cut begins in the fan's picture)
+                laid = lays[i] if lays is not None else None
+                if laid is not None:  # its parts laid where they lie in the cut
+                    size = (box[2] - box[0], box[3] - box[1])
+                    parts = [(part, px - cx, py - cy) for part, px, py in laid.parts]
+                    cut = scenes.laid(size, parts, laid.kept)
+                    fan_piece = Piece(cut.layer, piece.x + box[0], piece.y + box[1], native=cut)
+                else:
+                    part = image.crop((cx, cy, box[2] - x, box[3] - y))
+                    fan_piece = Piece(part, piece.x + box[0], piece.y + box[1])
+                hit = self._turning[(wid, name)] = (place, image, fan_piece)
+            out.append((hit[2], name))
+        return out
+
+    def _list_cells(self, layer: Image.Image | None, levels: Image.Image | None,
+                    widget: dict[str, Any], rows: list[tuple]) -> None:  # fmt: skip
+        """A grid of tiles, each filled as high as its value (or just its number)."""
+        w, h, fs = widget["w"], widget["h"], max(6, widget["font_size"])
+        n = len(rows)
+        gap = max(2, round(min(w, h) * 0.03))
+        best = (0.0, 1, n)
+        for columns in range(1, n + 1) if widget["columns"] <= 0 else [widget["columns"]]:
+            lines = -(-n // columns)
+            cell_w = (w - (columns - 1) * gap) / columns
+            cell_h = (h - (lines - 1) * gap) / lines
+            size = min(cell_w, cell_h * 1.6)  # wide tiles read better than tall ones
+            if size > best[0]:
+                best = (size, columns, lines)
+        _size, columns, lines = best
+        cell_w = (w - (columns - 1) * gap) / columns
+        cell_h = (h - (lines - 1) * gap) / lines
+        names = [r[0] for r in rows]
+        if widget["levels"]:
+            names = lists.short_names(names)
+        for i, (_name, _detail, text, frac, rule) in enumerate(rows):
+            row, col = divmod(i, columns)
+            x0, y0 = col * (cell_w + gap), row * (cell_h + gap)
+            cw, ch = round(x0 + cell_w) - round(x0), round(y0 + cell_h) - round(y0)
+            radius = min(cw, ch) * 0.16
+            if levels is not None:
+                self._list_tile(levels, widget, (x0, y0, cw, ch), radius, frac, rule)
+            vs = min(fs, ch * 0.34, cw / max(2.2, len(text) * 0.62))
+            ls = max(6, min(vs * 0.62, ch * 0.2))
+            with_name = ch >= vs * 0.7 + ls * 0.7 + ls * 1.6 and cw >= ls * 2 and ls >= 7.5
+            block = 0.7 * vs + (ls * 0.7 + ls * 0.7 if with_name else 0)
+            cap = y0 + (ch - block) / 2
+            cx = x0 + cw / 2
+            if with_name:
+                self._list_text(layer, self._list_name(widget, names[i]), cx, cap, ls,
+                                widget["muted"], widget["label_font"], "center", cw * 0.9,
+                                label=widget["uppercase"])  # fmt: skip
+                cap += ls * 0.7 + ls * 0.7
+            self._list_text(layer, text, cx, cap, vs, rule or widget["color"], widget["font"],
+                            "center", cw * 0.9)  # fmt: skip
+
+    def _list_tile(self, layer: Image.Image, widget: dict[str, Any],
+                   box: tuple[float, float, int, int], radius: float, frac: float,
+                   rule: str | None) -> None:  # fmt: skip
+        """A tile of a list's cells, filled as high as its value."""
+        x0, y0, cw, ch = box
+        s = SUPERSAMPLE
+        track = self.color(widget["background"])
+        tile, draw = self._canvas(cw, ch)
+        corners = [0, 0, cw * s - 1, ch * s - 1]
+        if track:
+            draw.rounded_rectangle(corners, radius=radius * s, fill=track)
+        if widget["levels"] and frac > 0:
+            fill = self.color(rule) if rule else self.color(widget["color2"])
+            mask = Image.new("L", tile.size, 0)
+            ImageDraw.Draw(mask).rounded_rectangle(corners, radius=radius * s, fill=255)
+            cut = Image.new("L", tile.size, 0)
+            ImageDraw.Draw(cut).rectangle([0, (1 - frac) * ch * s, cw * s, ch * s], fill=170)
+            mask = ImageChops.multiply(mask, cut)
+            tile.paste(Image.new("RGBA", tile.size, fill), (0, 0), mask)
+        self._paste(layer, self._down(tile, cw, ch), round(x0), round(y0))
+
+    # -- shapes ------------------------------------------------------------
+
+    def _canvas(self, w: int, h: int) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+        layer = Image.new("RGBA", (max(1, w * SUPERSAMPLE), max(1, h * SUPERSAMPLE)), (0, 0, 0, 0))
+        return layer, ImageDraw.Draw(layer)
+
+    @staticmethod
+    def _down(layer: Image.Image, w: int, h: int, s: int = SUPERSAMPLE) -> Image.Image:
+        """Reduce a layer drawn ``s`` times larger to its size on the panel.
+
+        An exact 3x reduction averages each 3x3 block (with premultiplied
+        alpha, so edges do not darken): classic supersampling, four times
+        faster than Lanczos and visually the same (mean difference below a
+        quarter of a level, only on antialiased edges).
+        """
+        w, h = max(1, w), max(1, h)
+        if layer.size == (w * s, h * s):
+            if layer.mode == "RGBA":
+                return layer.convert("RGBa").reduce(s).convert("RGBA")
+            return layer.reduce(s)  # masks ("L")
+        return layer.resize((w, h), Image.Resampling.LANCZOS)
+
+    def _fill_shape(
+        self,
+        layer: Image.Image,
+        box: list[float],
+        radius: float,
+        a: RGBA,
+        b: RGBA | None,
+        horizontal: bool,
+    ) -> None:
+        """Rounded rectangle filled with a colour or a gradient running across the layer."""
+        if b is None:
+            ImageDraw.Draw(layer).rounded_rectangle(box, radius=radius, fill=a)
+            return
+        mask = Image.new("L", layer.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
+        layer.paste(_gradient(layer.size, a, b, horizontal, self.dither), (0, 0), mask)
+
+    def _draw_rect(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        return self._cached(widget, None, lambda: self._rect_piece(widget))
+
+    def _rect_piece(self, widget: dict[str, Any]) -> Piece:
+        """A rect as it is drawn."""
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        s = SUPERSAMPLE
+        card = self._card(widget, x, y, w, h)
+        if card is not None:
+            return card
+        layer, draw = self._canvas(w, h)
+        radius = min(widget["radius"], w // 2, h // 2) * s
+        box = [0, 0, w * s - 1, h * s - 1]
+        if widget["color"]:
+            self._fill_shape(
+                layer,
+                box,
+                radius,
+                self.color(widget["color"]),
+                self.color(widget["color2"]),
+                widget["gradient"] == "horizontal",
+            )
+        if widget["outline"]:
+            draw.rounded_rectangle(
+                box,
+                radius=radius,
+                outline=self.color(widget["outline"]),
+                width=widget["outline_width"] * s,
+            )
+        backdrop = None
+        if widget["backdrop_blur"]:
+            mask = Image.new("L", layer.size, 0)
+            ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
+            backdrop = self._down(mask, w, h)
+        return Piece(self._down(layer, w, h), x, y, [x, y, w, h], backdrop, widget["backdrop_blur"])
+
+    def _card(self, widget: dict[str, Any], x: int, y: int, w: int, h: int) -> Piece | None:
+        """A rect drawn at its size with only its round corners supersampled:
+        the pixels of drawing it three times larger, at a fraction of the
+        cost (a 1920x480 backdrop took 100 ms). None where the corners meet (a
+        pill, a circle) or the outline fills it: those are drawn whole."""
+        r = min(widget["radius"], w // 2, h // 2)
+        ring = widget["outline_width"] if widget["outline"] else 0
+        if min(w, h) < 2 * (r + 2) + 2 or 2 * ring >= min(w, h):
+            return None
+        shape, corners, c = _card_corners(r, ring)
+        small, _ = shape.size
+        full = Image.new("L", (w, h), 255)
+        edge = Image.new("L", (w, h), 0) if ring else None
+        if edge is not None:
+            draw = ImageDraw.Draw(edge)
+            for band in ([0, 0, w - 1, ring - 1], [0, h - ring, w - 1, h - 1],
+                         [0, 0, ring - 1, h - 1], [w - ring, 0, w - 1, h - 1]):  # fmt: skip
+                draw.rectangle(band, fill=255)
+        for (sx, sy), (bx, by) in zip(
+            ((0, 0), (small - c, 0), (0, small - c), (small - c, small - c)),
+            ((0, 0), (w - c, 0), (0, h - c), (w - c, h - c)),
+            strict=True,
+        ):
+            full.paste(shape.crop((sx, sy, sx + c, sy + c)), (bx, by))
+            if edge is not None:
+                edge.paste(corners.crop((sx, sy, sx + c, sy + c)), (bx, by))
+        layer = None
+        if widget["color"]:
+            a, b = self.color(widget["color"]), self.color(widget["color2"])
+            if widget["color"] == SURFACE and a is not None:  # a card, as see-through as asked
+                a = (*a[:3], round(a[3] * self._card_opacity))
+            if b is None:
+                layer = Image.new("RGBA", (w, h), a)
+            else:
+                across = widget["gradient"] == "horizontal"
+                layer = _gradient_down((w, h), a, b, across, self.dither).copy()
+            inside = full if edge is None else ImageChops.subtract(full, edge)
+            alpha = layer.getchannel("A")
+            layer.putalpha(
+                inside if alpha.getextrema() == (255, 255) else ImageChops.multiply(alpha, inside)
+            )
+        if edge is not None:
+            color = self.color(widget["outline"])
+            line = Image.new("RGBA", (w, h), color)
+            line.putalpha(
+                edge
+                if color[3] == 255
+                else ImageChops.multiply(edge, Image.new("L", (w, h), color[3]))
+            )
+            layer = (
+                line
+                if layer is None
+                else ImageChops.add(layer.convert("RGBa"), line.convert("RGBa")).convert("RGBA")
+            )
+        if layer is None:
+            layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        backdrop = full if widget["backdrop_blur"] else None
+        if backdrop is None and self._fills:  # (its inside one colour: the engine lays it so)
+            made = scenes.filled(layer, max(c, ring))
+            if made is not None:
+                return Piece(made.layer, x, y, [x, y, w, h], native=made)
+        return Piece(layer, x, y, [x, y, w, h], backdrop, widget["backdrop_blur"])
+
+    def _draw_bar(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        target = _number(snapshot.value(widget["sensor"]))
+        value = self._eased(widget, target, now)
+        frac = _fraction(value, widget["min"], widget["max"], widget.get("scale", "linear"))
+        frac = _steps(frac, w if widget["direction"] in ("right", "left") else h)
+        paint = self._rule_paint(widget, value, now)
+        key = (frac, paint)
+        return self._cached(widget, key, lambda: self._bar_piece(widget, frac, paint, x, y, w, h))
+
+    def _bar_piece(
+        self,
+        widget: dict[str, Any],
+        frac: float,
+        paint: tuple[RGBA, RGBA | None],
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+    ) -> Piece:
+        """``paint``: the colour where the bar starts, and where a full bar
+        ends (None: one colour)."""
+        s = SUPERSAMPLE
+        layer, draw = self._canvas(w, h)
+        W, H = w * s, h * s
+        radius = min(widget["radius"], w // 2, h // 2) * s
+        direction = widget["direction"]
+        horizontal = direction in ("right", "left")
+        a, b = paint
+        track = self.color(widget["background"])
+
+        def span(p0: float, p1: float) -> list[float]:
+            """Rectangle covering the part p0..p1 (0 = start, 1 = end) of the bar."""
+            if direction == "right":
+                box = [p0 * W, 0, p1 * W - 1, H - 1]
+            elif direction == "left":
+                box = [(1 - p1) * W, 0, (1 - p0) * W - 1, H - 1]
+            elif direction == "down":
+                box = [0, p0 * H, W - 1, p1 * H - 1]
+            else:  # up
+                box = [0, (1 - p1) * H, W - 1, (1 - p0) * H - 1]
+            # Even the smallest value stays visible as a sliver.
+            box[2], box[3] = max(box[2], box[0]), max(box[3], box[1])
+            return box
+
+        n = widget["segments"]
+        if n > 0:
+            gap = widget["segment_gap"] * s / (W if horizontal else H)
+            cell = (1 - gap * (n - 1)) / n
+            colors = self._gradient_colors(a, b, n)
+            rising = widget.get("rising", 0)
+            for i in range(n):
+                box = span(i * (cell + gap), i * (cell + gap) + cell)
+                if rising > 0:  # levels on a mixer: standing on the bottom (the left) edge
+                    share = rising + (1 - rising) * i / max(1, n - 1)
+                    if horizontal:
+                        box[1] = box[3] - max(s, share * H)
+                    else:
+                        box[2] = box[0] + max(s, share * W)
+                seg_r = min(radius, (box[2] - box[0]) / 2, (box[3] - box[1]) / 2)
+                amount = min(1.0, max(0.0, frac * n - i))  # the last lit segment may be partial
+                if track and amount < 1:
+                    draw.rounded_rectangle(box, radius=seg_r, fill=track)
+                if amount > 0:
+                    color = colors[i]
+                    draw.rounded_rectangle(
+                        box, radius=seg_r, fill=(*color[:3], int(color[3] * amount))
+                    )
+        else:
+            if track:
+                draw.rounded_rectangle([0, 0, W - 1, H - 1], radius=radius, fill=track)
+            if frac > 0:
+                box = span(0, frac)
+                fill_r = min(radius, (box[2] - box[0]) / 2, (box[3] - box[1]) / 2)
+                if b is None:
+                    draw.rounded_rectangle(box, radius=fill_r, fill=a)
+                else:
+                    # The gradient spans the whole track, so a colour always means the same value.
+                    first, last = (b, a) if direction in ("left", "up") else (a, b)
+                    self._fill_shape(layer, box, fill_r, first, last, horizontal)
+        return Piece(self._down(layer, w, h), x, y, [x, y, w, h])
+
+    def _draw_mark(self, widget: dict[str, Any], snapshot: Snapshot) -> Piece | None:
+        """A bar's mark: a thin line across the bar where the reading ``mark`` stands on the bar's
+        own scale, reaching a little beyond it on both sides (the average of earlier rounds, a
+        limit). A reading that is not there draws none."""
+        value = _number(snapshot.value(widget["mark"]))
+        if value is None:
+            return None
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        direction = widget["direction"]
+        horizontal = direction in ("right", "left")
+        length, across = (w, h) if horizontal else (h, w)
+        thick = max(1, min(widget["mark_width"], length))
+        frac = _fraction(value, widget["min"], widget["max"], widget.get("scale", "linear"))
+        along = int((length - thick) * frac)  # from the bar's start, in whole pixels
+        if direction in ("left", "up"):  # these start at the far end
+            along = length - thick - along
+        reach = round(across * 0.22)
+        color = self.color(widget["mark_color"])
+        at = (x + along, y - reach) if horizontal else (x - reach, y + along)
+        size = (thick, h + 2 * reach) if horizontal else (w + 2 * reach, thick)
+        marked = {"id": f"{widget['id']}\0mark", "opacity": widget.get("opacity", 1.0)}
+        return self._cached(
+            marked, (at, size, color), lambda: Piece(Image.new("RGBA", size, color), *at)
+        )
+
+    @staticmethod
+    def _gradient_colors(a: RGBA, b: RGBA | None, n: int) -> list[RGBA]:
+        if b is None:
+            return [a] * n
+        return [_lerp(a, b, i / max(1, n - 1)) for i in range(n)]
+
+    def _draw_gauge(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        target = _number(snapshot.value(widget["sensor"]))
+        value = self._eased(widget, target, now)
+        frac = _fraction(value, widget["min"], widget["max"], widget.get("scale", "linear"))
+        sweep = abs(widget["end_angle"] - widget["start_angle"])
+        frac = _steps(frac, math.radians(sweep) * max(widget["w"], widget["h"]) / 2)
+        paint = self._rule_paint(widget, value, now)
+        return self._cached(widget, (frac, paint), lambda: self._gauge_piece(widget, frac, paint))
+
+    def _gauge_piece(
+        self, widget: dict[str, Any], frac: float, paint: tuple[RGBA, RGBA | None]
+    ) -> Piece:
+        """Ring gauge: a cached static part (track, ticks) plus the value arc.
+
+        The arc is one antialiased mask filled from a cached conic gradient, so
+        a gliding ring costs a few milliseconds per frame, not tens.
+        """
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        layer = self._gauge_static(widget).copy()
+        if frac > 0:
+            a, b = paint
+            mask = self._gauge_mask(widget, frac)
+            if b is None:
+                arc = Image.new("RGBA", (w, h), a)
+            else:
+                arc = self._gauge_colors(widget, a, b).copy()
+            alpha = arc.getchannel("A")
+            arc.putalpha(
+                mask if alpha.getextrema() == (255, 255) else ImageChops.multiply(alpha, mask)
+            )
+            layer.alpha_composite(arc)
+        return Piece(layer, x, y, [x, y, w, h])
+
+    def _gauge_geometry(self, widget: dict[str, Any], scale: int) -> dict[str, Any]:
+        W, H = widget["w"] * scale, widget["h"] * scale
+        th = max(1, widget["thickness"]) * scale
+        return {
+            "box": [0, 0, W - 1, H - 1],
+            "c": ((W - 1) / 2, (H - 1) / 2),
+            "r": ((W - th) / 2, (H - th) / 2),  # centre line of the ring
+            "th": th,
+        }
+
+    def _gauge_static(self, widget: dict[str, Any]) -> Image.Image:
+        key = ("gauge-static", json.dumps(widget, sort_keys=True))
+        hit = self._gauge_parts.get(key)
+        if hit is not None:
+            return hit
+        s = SUPERSAMPLE
+        layer, draw = self._canvas(widget["w"], widget["h"])
+        g = self._gauge_geometry(widget, s)
+        start, end = widget["start_angle"], widget["end_angle"]
+        sweep = end - start
+
+        def point(angle: float, inset: float = 0.0) -> tuple[float, float]:
+            rad = math.radians(angle)
+            return (
+                g["c"][0] + (g["r"][0] - inset) * math.cos(rad),
+                g["c"][1] + (g["r"][1] - inset) * math.sin(rad),
+            )
+
+        track = self.color(widget["background"])
+        th = g["th"]
+        if track:
+            draw.arc(g["box"], start, end, fill=track, width=th)
+            if widget["cap"] == "round":
+                for angle in (start, end):
+                    px, py = point(angle)
+                    draw.ellipse([px - th / 2, py - th / 2, px + th / 2, py + th / 2], fill=track)
+        ticks = widget["ticks"]
+        if ticks > 0:
+            tick = self.color(widget["tick_color"] or widget["background"] or widget["color"])
+            length = th * 0.6
+            for i in range(ticks + 1):
+                angle = start + sweep * i / ticks
+                p0 = point(angle, th / 2 + 2 * s)
+                p1 = point(angle, th / 2 + 2 * s + length)
+                draw.line([p0, p1], fill=tick, width=max(1, s))
+        image = self._down(layer, widget["w"], widget["h"])
+        self._gauge_parts[key] = image
+        return image
+
+    def _gauge_mask(self, widget: dict[str, Any], frac: float) -> Image.Image:
+        s = SUPERSAMPLE
+        g = self._gauge_geometry(widget, s)
+        start, sweep = widget["start_angle"], widget["end_angle"] - widget["start_angle"]
+        stop = start + sweep * frac
+        mask = Image.new("L", (widget["w"] * s, widget["h"] * s), 0)
+        draw = ImageDraw.Draw(mask)
+        th = g["th"]
+        draw.arc(g["box"], start, stop, fill=255, width=th)
+        if widget["cap"] == "round":
+            for angle in (start, stop):
+                rad = math.radians(angle)
+                px = g["c"][0] + g["r"][0] * math.cos(rad)
+                py = g["c"][1] + g["r"][1] * math.sin(rad)
+                draw.ellipse([px - th / 2, py - th / 2, px + th / 2, py + th / 2], fill=255)
+        return mask.reduce(s)
+
+    def _gauge_colors(self, widget: dict[str, Any], a: RGBA, b: RGBA) -> Image.Image:
+        """Colour along the scale: angle ``start`` is ``a``, ``end`` is ``b``."""
+        key = (
+            "gauge-colors",
+            widget["id"],
+            widget["w"],
+            widget["h"],
+            a,
+            b,
+            widget["start_angle"],
+            widget["end_angle"],
+        )
+        hit = self._gauge_parts.get(key)
+        if hit is not None:
+            return hit
+        w, h = widget["w"], widget["h"]
+        start, end = widget["start_angle"], widget["end_angle"]
+        sweep = end - start
+        field = Image.new("RGBA", (w, h), a)
+        draw = ImageDraw.Draw(field)
+        box = [-w, -h, 2 * w, 2 * h]  # wedges reach past the corners
+        steps = max(2, int(abs(sweep) / 1.5))
+        for i in range(steps):
+            a0 = start + sweep * i / steps
+            a1 = start + sweep * (i + 1) / steps
+            draw.pieslice(box, min(a0, a1), max(a0, a1) + 0.8, fill=_lerp(a, b, i / steps))
+        # Past the end (the round cap) the colour stays the end colour; before
+        # the start it is the start colour the field was filled with.
+        tail = (end, end + 30) if sweep > 0 else (end - 30, end)
+        draw.pieslice(box, *tail, fill=b)
+        self._gauge_parts[key] = field
+        return field
+
+    DOTS = 256  # end dots kept (a dot moves in quarter pixels: a handful of looks at a time)
+
+    def _draw_end_dot(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """A graph's end dot: a dot of ``end_dot`` px radius in the line's colour, with the
+        widget's glow around it, where the line ends: at the right edge, at the newest value.
+        Drawn in quarter pixels, as SPUR II draws it, so it glides with the value. None where
+        the line has no end (too few points, no value)."""
+        if self.continuous:  # (where it draws its fine course, the dot ends that)
+            widget = self._traced(widget, snapshot)[0]
+        x, y, w = widget["x"], widget["y"], widget["w"]
+        key = widget["sensor"]
+        if self.continuous:  # the curve is drawn from the gliding value: so is its end
+            value, scale = self.motion.value(key, now), self.STRIP_SCALE
+            strips = self._strips.get(widget["id"])
+            strip = strips.ready if strips is not None else None
+            bounds = strip.bounds if strip is not None else None
+            if strip is not None:  # where the curve is drawn in this frame
+                bounds = self._range_now(widget, now) or bounds
+        else:
+            values = _gaps(snapshot.history.get(key, [])[-max(2, widget["history"]) :])
+            value, scale = (values[-1] if len(values) > 1 else None), SUPERSAMPLE
+            known = [v for v in values if v is not None]
+            bounds = self._graph_bounds(widget, known) if known and len(values) > 1 else None
+            if bounds is not None:  # the graph's own range, as it draws it
+                bounds = self._range_now(widget, now) or bounds
+        if value is None or bounds is None:
+            return None
+        first, last = self._range_rows(widget, scale)
+        frac = _fraction(value, *bounds, widget.get("scale", "linear"))
+        row = first + (last - first) * (1 - frac)
+        if widget.get("direction") == "down":  # it hangs from the top edge
+            row = first + last - row
+        # the curve's end in pixels (the last point is a quarter of a pixel inside the edge)
+        cx, cy = x + w - 0.5 / scale, y + (row + 0.5) / scale
+        return self._dot(widget, cx, cy, self.color(widget["color"]))
+
+    def _draw_bar_dot(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        """A bar's end dot: a dot of ``end_dot`` px radius in the bar's colour where it
+        ends, its head (Studio's seconds run). None for an empty bar."""
+        value = self._eased(widget, _number(snapshot.value(widget["sensor"])), now)
+        frac = _fraction(value, widget["min"], widget["max"], widget.get("scale", "linear"))
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        direction = widget["direction"]
+        length = w if direction in ("right", "left") else h
+        if value is None or frac * length < 0.5:
+            return None
+        reach = frac * length - 0.5  # the middle of its last pixel, as SPUR II's run
+        cx = {"right": x + reach, "left": x + w - reach}.get(direction, x + w / 2)
+        cy = {"down": y + reach, "up": y + h - reach}.get(direction, y + h / 2)
+        start, end = self._rule_paint(widget, value, now)
+        return self._dot(widget, cx, cy, start if end is None else _lerp(start, end, frac))
+
+    def _dot(self, widget: dict[str, Any], cx: float, cy: float, color: Any) -> Piece:
+        """A dot of the widget's ``end_dot`` radius around (``cx``, ``cy``), placed in
+        quarter pixels, with the widget's glow."""
+        radius = float(widget["end_dot"])
+        left, top = cx - radius - 1.0, cy - radius - 1.0
+        ix, iy = math.floor(left), math.floor(top)
+        px, py = int((left - ix) * 4) % 4, int((top - iy) * 4) % 4
+        glow, glow_radius = widget.get("glow", 0.0), widget.get("glow_radius", 10)
+        look = (radius, color, px, py, glow, glow_radius)
+        if look not in self._dots:
+            if len(self._dots) >= self.DOTS:
+                self._dots.clear()
+            size = math.ceil(2 * radius + 3)
+            big = Image.new("RGBA", (size * 4, size * 4), (0, 0, 0, 0))
+            mx, my = radius + 1.0 + px / 4, radius + 1.0 + py / 4
+            ImageDraw.Draw(big).ellipse(
+                [(mx - radius) * 4, (my - radius) * 4, (mx + radius) * 4, (my + radius) * 4],
+                fill=color,
+            )
+            dot = self._down(big, size, size, 4)
+            halo, pad = self._halo({"glow": glow, "glow_radius": glow_radius}, dot)
+            if halo is not None:
+                halo.alpha_composite(dot, (pad, pad))
+                dot = halo
+            self._dots[look] = (dot, pad)
+        dot, pad = self._dots[look]
+        plain = {"id": f"{widget['id']}\0dot", "opacity": widget.get("opacity", 1.0)}
+        return self._cached(plain, (ix, iy, look), lambda: Piece(dot, ix - pad, iy - pad))
+
+    def _draw_graph(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        course = course_of(snapshot.value(widget["sensor"]))
+        if course is not None:  # a course published whole: across the width, and still
+            numbers = [v for v in course if v is not None]
+            bounds = self._graph_bounds(widget, numbers) if numbers else None
+            key = ("course", course, bounds)
+            return self._cached(
+                widget, key, lambda: self._graph_piece(widget, list(course), len(course), bounds)
+            )
+        if self.continuous:
+            return self._timeline(widget, snapshot, now)
+        slots = max(2, widget["history"])
+        values = _gaps(snapshot.history.get(widget["sensor"], [])[-slots:])
+        numbers = [v for v in values if v is not None]
+        bounds = None
+        if numbers:
+            bounds, moving = self._glided_bounds(widget, numbers, now)
+            self.moving = self.moving or moving
+        key = (len(values), tuple(values[-3:]), values[0] if values else None, bounds)
+        return self._cached(widget, key, lambda: self._graph_piece(widget, values, slots, bounds))
+
+    def _graph_piece(
+        self, widget: dict[str, Any], values: list[float], slots: int,
+        bounds: tuple[float, float] | None = None,
+    ) -> Piece:  # fmt: skip
+        x, y, w, h = widget["x"], widget["y"], widget["w"], widget["h"]
+        layer = self._graph_layer(widget, values, slots, w, slots - len(values), bounds=bounds)
+        return Piece(self._down(layer, w, h), x, y, [x, y, w, h])
+
+    # -- a graph's own range -------------------------------------------------
+    #
+    # A graph without ``min`` and ``max`` (the game's frame rate) takes the range of the
+    # values it shows. Taken anew for every picture, it jumped whenever a peak came into the
+    # window or left it, and the whole curve with it. It glides instead: wider at once where
+    # the values leave it (they glide themselves, so it widens smoothly), narrower only once
+    # they have used little of it for a while, and from one range to the next over a moment.
+
+    RANGE_ROOM = 0.1  # room above and below the values, of their span
+    RANGE_GLIDE_S = 0.6  # the range on show reaches a new one at this pace (a time constant)
+    # ... a range in whole steps, which changes seldom and then by a step, at once: while a
+    # range glides its graph is drawn anew ten times a second, a wide one at some cost
+    RANGE_STEP_GLIDE_S = 0.12
+    RANGE_STEP_NEAR = 0.01  # (it is there once this close, of its span)
+    RANGE_NARROW_S = 3.0  # it narrows once the values have used ...
+    RANGE_USED = 0.6  # ... less than this share of it for so long
+
+    def _glided_bounds(
+        self, widget: dict[str, Any], numbers: list[float], now: float
+    ) -> tuple[tuple[float, float], bool]:
+        """The range to draw a graph with now, and whether it still glides."""
+        lo, hi = self._graph_bounds(widget, numbers)
+        fixed_lo, fixed_hi = widget["min"] is not None, widget["max"] is not None
+        if fixed_lo and fixed_hi:
+            return (lo, hi), False
+        room = (hi - lo) * self.RANGE_ROOM
+        want = (lo if fixed_lo else lo - room, hi if fixed_hi else hi + room)
+        step = widget.get("range_step") or 0
+        if step > 0:  # whole steps: it changes seldom, and then by a step
+            down = math.floor(want[0] / step) * step
+            if lo >= 0:  # (no room below nothing: a frame rate is never less than 0)
+                down = max(0.0, down)
+            up = max(down + step, math.ceil(want[1] / step) * step)
+            want = (want[0] if fixed_lo else down, want[1] if fixed_hi else up)
+        state = self._ranges.get(widget["id"])
+        if state is None or now < state.at or not self.animate:  # (still: the values, roomy)
+            self._ranges[widget["id"]] = _Range(want, now, (lo, hi))
+            return want, False
+        # on to now on the way it was going (a new target takes over from here on) ...
+        k = 1 - math.exp(-(now - state.at) / self._range_glide(widget))
+        shown = tuple(a + (b - a) * k for a, b in zip(state.shown, state.target, strict=True))
+        shown = (min(shown[0], lo), max(shown[1], hi))  # the values always inside
+        target = state.target  # ... and where to now
+        if want[0] < target[0] or want[1] > target[1]:  # the values leave it: wider at once
+            target = (min(target[0], want[0]), max(target[1], want[1]))
+            state.full = now
+        elif hi - lo >= self.RANGE_USED * (target[1] - target[0]):
+            state.full = now
+        elif now - state.full >= self.RANGE_NARROW_S:  # little of it used for a while
+            target, state.full = want, now
+        state.target, state.shown, state.at, state.values = target, shown, now, (lo, hi)
+        near = (target[1] - target[0]) * (self.RANGE_STEP_NEAR if step > 0 else 0.002)
+        if step > 0 and abs(shown[0] - target[0]) <= near and abs(shown[1] - target[1]) <= near:
+            state.shown = shown = target  # (there: the strip drawn now is the last of its glide)
+        return shown, abs(shown[0] - target[0]) > near or abs(shown[1] - target[1]) > near
+
+    def _range_glide(self, widget: dict[str, Any]) -> float:
+        """How fast a graph's own range goes to a new one (a time constant)."""
+        return self.RANGE_STEP_GLIDE_S if widget.get("range_step") else self.RANGE_GLIDE_S
+
+    def _range_now(self, widget: dict[str, Any], now: float) -> tuple[float, float] | None:
+        """A graph's own range at ``now``, on its way to the one it glides to (in video mode
+        between two strips); None for a graph with ``min`` and ``max``, or none drawn yet."""
+        state = self._ranges.get(widget["id"])
+        if state is None or (widget["min"] is not None and widget["max"] is not None):
+            return None
+        if not self.animate:
+            return state.shown
+        k = 1 - math.exp(-max(0.0, now - state.at) / self._range_glide(widget))
+        lo, hi = (a + (b - a) * k for a, b in zip(state.shown, state.target, strict=True))
+        lo, hi = min(lo, state.values[0]), max(hi, state.values[1])
+        live = self.motion.value(widget["sensor"], now) if self.continuous else None
+        if isinstance(live, int | float):  # the newest point, at the right edge, inside too
+            lo, hi = min(lo, live), max(hi, live)
+        return lo, hi
+
+    def _stretch(
+        self, widget: dict[str, Any], drawn: tuple[float, float], now_range: tuple[float, float]
+    ) -> tuple[float, float] | None:
+        """How a strip's window drawn in the range ``drawn`` is stretched upright to look as
+        in ``now_range`` (:meth:`_restretch`): a row of the drawn curve, r, is a * r + c now,
+        as (a, c); None where it stays as drawn (a curve on a scale other than linear, or hung
+        from the top, and a stretch under a third of a pixel)."""
+        if widget.get("scale", "linear") != "linear" or widget.get("direction") == "down":
+            return None
+        first, last = self._range_rows(widget, self.STRIP_SCALE)
+        first, length = first / self.STRIP_SCALE, (last - first) / self.STRIP_SCALE
+        span, span_now = drawn[1] - drawn[0], now_range[1] - now_range[0]
+        if span <= 0 or span_now <= 0:
+            return None
+        a = span / span_now
+        c = first + length - length * (drawn[1] - now_range[0]) / span_now - a * first
+        if max(abs(c), abs((a - 1) * (first + length) + c)) < 0.3:  # under a third of a pixel
+            return None
+        return a, c
+
+    def _restretch(
+        self, widget: dict[str, Any], layer: Image.Image, pad: int, drawn: tuple[float, float],
+        now_range: tuple[float, float],
+    ) -> Image.Image:  # fmt: skip
+        """``layer`` (a strip's window, ``pad`` px larger on every side), drawn in the range
+        ``drawn``, as it looks in ``now_range``: stretched or squeezed upright, a few per cent
+        at most (the strips follow the range ten times a second), so it glides on every
+        frame. A curve on a scale other than linear, or hung from the top, stays as drawn."""
+        stretch = self._stretch(widget, drawn, now_range)
+        if stretch is None:
+            return layer
+        a, c = stretch
+        # row y of the result shows row y / a + top of the layer: a resize of that band
+        width, height = layer.size
+        top = pad - (pad + c) / a
+        bottom = top + height / a
+        y0, y1 = math.floor(top) - 1, math.ceil(bottom) + 1  # (beyond the layer: clear)
+        band = layer.crop((0, y0, width, y1))
+        return band.resize(
+            (width, height), Image.Resampling.BILINEAR, box=(0, top - y0, width, bottom - y0)
+        )
+
+    # -- graphs in video mode ------------------------------------------------
+    #
+    # Every frame reaches the panel, so a graph draws the gliding value of its
+    # sensor 25 times a second (the motion's history), and its newest point is
+    # the value the numbers show now. Drawing that every frame costs too much:
+    # the curve goes onto a strip in the helper thread, and each frame shows a
+    # window into it, in half-pixel steps. Until the next reading the glide is
+    # known, so a strip reaches that far ahead; a reading that comes before
+    # the next strip is drawn over the end of the window until it is in.
+
+    STRIP_SCALE = 2  # drawn twice as large: half-pixel steps, as SPUR II's curves
+    STRIP_AHEAD_S = 0.5  # a strip reaches this far past the next reading
+    STRIP_EVERY_S = 0.25  # a graph asks for a new strip at most this often
+    STRIP_GLIDE_S = 0.1  # ... and this often while its own range glides (small steps)
+    STRIP_PARTS = 8  # a slow graph's steps are cut into at most this many
+
+    def _graph_seconds(self, widget: dict[str, Any]) -> float:
+        """The time a graph shows in video mode: its ``seconds``, else a pixel per point
+        (25 a second): as SPUR II's graphs, half a pixel in every frame at 50 fps, in every
+        theme and module alike. (A slower one stood still between its steps, or blurred
+        between them.)"""
+        seconds = float(widget.get("seconds") or 0)
+        if seconds <= 0:
+            seconds = (widget["w"] - 1) / RATE
+        return min(max(seconds, 2 / RATE), (MAX_POINTS - 4 * RATE) / RATE)
+
+    def _reach(self, widget: dict[str, Any]) -> int:
+        """How far the curve's glow and shadow reach, in pixels."""
+        glow = 3 * widget.get("glow_radius", 10) if widget.get("glow") else 0
+        shadow = 0
+        if widget.get("shadow"):
+            shadow = 3 * widget.get("shadow_blur", 6) + abs(widget.get("shadow_offset", 3))
+        return max(glow, shadow) + widget["line_width"] + 2
+
+    # A graph with a ``trace`` (the game's frame rate: ``game.fps_trace``, 25 points a second)
+    # draws that course instead of its value's glide, as it was measured: every dip, no glide
+    # between readings. Each reading brings it up to a moment before it; shown this much
+    # later than the reading's time (and the time to the next), the curve's newest point is
+    # always one that came, and it moves on evenly.
+    TRACE_MARGIN_S = 0.35
+
+    def _traced(
+        self, widget: dict[str, Any], snapshot: Snapshot
+    ) -> tuple[dict[str, Any], tuple[str, tuple[float | None, ...]] | None]:
+        """The graph as it draws now: with its ``trace``'s key as its sensor where that has a
+        course (and the course, as text and as numbers); else as it is (and None)."""
+        trace = widget.get("trace")
+        value = snapshot.value(trace) if trace else None
+        course = course_of(value)
+        if course is None:
+            return widget, None
+        return {**widget, "sensor": trace, "\0value": widget["sensor"]}, (value, course)
+
+    def _trace_delay(self) -> float:
+        """How much later than its time a fine course is shown (see ``TRACE_MARGIN_S``)."""
+        return TRACE_LAG_S + self.sample[1] + self.TRACE_MARGIN_S
+
+    def _timeline(self, widget: dict[str, Any], snapshot: Snapshot, now: float) -> Piece | None:
+        widget, fine = self._traced(widget, snapshot)
+        wid, key, w, h = widget["id"], widget["sensor"], widget["w"], widget["h"]
+        s = self.STRIP_SCALE
+        glide = self._glide_s()
+        readings, last_at = snapshot.history.get(key, []), self.sample[0]
+        if fine is not None:  # (a new history: the value's glide before the course came)
+            delay = self._trace_delay()
+            self.motion.trace(key, fine[0], fine[1], self.sample[0] - TRACE_LAG_S + delay, now)
+            readings, last_at = snapshot.history.get(widget["\0value"], []), last_at + delay
+        else:
+            self.motion.glide(key, motion_number(snapshot.value(key)), now, glide, self._lead())
+        span = self._graph_seconds(widget) * RATE  # points across the window
+        per_point = (w * s - 1) / span  # their distance, in pixels at ``s``
+        every = max(1, int(s / per_point))  # long windows: about a point per pixel
+        margin = math.ceil(s * (self._pad(widget) + self._reach(widget) + 1) / per_point)
+        view, scrolls = self._graph_view(now, fine is not None, glide)
+        self.moving = self.moving or scrolls
+        # a graph that steps shows up to a reading or two before now: as many points more
+        lag = 0 if view >= now else math.ceil(max(now - view, 2 * self.sample[1]) * RATE)
+        history = self.motion.history(
+            key, math.ceil(span) + margin + 2 * every + lag, now, readings, last_at,
+            self.sample[1], glide,
+        )  # fmt: skip
+        strips = self._strips.get(wid)
+        if strips is None or strips.per_point != per_point or strips.key != key:
+            strips = self._strips[wid] = _Strips(per_point, key)  # new, or another window
+        strips.drawn = now
+        strips.collect()
+        # The window's left edge at ``s``, point k sitting at k * per_point on
+        # every strip: the newest point at the right edge, now.
+        exact = view * RATE * per_point - (w * s - 1)
+        left = math.floor(exact)
+        parts = self._parts(per_point)
+        strip = strips.ready
+        if strip is None or not (strip.covers(left, w, s) and strip.covers(left + 1, w, s)):
+            job = self._strip_job(widget, history, now, per_point, every, margin, parts, edge=view)
+            strip = strips.ready = job()
+        valid = self._valid_until(strip, key)
+        due = strip.gliding or valid < strip.until or view >= strip.until - self.STRIP_EVERY_S
+        every_s = self.STRIP_GLIDE_S if strip.gliding else self.STRIP_EVERY_S
+        if due and strips.building is None and now - strips.asked >= every_s:
+            strips.asked = now
+            job = self._strip_job(widget, history, now, per_point, every, margin, parts,
+                                  strips.ready, view)  # fmt: skip
+            if self.background_builds:
+                if self._strip_builder is None:
+                    self._strip_builder = _Builder("render-strips", self._gate())
+                strips.building = self._strip_builder.submit(job)
+            else:
+                strip = strips.ready = job()
+                valid = strip.until
+        left, part = divmod(round(exact * strip.parts), strip.parts)  # a step, and a part of one
+        offset, phase = divmod(left - strip.origin, s)
+        pad = strip.pad
+        # A reading the strip did not know: draw the end again once it shows,
+        # at the newest point or in the glow just past it (a big change).
+        beyond = view + s * (pad + self._reach(widget)) / (per_point * RATE)
+        patch = valid < view and (
+            self._apart(widget, strip, view) >= 0.4 or self._apart(widget, strip, beyond) >= 4
+        )
+        now_range = self._range_now(widget, now)  # (its own range: where it is this frame)
+        if now_range is not None:
+            now_range = (round(now_range[0], 3), round(now_range[1], 3))
+            if now_range == tuple(round(v, 3) for v in strip.bounds):
+                now_range = None
+        # (a window its own range leaves as drawn is the strip's window, cut as any: Lumen's
+        # network graphs, on a square root's scale, glide their range all the time)
+        stretch = None if now_range is None else self._stretch(widget, strip.bounds, now_range)
+        content = ("timeline", id(strip), offset, phase, part, stretch)
+        hit = self._cache.get(wid)
+        if not patch and hit is not None and hit[0] == content:
+            return hit[1]
+
+        def window(k: int, column: int, at: int) -> Image.Image:
+            """Image ``k`` of the strip from ``column`` on: the window that begins at ``at``."""
+            layer = strip.phases[k].crop((column, 0, column + w + 2 * pad, h + 2 * pad))
+            if strip.halo is not None:  # beside the window only the glow: the curve ends there
+                for x0 in (0, w + pad):
+                    side = strip.halo.crop((column + x0, 0, column + x0 + pad, h + 2 * pad))
+                    layer.paste(side, (x0, 0))
+            if patch:
+                self._patch(widget, layer, strip, history, valid, at)
+            return layer
+
+        view = None
+        if self.native_views and stretch is None and (not patch or not part):  # cut by the engine
+            k = phase * strip.parts + part
+            cuts = [(strip.phases[k], offset, 0, 0, 0, w + 2 * pad, h + 2 * pad)]
+            if strip.halo is not None:  # beside the window only the glow, as window() cuts
+                cuts += [
+                    (strip.halo, offset + x0, 0, x0, 0, pad, h + 2 * pad) for x0 in (0, w + pad)
+                ]
+            if patch:  # the end drawn again, laid over the cut as window() pastes it
+                piece, x = self._patch_piece(widget, strip, history, valid, left)
+                cuts.append((piece, 0, 0, x, 0, piece.width, piece.height))
+            view = scenes.viewed((w + 2 * pad, h + 2 * pad), cuts)
+            layer = view.layer
+        elif not patch or not part:
+            layer = window(phase * strip.parts + part, offset, left)
+        else:  # the end drawn again: on both steps, and blended as the strip's parts are
+            ahead = (phase + 1) % s
+            following = window(ahead * strip.parts, offset + (ahead == 0), left + 1)
+            layer = _between(
+                window(phase * strip.parts, offset, left), following, part, strip.parts
+            )
+        if stretch is not None:  # its own range glides: on its way in every frame
+            layer = self._restretch(widget, layer, pad, strip.bounds, now_range)
+        x, y = widget["x"], widget["y"]
+        piece = Piece(layer, x - pad, y - pad, [x, y, w, h], native=view)
+        if widget.get("clip"):
+            piece = _clip_sides(piece)
+        self._cache[wid] = (None if patch else content, piece)
+        return piece
+
+    STEP_S = 0.35  # how long a graph that steps (graph_steps) glides to a new reading
+
+    def _graph_view(self, now: float, fine: bool, glide: float) -> tuple[float, bool]:
+        """The time at a scrolling graph's right edge, and whether it moves: ``now``, the curve
+        scrolling on; with :attr:`graph_steps` (not for a graph with its own fine course) the
+        time the last reading's value is there (``glide`` after it), glided to from the one
+        before in :data:`STEP_S` and still until the next reading: a graph of readings a
+        second apart moves a third of the time, and a panel on which nothing else moves rests
+        (MainLoop.rest)."""
+        if not self.graph_steps or fine:
+            return now, True
+        at, before = self.sample[0], self.sample_before
+        k = (now - at) / self.STEP_S
+        if before is None or k >= 1:
+            return at + glide, False
+        k = max(0.0, k)
+        return before + glide + (at - before) * k * k * (3 - 2 * k), True
+
+    def _forget_strips(self, now: float) -> None:
+        """Let the strips of a graph not on show go (on a card of a slot that is not on show):
+        once its strip ends before ``now``, it could not be shown again but drawn anew, as it
+        is when the graph comes back. One whose next strip is still being drawn stays."""
+        for wid, strips in list(self._strips.items()):
+            if strips.drawn >= now:
+                continue
+            strips.collect()
+            ready = strips.ready
+            if strips.building is None and (ready is None or ready.until + 1.0 < now):
+                del self._strips[wid]
+
+    def _parts(self, per_point: float) -> int:
+        """Into how many parts a graph's steps are cut: so many that it moves on in every
+        frame, by about the same. A graph a minute across moves a third of a step a frame;
+        moved in whole steps, it stood still for two or three frames each time. One that
+        moves a step a frame (SPUR II's, 25 points a second) is not cut."""
+        speed = RATE * per_point / self.fps if self.fps > 0 else 0.0  # steps a frame
+        if speed <= 0 or speed >= 0.75:
+            return 1
+        return min(self.STRIP_PARTS, math.ceil(1.5 / speed))
+
+    def _pad(self, widget: dict[str, Any]) -> int:
+        """The room :meth:`_halo` leaves around a layer for its effects."""
+        pad = 0
+        if widget.get("glow"):
+            pad = max(pad, widget.get("glow_radius", 10) * 2)
+        if widget.get("shadow"):
+            pad = max(pad, widget.get("shadow_blur", 6) * 2 + abs(widget.get("shadow_offset", 3)))
+        return pad
+
+    def _apart(self, widget: dict[str, Any], strip: _Strip, t: float) -> float:
+        """How many pixels the strip's curve is off the sensor's at ``t``. A
+        glide starts gently: a new reading shows only after a frame or two,
+        often after the next strip is in."""
+        live = self.motion.value(widget["sensor"], t)
+        drawn = Spring()
+        drawn.pieces = list(strip.pieces)
+        old = drawn.at(t)
+        if live is None or old is None:
+            return 0.0 if live is None and old is None else math.inf
+        scale = widget.get("scale", "linear")
+        apart = _fraction(live, *strip.bounds, scale) - _fraction(old, *strip.bounds, scale)
+        return abs(apart) * (widget["h"] - 2 * widget["line_width"])
+
+    def _valid_until(self, strip: _Strip, key: str) -> float:
+        """Until when the strip's curve is the sensor's: the end of what it
+        drew ahead, or when the value took a course the strip did not know."""
+        spring = self.motion.springs.get(key)
+        if spring is None:
+            return strip.taken
+        if spring.made == strip.made:
+            return strip.until
+        later = [piece for piece in spring.pieces if piece[0] >= strip.made]
+        if not later or later[0][0] != strip.made:  # gone already: right until it was taken
+            return strip.taken
+        return later[0][1]
+
+    def _values(
+        self, history: History, key: str, first: int, last: int, every: int
+    ) -> tuple[list[float | None], int]:
+        """The values of the points ``first`` .. ``last`` that are drawn (every
+        ``every``-th): recorded ones from the history, later ones ahead of time
+        from the spring. Returns them and the first point's number."""
+        first -= first % every
+        if history.last is not None and history.last > last:  # a clock that went back: none
+            values = []  # (they would be drawn from a time long past: a picture miles wide)
+        else:
+            values = history.since(first)[: max(0, history.last - first + 1)][::every]
+        spring = self.motion.springs.get(key)
+        future = Spring()
+        future.pieces = list(spring.pieces) if spring is not None else []
+        start = first + len(values) * every
+        values += [future.at(k / RATE) for k in range(start, last + 1, every)]
+        return values, first
+
+    def _strip_job(
+        self, widget: dict[str, Any], history: History, now: float, per_point: float,
+        every: int, margin: int, parts: int = 1, before: _Strip | None = None,
+        edge: float | None = None,
+    ) -> Callable[[], _Strip]:  # fmt: skip
+        """A strip of the curve to draw (in the helper thread): its values are
+        taken now, on the render thread; the drawing happens when it runs. It reaches from
+        the window's width before ``edge`` (the time at its right edge: ``now``, or the last
+        reading's on a graph that steps) to past the next reading."""
+        key = widget["sensor"]
+        last = grid(now if edge is None else edge)
+        ahead = math.ceil((self.sample[1] + self.STRIP_AHEAD_S) * RATE)
+        span = (widget["w"] * self.STRIP_SCALE - 1) / per_point
+        values, first = self._values(
+            history, key, last - math.ceil(span) - margin - every, last + ahead + margin, every
+        )
+        spring = self.motion.springs.get(key)
+        made = spring.made if spring is not None else 0
+        pieces = tuple(spring.pieces) if spring is not None else ()
+        until = (last + ahead) / RATE
+        # its range from the values up to now: those it draws ahead come in over the next
+        # moment, and the range with them (the strips follow it ten times a second)
+        numbers = [v for v in values[: (last - first) // every + 1] if v is not None]
+        numbers = numbers or [v for v in values if v is not None]
+        bounds, gliding = (0.0, 1.0), False
+        if numbers:
+            bounds, gliding = self._glided_bounds(widget, numbers, now)
+
+        def job() -> _Strip:
+            strip = _Strip(made, now, until, pieces)
+            strip.parts, strip.gliding = parts, gliding
+            grown = self._grown_strip(widget, before, values, first, per_point, every, strip,
+                                      bounds)  # fmt: skip
+            if grown is not None:
+                return grown
+            drawn = self._draw_strip(widget, values, first, per_point, every, strip, bounds)
+            return self._engine_keeps(drawn, widget, _asked_at(before))
+
+        return job
+
+    def _grown_strip(
+        self, widget: dict[str, Any], before: _Strip | None, values: list[float | None],
+        first: int, per_point: float, every: int, strip: _Strip, bounds: tuple[float, float],
+    ) -> _Strip | None:  # fmt: skip
+        """The strip :meth:`_draw_strip` would draw, made of the one ``before`` where the curve
+        stays as it was and drawn anew only from where its values change (a reading came: from
+        the point before it, and what its glow reaches), with the same range and fade: about a
+        tenth of it each second instead of all of it (the drawing, its glow, its steps). None
+        where that is not so (another range, another fade, a strip drawn otherwise): drawn
+        whole. The pixels are the whole drawing's, but in its first columns, where the one
+        before saw further back (no window shows them: they are its glow's margin)."""
+        if (
+            before is None or not before.phases or before.values is None
+            or before.per_point != per_point or before.every != every
+            or before.parts != strip.parts or before.bounds != bounds
+            or (first - before.first) % every or first < before.first
+        ):  # fmt: skip
+            return None
+        s, h = self.STRIP_SCALE, widget["h"]
+        dense = self._dense(widget, every * per_point)
+        numbers = [v for v in values if v is not None]
+        if not numbers or self._fade_top(dense, numbers, bounds, s) != before.top:
+            return None
+        start = (first - before.first) // every  # (where ``values`` begin in the one before)
+        same = 0
+        for value, was in zip(values, before.values[start:], strict=False):
+            if value != was:
+                break
+            same += 1
+        changed = first + same * every  # the first point that is not as it was
+        grid = self.STRIP_GRID * s
+        origin = self._strip_origin(first, per_point)
+        last = first + (len(values) - 1) * every
+        width = math.ceil((last * per_point - origin + 1) / s) + 1
+        pad = before.pad
+        reach = self._reach(dense) + 3 * dense.get("glow_radius", 10) + grid  # (the lit halo too)
+        shift = (origin - before.origin) // s  # the one before's columns, this one's from
+        # this one's columns from ``seam`` on are drawn anew: from the segment that leads to the
+        # first point changed on, and the glow and line around it
+        seam = math.floor(((changed - every) * per_point - origin) / s) - reach - 2
+        seam = min(seam, before.width - shift - reach - 2)
+        if seam < 2 * reach + pad or seam >= width:
+            return None  # (little of it stays: drawn whole)
+        step = grid // s  # (columns)
+        begin = (seam - reach - 2) // step * step  # drawn from here: the glow at ``seam`` is the
+        # whole's, and its grid the same
+        x0 = origin + s * begin  # its left edge, at ``s``
+        lo = max(0, (math.floor(x0 / per_point) - first) // every - 1)
+        points = [((first + i * every) * per_point - x0, values[i]) for i in range(lo, len(values))]
+        tail_w = width - begin
+        layer = self._curve(dense, points, tail_w + 1, s, bounds, before.top)
+        opacity = dense.get("opacity", 1.0)
+        lines = [
+            _scale_alpha(
+                self._down(layer.crop((p, 0, p + s * tail_w, s * h)), tail_w, h, s), opacity
+            )  # fmt: skip
+            for p in range(s)
+        ]
+        del layer
+        halo, tail_pad = self._halo(dense, lines[0], exact=True)
+        if tail_pad != pad:
+            return None
+        tails = self._strip_phases(lines, halo, pad, strip.parts)
+        size, keep = (width + 2 * pad, h + 2 * pad), seam + pad
+        cut = seam - begin + pad  # the tail's column of this one's column ``seam``
+        values = list(values)
+        # (where the engine cuts the windows: the pictures are made again here only if asked)
+        again = _Remaking(self, widget, values, first, per_point, every, strip.parts, bounds)
+        asked = _asked_at(before)
+
+        def joined(old: Image.Image, tail: Image.Image, k: int) -> Image.Image:
+            rest = tail.crop((cut, 0, tail.width, tail.height))  # this one's columns from keep
+            if not self.native_views:  # (as always: all of it here)
+                out = Image.new("RGBA", size, (0, 0, 0, 0))
+                out.paste(old.crop((shift, 0, shift + keep, old.height)), (0, 0))
+                out.paste(rest, (keep, 0))
+                scenes.grew(out, old, shift, keep)  # (an engine that keeps ``old`` grows it)
+                return out
+            # the engine grows it from ``old`` and its tail; here it is joined only where the
+            # pixels of ``old`` are still here: not sent yet (a step no window showed: it may go
+            # whole), or asked for a moment ago (the app's picture of the panel)
+            base = scenes.pixels_of(old)
+            pixels = None
+            if base is not None:
+                pixels = Image.new("RGBA", size, (0, 0, 0, 0))
+                pixels.paste(base.crop((shift, 0, shift + keep, base.height)), (0, 0))
+                pixels.paste(rest, (keep, 0))
+            out = scenes.Strip(size, again.maker(k), pixels, asked)
+            out.tail = Image.new("RGBA", (size[0] - keep, size[1]), (0, 0, 0, 0))
+            out.tail.paste(rest, (0, 0))
+            again.add(k, out)
+            scenes.grew(out, old, shift, keep)
+            return out
+
+        strip.per_point, strip.every, strip.origin, strip.width = per_point, every, origin, width
+        strip.bounds, strip.top, strip.pad = bounds, before.top, pad
+        strip.phases = [
+            joined(old, tail, k)
+            for k, (old, tail) in enumerate(zip(before.phases, tails, strict=True))
+        ]
+        strip.halo = None if halo is None else joined(before.halo, halo, -1)
+        strip.values, strip.first = values, first
+        return strip
+
+    def _engine_keeps(self, strip: _Strip, widget: dict[str, Any], asked: float) -> _Strip:
+        """``strip`` drawn whole, its pictures the engine's to keep where it cuts the windows
+        (render/scene.py's Strip: they go here once it has them, unless something here asked
+        for the strip before a moment ago, at ``asked``, and are drawn again if asked for)."""
+        if not self.native_views or strip.values is None:
+            return strip
+        again = _Remaking(self, widget, strip.values, strip.first, strip.per_point, strip.every,
+                          strip.parts, strip.bounds)  # fmt: skip
+        pictures = []
+        for k, image in enumerate(strip.phases):
+            picture = scenes.Strip(image.size, again.maker(k), image, asked)
+            again.add(k, picture)
+            pictures.append(picture)
+        strip.phases = pictures
+        if strip.halo is not None:
+            halo = scenes.Strip(strip.halo.size, again.maker(-1), strip.halo, asked)
+            again.add(-1, halo)
+            strip.halo = halo
+        return strip
+
+    # A strip's left edge lies on a grid of this many pixels (at its scale, times it): the lit
+    # line's halo is worked out at a quarter of the size (lit._lay_halo), on a grid that starts
+    # at the picture's edge. On the same grid, a strip made of the one before (_grown_strip)
+    # is the strip drawn whole, pixel for pixel
+    STRIP_GRID = 4
+
+    def _strip_origin(self, first: int, per_point: float) -> int:
+        """The left edge (at the strip's scale) of a strip whose first point is ``first``: a
+        pixel before it, on the grid of :data:`STRIP_GRID`."""
+        grid = self.STRIP_GRID * self.STRIP_SCALE
+        return (math.floor(first * per_point) - 1) // grid * grid
+
+    @staticmethod
+    def _strip_phases(lines: list[Image.Image], halo: Image.Image | None, pad: int,
+                      parts: int) -> list[Image.Image]:  # fmt: skip
+        """A strip's images (see :meth:`_draw_strip`): per half-pixel step its line on its
+        glow, and per part of a step (``parts``) one between it and the next."""
+        phases = []
+        for line in lines:
+            if halo is None:
+                phases.append(line)
+                continue
+            out = halo.copy()
+            out.alpha_composite(line, (pad, pad))
+            phases.append(out)
+        if parts > 1:  # after the last step comes the first, a pixel on
+            weighed = [phase.convert("RGBa") for phase in phases]
+            width0, height0 = weighed[0].size
+            following = [*weighed[1:], weighed[0].crop((1, 0, width0 + 1, height0))]
+            cut = []
+            for one, mixed, after in zip(phases, weighed, following, strict=True):
+                cut.append(one)
+                for q in range(1, parts):
+                    cut.append(Image.blend(mixed, after, q / parts).convert("RGBA"))
+            phases = cut
+        return phases
+
+    def _draw_strip(
+        self, widget: dict[str, Any], values: list[float | None], first: int, per_point: float,
+        every: int, strip: _Strip, bounds: tuple[float, float] | None = None,
+    ) -> _Strip:  # fmt: skip
+        """Draw the curve through ``values`` (point ``first`` on, every
+        ``every``-th) onto ``strip`` in the value range ``bounds`` (default: the values'):
+        an image per half-pixel step, glow and all, and per part of a step
+        (``strip.parts``) one between it and the next."""
+        s, h = self.STRIP_SCALE, widget["h"]
+        widget = self._dense(widget, every * per_point)
+        numbers = [v for v in values if v is not None]
+        if bounds is None:
+            bounds = self._graph_bounds(widget, numbers) if numbers else (0.0, 1.0)
+        top = self._fade_top(widget, numbers, bounds, s)
+        origin = self._strip_origin(first, per_point)  # the strip's left edge, at ``s``
+        last = first + (len(values) - 1) * every
+        width = math.ceil((last * per_point - origin + 1) / s) + 1
+        layer = self._graph_layer(
+            widget, values, 0, width + 1, first // every, scale=s, step=every * per_point,
+            origin=origin, bounds=bounds, top=top,
+        )  # fmt: skip
+        opacity = widget.get("opacity", 1.0)
+        lines = [
+            _scale_alpha(self._down(layer.crop((p, 0, p + s * width, s * h)), width, h, s), opacity)
+            for p in range(s)
+        ]
+        del layer  # (drawn twice as large: the biggest picture here, let go before the next)
+        halo, pad = self._halo(widget, lines[0], exact=True)
+        phases = self._strip_phases(lines, halo, pad, strip.parts)
+        del lines
+        strip.per_point, strip.every, strip.origin, strip.width = per_point, every, origin, width
+        strip.bounds, strip.top, strip.pad, strip.phases = bounds, top, pad, phases
+        strip.halo = halo
+        strip.values, strip.first = list(values), first
+        return strip
+
+    def _patch(
+        self, widget: dict[str, Any], layer: Image.Image, strip: _Strip, history: History,
+        valid: float, left: int,
+    ) -> None:  # fmt: skip
+        """Draw the end of the window ``layer`` again from where the strip no
+        longer holds (a reading it did not know), as the next strip will."""
+        piece, x = self._patch_piece(widget, strip, history, valid, left)
+        layer.paste(piece, (x, 0))
+
+    def _patch_piece(
+        self, widget: dict[str, Any], strip: _Strip, history: History, valid: float, left: int,
+    ) -> tuple[Image.Image, int]:  # fmt: skip
+        """The end of the window (from ``left``) drawn again from where the strip no longer
+        holds: the picture that goes over the window's columns from the one it gives on, to the
+        window's right edge (:meth:`_patch` pastes it; an engine that cuts the window from the
+        strip lays it over its cut, render/scene.py's viewed)."""
+        s, w, h, pad = self.STRIP_SCALE, widget["w"], widget["h"], strip.pad
+        widget = self._dense(widget, strip.every * strip.per_point)
+        reach = self._reach(widget)
+        # Window columns from ``start`` on change (and the glow that reaches
+        # them); from ``begin`` on, the patch draws what that glow sees.
+        changed = (valid * RATE * strip.per_point - left) / s
+        start = max(-pad, math.floor(changed) - reach)
+        begin, end = start - reach, w + pad + reach
+        x0 = left + s * begin  # the patch's left edge, at ``s``
+        first = math.floor(x0 / strip.per_point) - strip.every
+        last = math.ceil((x0 + s * (end - begin)) / strip.per_point) + strip.every
+        values, first = self._values(history, widget["sensor"], first, last, strip.every)
+        step = strip.every * strip.per_point
+        points = [((first // strip.every + i) * step - x0, v) for i, v in enumerate(values)]
+        part = self._curve(widget, points, end - begin, s, strip.bounds, strip.top)
+        line = _scale_alpha(self._down(part, end - begin, h, s), widget.get("opacity", 1.0))
+        halo, _ = self._halo(widget, line, exact=True)
+        if halo is not None:  # the curve inside the window, its glow also beside it
+            inside = line.crop((max(0, -begin), 0, w - begin, h))
+            halo.alpha_composite(inside, (pad + max(0, -begin), pad))
+            line = halo
+        cut = start - begin + pad  # the patch's column of window column ``start``
+        return line.crop((cut, 0, cut + w + pad - start, line.height)), start + pad
+
+    def _dense(self, widget: dict[str, Any], step: float) -> dict[str, Any]:
+        """Points this close (``step`` pixels at the strip's scale) are a curve
+        already: no spline through them, and no round joints (a slice drawn in
+        Python for every point, holding up the render thread)."""
+        if step < 3 * self.STRIP_SCALE:
+            return {**widget, "smooth": False, "\0joints": False}
+        return widget
+
+    def _graph_bounds(self, widget: dict[str, Any], numbers: list[float]) -> tuple[float, float]:
+        lo = widget["min"] if widget["min"] is not None else min(numbers)
+        hi = widget["max"] if widget["max"] is not None else max(numbers)
+        return (lo, lo + 1) if hi == lo else (lo, hi)
+
+    @staticmethod
+    def _range_rows(widget: dict[str, Any], s: int) -> tuple[float, float]:
+        """The rows (at ``s``) a graph's top and bottom value lie on: a line's
+        width in from its edges, so the line stays inside, or without
+        ``inset`` the edges themselves, as SPUR II's charts."""
+        if widget.get("inset", True):
+            pad = widget["line_width"] * s
+            return pad, widget["h"] * s - 1 - pad
+        return 0.0, (widget["h"] - 1) * s
+
+    def _fade_top(
+        self, widget: dict[str, Any], numbers: list[float], bounds: tuple[float, float], s: int
+    ) -> int:
+        """Where a strip's fill starts to fade: its highest point; for a range in whole steps
+        the range's top, which stays where the peak would move from strip to strip."""
+        first, last = self._range_rows(widget, s)
+        if widget.get("range_step"):
+            return int(first)
+        if not numbers:
+            return 0
+        scale = widget.get("scale", "linear")
+        highest = max(_fraction(v, *bounds, scale) for v in numbers)
+        return int(first + (last - first) * (1 - highest))
+
+    def _graph_layer(
+        self, widget: dict[str, Any], values: list[float | None], slots: int, width: int,
+        first: int, *, scale: int = SUPERSAMPLE, step: float | None = None, origin: int = 0,
+        bounds: tuple[float, float] | None = None, top: int | None = None,
+    ) -> Image.Image:  # fmt: skip
+        """The graph at ``scale``, on a canvas ``width`` px wide: value ``i`` sits
+        at sample position ``first + i`` of the widget's ``slots`` (or ``step``
+        pixels apart at ``scale``, the canvas starting at ``origin``); None
+        leaves a gap."""
+        if step is None:
+            step = (widget["w"] * scale - 1) / (slots - 1)
+        points = [((first + i) * step - origin, v) for i, v in enumerate(values)]
+        return self._curve(widget, points, width, scale, bounds, top)
+
+    def _curve(
+        self, widget: dict[str, Any], points: list[tuple[float, float | None]], width: int,
+        scale: int, bounds: tuple[float, float] | None = None, top: int | None = None,
+    ) -> Image.Image:  # fmt: skip
+        """Background, grid and the curve through ``points`` (x in pixels at
+        ``scale``; a value None breaks the curve) on a canvas ``width`` px wide.
+        ``bounds`` is the value range (default: the widget's, else the
+        points'), ``top`` where the fill's fade starts (default: its peak)."""
+        s = scale
+        W, H = max(1, width * s), max(1, widget["h"] * s)
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        if widget["background"]:
+            draw.rectangle([0, 0, W - 1, H - 1], fill=self.color(widget["background"]))
+        if widget["grid"] > 0 and widget["grid_color"]:
+            grid_color = self.color(widget["grid_color"])
+            for i in range(1, widget["grid"] + 1):
+                gy = round(H * i / (widget["grid"] + 1))
+                draw.line([(0, gy), (W - 1, gy)], fill=grid_color, width=max(1, s // 2))
+        numbers = [v for _, v in points if v is not None]
+        if len(numbers) < 2:
+            return layer
+        lo, hi = bounds or self._graph_bounds(widget, numbers)
+        first, last = self._range_rows(widget, s)
+        scale_kind = widget.get("scale", "linear")
+        down = widget.get("direction") == "down"  # hangs from the top edge
+        runs: list[list[tuple[float, float]]] = [[]]
+        for px, v in points:
+            if v is None:
+                if runs[-1]:
+                    runs.append([])
+                continue
+            py = first + (last - first) * (1 - _fraction(v, lo, hi, scale_kind))
+            runs[-1].append((px, first + last - py if down else py))
+        runs = [run for run in runs if len(run) >= 2]
+        if widget["smooth"]:
+            runs = [
+                [(px, min(last, max(first, py))) for px, py in _catmull_rom(run)] for run in runs
+            ]
+        color = self.color(widget["color"])
+        if widget["fill"] and runs:
+            area = Image.new("L", layer.size, 0)
+            base = 0 if down else H - 1 if widget.get("inset", True) else last
+            for run in runs:
+                polygon = [*run, (run[-1][0], base), (run[0][0], base)]
+                ImageDraw.Draw(area).polygon(polygon, fill=255)
+            solid = min(1.0, max(0.0, widget.get("fill_alpha", 0)))
+            if widget["fill_fade"]:
+                peak = round(255 * solid) if solid else 115
+                if top is None and widget.get("range_step"):  # the range's top (_fade_top)
+                    top = int(first)
+                if top is None:  # the peak, counted from where the fill starts
+                    ys = [py for run in runs for _, py in run]
+                    top = int(first + last - max(ys) if down else min(ys))
+                rows = [
+                    int(peak * min(1.0, max(0.0, 1 - (row - top) / max(1, H - top))))
+                    for row in range(H)
+                ]
+                fade = Image.new("L", (1, H), 0)
+                fade.putdata(rows[::-1] if down else rows)
+                alpha = ImageChops.multiply(area, fade.resize(layer.size))
+            else:
+                flat = round(255 * solid) if solid else 64
+                alpha = area.point([v * flat // 255 for v in range(256)])
+            tint = Image.new("RGBA", layer.size, (*color[:3], 255))
+            if color[3] < 255:
+                alpha = ImageChops.multiply(alpha, Image.new("L", layer.size, color[3]))
+            tint.putalpha(alpha)
+            layer.alpha_composite(tint)
+        finish = self._finishes.get(widget["id"])  # a finish may draw the line its own way
+        if finish is not None and finish.curve(self, widget, layer, runs, color, s):
+            return layer
+        joint = "curve" if widget.get("\0joints", True) else None
+        for run in runs:
+            draw.line(run, fill=color, width=widget["line_width"] * s, joint=joint)
+        return layer
+
+
+class _Bar:
+    """A list's bar at one value (:meth:`Renderer._list_bar`), kept small: the part round the
+    end of its fill (``cut``, from the start of the bar on along it, in pixels), the bar empty
+    and the bar full (``ends``, kept once for the look: the pictures and their arrays) the rest
+    of it, as it is drawn: a bar whose other parts are not exactly those is kept whole. Its
+    own part is kept as an array (:func:`_planes`): laid in one array with the others while
+    the bars glide (:class:`_Levels`), as a picture on a list's picture otherwise."""
+
+    __slots__ = ("cut", "ends", "middle", "vertical", "whole", "filled_first", "pictures")
+
+    MARGIN = 2  # pixels beyond the rounded end: where the reduction meets it, and a rounding
+
+    def __init__(self) -> None:
+        self.whole: Any = None  # (arrays: _planes)
+        self.middle: Any = None
+        self.ends: tuple | None = None  # (empty, full, their arrays)
+        self.cut = (0, 0)
+        self.vertical = False
+        self.filled_first = False  # the full bar's part comes first (down, right)
+        self.pictures: dict[str, Image.Image] | None = None  # (of its arrays: picture())
+
+    @classmethod
+    def of(cls, image: Image.Image, frac: float, direction: str, radius: int,
+           ends: Callable[[], tuple]) -> _Bar:  # fmt: skip
+        bar = cls()
+        bar.vertical = direction in ("up", "down")
+        bar.filled_first = direction in ("down", "right")
+        length = image.height if bar.vertical else image.width
+        r = min(radius, image.width // 2, image.height // 2) + cls.MARGIN
+        end = frac * length if bar.filled_first else (1 - frac) * length
+        a, b = max(0, math.floor(end) - r), min(length, math.ceil(end) + r)
+        if b - a > 0.6 * length:  # (short: as small whole)
+            bar.whole = _planes(image)
+            return bar
+        pair = ends()
+        empty, full = pair[0], pair[1]
+        first, last = (full, empty) if bar.filled_first else (empty, full)
+        if bar._part(image, 0, a) != bar._part(first, 0, a) or bar._part(
+            image, b, length
+        ) != bar._part(last, b, length):
+            bar.whole = _planes(image)  # (not the same pixels there: whole, as drawn)
+            return bar
+        bar.cut, bar.ends = (a, b), pair
+        bar.middle = _planes(bar._crop(image, a, b))
+        return bar
+
+    def _crop(self, image: Image.Image, a: int, b: int) -> Image.Image:
+        return image.crop((0, a, image.width, b) if self.vertical else (a, 0, b, image.height))
+
+    def _part(self, image: Image.Image, a: int, b: int) -> bytes:
+        return self._crop(image, a, b).tobytes() if b > a else b""
+
+    @property
+    def nbytes(self) -> int:
+        return int((self.whole if self.whole is not None else self.middle).nbytes)
+
+    def picture(self, which: str) -> Image.Image:
+        """Its ``whole`` or ``middle`` array as a picture, made once: one an engine that cuts a
+        list's levels keeps (scene.View, :class:`_Levels`)."""
+        if self.pictures is None:
+            self.pictures = {}
+        found = self.pictures.get(which)
+        if found is None:
+            found = self.pictures[which] = Image.fromarray(getattr(self, which), "RGBA")
+        return found
+
+    def paste(self, renderer: Renderer, layer: Image.Image, x: int, y: int) -> None:
+        """Onto ``layer`` at ``x``, ``y``: the same pixels the whole bar gives there (a pixel
+        that does not show lays nothing, whatever its colour)."""
+        if self.whole is not None:
+            renderer._paste(layer, Image.fromarray(self.whole, "RGBA"), x, y)
+            return
+        empty, full = self.ends[0], self.ends[1]  # type: ignore[index]
+        first, last = (full, empty) if self.filled_first else (empty, full)
+        a, b = self.cut
+        length = first.height if self.vertical else first.width
+        middle = Image.fromarray(self.middle, "RGBA")
+        for image, at in ((self._crop(first, 0, a), 0), (middle, a),
+                          (self._crop(last, b, length), b)):  # fmt: skip
+            if not (image.width and image.height):
+                continue
+            if self.vertical:
+                renderer._paste(layer, image, x, y + at)
+            else:
+                renderer._paste(layer, image, x + at, y)
+
+
+def _planes(image: Image.Image) -> Any:
+    """``image``'s pixels as an array, as :meth:`Image.alpha_composite` lays them on a
+    transparent picture: as they are, and nothing where they do not show."""
+    import numpy as np
+
+    pixels = np.array(image.convert("RGBA") if image.mode != "RGBA" else image)
+    pixels[pixels[..., 3] == 0] = 0
+    return pixels
+
+
+class _Levels:
+    """A list's bars on nothing (its levels alone, :meth:`Renderer._list_piece`): each bar's
+    kept arrays put in place in one array, what alpha_composite gives on a transparent picture
+    (:func:`_planes`), without a picture of the place and three composites for every bar
+    (Arena's threads: 32 bars a frame while they glide). A bar on another (they stand apart)
+    is laid on it as it would be. ``origin`` is where the place of the bars lies in the array,
+    ``room`` its size: a bar is cut to it, as on a picture of that size."""
+
+    def __init__(self, size: tuple[int, int], origin: tuple[int, int],
+                 room: tuple[int, int], cut: bool = False) -> None:  # fmt: skip
+        import numpy as np
+
+        self.array = np.zeros((size[1], size[0], 4), np.uint8)
+        self.origin, self.room = origin, room
+        self.boxes: list[tuple[int, int, int, int]] = []  # where bars lie (x0, y0, x1, y1)
+        # with ``cut``: the parts as an engine cuts the levels from pictures it keeps (picture,
+        # x and y in it, x and y in the levels, w, h: scene.View), pasted where nothing lies
+        # yet; None where one lies on another (laid on it: not cut so)
+        self.cuts: list[tuple[Image.Image, int, int, int, int, int, int]] | None = (
+            [] if cut else None
+        )
+
+    def put(self, pixels: Any, x: int, y: int, picture: Image.Image | None = None,
+            at: tuple[int, int] = (0, 0)) -> None:  # fmt: skip
+        """``pixels`` (from :func:`_planes`) with their top left at (x, y) of the place; they
+        are those of ``picture`` from ``at`` on (a picture an engine keeps: :attr:`cuts`)."""
+        h, w = pixels.shape[:2]
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + w, self.room[0]), min(y + h, self.room[1])
+        if x1 <= x0 or y1 <= y0:
+            return
+        part = pixels[y0 - y : y1 - y, x0 - x : x1 - x]
+        ox, oy = self.origin
+        under = self.array[oy + y0 : oy + y1, ox + x0 : ox + x1]
+        if under[..., 3].any():  # (on another: laid on it)
+            import numpy as np
+
+            laid = Image.fromarray(np.ascontiguousarray(under), "RGBA")
+            laid.alpha_composite(Image.fromarray(np.ascontiguousarray(part), "RGBA"))
+            under[...] = np.asarray(laid)
+            self.cuts = None
+        else:
+            under[...] = part
+            if self.cuts is not None:
+                if picture is None:
+                    self.cuts = None
+                else:
+                    sx, sy = at[0] + x0 - x, at[1] + y0 - y
+                    self.cuts.append((picture, sx, sy, ox + x0, oy + y0, x1 - x0, y1 - y0))
+
+    def put_bar(self, bar: _Bar, x: int, y: int) -> None:
+        """A kept bar: the pixels :meth:`_Bar.paste` gives, and the box all of it lies in
+        (whatever its share: the same while it glides)."""
+        whole = bar.whole if bar.whole is not None else bar.ends[2]  # type: ignore[index]
+        h, w = whole.shape[:2]
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + w, self.room[0]), min(y + h, self.room[1])
+        if x1 > x0 and y1 > y0:
+            ox, oy = self.origin
+            self.boxes.append((ox + x0, oy + y0, ox + x1, oy + y1))
+        cutting = self.cuts is not None  # (the pictures of the parts, for an engine to cut)
+        if bar.whole is not None:
+            self.put(bar.whole, x, y, bar.picture("whole") if cutting else None)
+            return
+        empty, full = bar.ends[2], bar.ends[3]  # type: ignore[index]
+        first, last = (full, empty) if bar.filled_first else (empty, full)
+        shown = bar.ends[4:6] if cutting else (None, None)  # type: ignore[index]
+        firsts, lasts = (shown[1], shown[0]) if bar.filled_first else shown
+        middle = bar.picture("middle") if cutting else None
+        a, b = bar.cut
+        length = first.shape[0] if bar.vertical else first.shape[1]
+        parts = (  # (each: its pixels, where it lies along the bar, its picture, from where)
+            (first[:a] if bar.vertical else first[:, :a], 0, firsts, 0),
+            (bar.middle, a, middle, 0),
+            (last[b:] if bar.vertical else last[:, b:], b, lasts, b),
+        )
+        for plane, at, picture, start in parts:
+            if plane.shape[0] and plane.shape[1] and at < length:
+                if bar.vertical:
+                    self.put(plane, x, y + at, picture, (0, start))
+                else:
+                    self.put(plane, x + at, y, picture, (start, 0))
+
+    def image(self) -> Image.Image:
+        return Image.fromarray(self.array, "RGBA")
+
+
+def _asked_at(strip: _Strip | None) -> float:
+    """When something here last asked for the pictures of ``strip`` (render/scene.py's Strip:
+    a frame composed here, the app's picture of the panel); 0: never, or none to ask."""
+    if strip is None:
+        return 0.0
+    return max((getattr(image, "used", 0.0) for image in (*strip.phases, strip.halo)
+                if image is not None), default=0.0)  # fmt: skip
+
+
+class _Remaking:
+    """The pictures of a strip whose windows an engine cuts (render/scene.py's Strip), drawn
+    again, all at once, where something here asks for one whose pixels went: the strip drawn
+    whole through the same values, in the same range (Renderer._draw_strip). The pixels of what
+    a window shows are the same as the grown strip's (Renderer._grown_strip)."""
+
+    def __init__(
+        self, renderer: Renderer, widget: dict[str, Any], values: list[float | None], first: int,
+        per_point: float, every: int, parts: int, bounds: tuple[float, float],
+    ) -> None:  # fmt: skip
+        self.renderer = renderer
+        self.drawing = (widget, values, first, per_point, every, bounds)
+        self.parts = parts
+        self.pictures: dict[int, weakref.ref] = {}  # its pictures: phase k, -1 the glow
+        self.lock = threading.Lock()
+
+    def add(self, k: int, picture: Image.Image) -> None:
+        self.pictures[k] = weakref.ref(picture)
+
+    def maker(self, k: int) -> Callable[[], Image.Image]:
+        return lambda: self.make(k)
+
+    def make(self, k: int) -> Image.Image:
+        """Picture ``k`` drawn again; its siblings whose pixels went get theirs with it."""
+        with self.lock:
+            widget, values, first, per_point, every, bounds = self.drawing
+            strip = _Strip(0, 0.0, 0.0, ())
+            strip.parts = self.parts
+            self.renderer._draw_strip(widget, values, first, per_point, every, strip, bounds)
+            drawn = dict(enumerate(strip.phases))
+            if strip.halo is not None:
+                drawn[-1] = strip.halo
+            for j, ref in list(self.pictures.items()):
+                sibling = ref()
+                if j != k and sibling is not None and j in drawn and sibling._im is None:
+                    sibling.im = drawn[j].im  # (made here: they go again when nothing asks)
+            return drawn[k]
+
+
+class _Strip:
+    """A graph's curve drawn ahead (see :meth:`Renderer._timeline`): one image
+    per half-pixel step, glow and all, ``pad`` pixels larger on every side."""
+
+    def __init__(self, made: int, taken: float, until: float, pieces: tuple) -> None:
+        self.made = made  # the sensor's spring pieces it knew (Spring.made) ...
+        self.pieces = pieces  # ... and those pieces: what it drew ahead with
+        self.taken = taken  # when its values were taken
+        self.until = until  # the curve is right until here, if no reading comes in between
+        self.per_point = 0.0  # pixels between two history points, at the strip's scale
+        self.every = 1  # every how many history points it draws
+        self.origin = 0  # its left edge: point k sits at k * per_point - origin
+        self.width = 0  # in pixels, without the pad
+        self.bounds = (0.0, 1.0)  # the value range it was drawn with
+        self.top = 0  # where its fill's fade starts
+        self.pad = 0
+        # per half-pixel step, and per part of one (``parts`` images each, the first the step)
+        self.phases: list[Image.Image] = []
+        self.parts = 1
+        self.halo: Image.Image | None = None  # the glow alone, for beside the window
+        self.gliding = False  # drawn while the graph's own range glided: the next comes soon
+        # the values it was drawn through, from point ``first`` (the next is made of it where
+        # they stay the same: Renderer._grown_strip)
+        self.values: list[float | None] | None = None
+        self.first = 0
+
+    def covers(self, left: int, w: int, s: int) -> bool:
+        """Whether a window of ``w`` pixels from ``left`` (at scale ``s``) lies on it."""
+        offset = left - self.origin
+        return offset >= 0 and offset // s + w <= self.width
+
+
+def _clip_sides(piece: Piece) -> Piece:
+    """``piece`` without what lies left and right of its box (its glow there); one an engine
+    cuts (scene.View) cut so too, its pixels not made here."""
+    x, _, w, _ = piece.box or (piece.x, 0, piece.layer.width, 0)
+    left = max(0, x - piece.x)
+    right = min(piece.layer.width, x + w - piece.x)
+    if left == 0 and right == piece.layer.width:
+        return piece
+    view = piece.native
+    if isinstance(view, scenes.View) and view.layer is piece.layer:
+        view = scenes.cut_columns(view, left, right)
+        return replace(piece, layer=view.layer, x=piece.x + left, native=view)
+    layer = piece.layer.crop((left, 0, right, piece.layer.height))
+    return replace(piece, layer=layer, x=piece.x + left, native=None)
+
+
+class _Range:
+    """A graph's own range as it glides (Renderer._glided_bounds)."""
+
+    def __init__(
+        self, bounds: tuple[float, float], now: float, values: tuple[float, float]
+    ) -> None:
+        self.shown = bounds  # the range drawn last
+        self.target = bounds  # the range it glides to
+        self.at = now  # when it was drawn
+        self.full = now  # when the values last used much of the target
+        self.values = values  # the lowest and highest value then: always inside
+
+
+class _Strips:
+    """A graph's strip on show and the one being drawn."""
+
+    def __init__(self, per_point: float, key: str = "") -> None:
+        self.per_point = per_point
+        self.key = key  # the sensor whose course it draws (a graph's value, or its trace)
+        self.ready: _Strip | None = None
+        self.building: Future | None = None
+        self.asked = -math.inf
+        self.drawn = -math.inf  # the frame it was last on show in
+
+    @property
+    def nbytes(self) -> int:
+        """The bytes of its pictures (kept.size_of)."""
+        strip = self.ready
+        if strip is None:
+            return 0
+        return sum(size_of(image) for image in (*strip.phases, strip.halo)
+                   if not isinstance(image, scenes.Lazy) or image.composed)  # fmt: skip
+
+    def collect(self) -> None:
+        """Take the strip the helper thread has finished, if it is newer."""
+        if self.building is None or not self.building.done():
+            return
+        try:
+            strip = self.building.result()
+        except Exception as exc:  # the strip on show stays
+            log.warning("graph strip failed: %s", exc)
+        else:
+            if self.ready is None or strip.taken >= self.ready.taken:
+                self.ready = strip
+        self.building = None

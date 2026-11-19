@@ -1,0 +1,84 @@
+// The app's frame: header, the current view, and what floats above them
+// (command palette, dialogs, messages).
+
+import { t } from "../core/i18n.js";
+import { useStore } from "../core/state.js";
+import { html, useEffect, useErrorBoundary, useRef } from "../lib/preact.js";
+import { Dialogs } from "../ui/dialog.js";
+import { Icon } from "../ui/icons.js";
+import { CommandPalette } from "../ui/palette.js";
+import { Toasts } from "../ui/toast.js";
+import { Header } from "./header.js";
+import { viewById } from "./views.js";
+
+function Loading() {
+  return html`<div class="view-message" aria-busy="true"><span class="spinner"></span>${t("Loading…")}</div>`;
+}
+
+function Failure({ message }) {
+  return html`<div class="view-message error" role="alert">
+    <${Icon} name="warning" size=${22} />
+    <strong>${t("Libre Panel could not start")}</strong>
+    <span>${message}</span>
+    <button type="button" class="btn" onClick=${() => location.reload()}>${t("Try again")}</button>
+  </div>`;
+}
+
+/**
+ * A view that throws while it is drawn (a plugin's odd data, a bug) would leave the page blank:
+ * it says so instead, and the other views stay reachable. Another address, `at`, is another try,
+ * but not the address it threw at: Preact runs an effect still waiting from the view's first
+ * drawing before it draws what it caught, and a try there would draw the view in the middle of
+ * that, where no boundary catches it, leaving this one stuck and the page blank for good.
+ */
+function Boundary({ children, at }) {
+  const caughtAt = useRef(null);
+  const [error, reset] = useErrorBoundary((caught) => {
+    caughtAt.current = at;
+    console.warn("a view could not be drawn:", caught);
+  });
+  useEffect(() => {
+    if (caughtAt.current !== at) reset();
+  }, [at]);
+  if (!error) return children;
+  return html`<div class="view-message error" role="alert">
+    <${Icon} name="warning" size=${22} />
+    <strong>${t("This view could not be drawn")}</strong>
+    <span>${error.message || String(error)}</span>
+    <span class="muted">${t("If it happens again, tell the project: Help (F1) has the way to report it.")}</span>
+    <div class="view-message-actions">
+      <button type="button" class="btn" onClick=${reset}>${t("Try again")}</button>
+      <a class="btn" href="#/home">${t("Start")}</a>
+    </div>
+  </div>`;
+}
+
+/** The background app stopped answering (it quit, or crashed): the page says so and goes on asking.
+ * `refused`: it answers, but not this page, which is from an earlier run: what to do instead. */
+function Offline({ refused }) {
+  return html`<div class="offline-bar" role="alert">
+    <${Icon} name="warning" size=${16} />
+    <span>${refused || t("Libre Panel does not answer. If it has quit, start it again: this page tries again by itself.")}</span>
+  </div>`;
+}
+
+export function App() {
+  useStore((s) => s.lang); // a new language: everything is drawn again
+  const { gone, refused } = useStore((s) => ({ gone: Boolean(s.app.gone), refused: s.app.refused || "" }));
+  const { ready, failed, route } = useStore((s) => ({ ready: s.ready, failed: s.failed, route: s.route }));
+  const view = viewById(route.view);
+  const View = view?.component;
+  let body = html`<${Loading} />`;
+  if (failed) body = html`<${Failure} message=${failed} />`;
+  else if (ready && View) {
+    body = html`<${Boundary} key=${view.id} at=${route.rest}><${View} rest=${route.rest} /><//>`;
+  }
+  return html`<div class="app" data-view=${route.view}>
+    <${Header} view=${ready ? view : null} />
+    ${gone ? html`<${Offline} refused=${refused} />` : null}
+    <main class="view" id="main">${body}</main>
+    <${CommandPalette} />
+    <${Dialogs} />
+    <${Toasts} />
+  </div>`;
+}

@@ -1,0 +1,89 @@
+{
+  "format": "libre-panel-theme/1",
+  "name": "Arena Companion",
+  "author": "Libre Panel contributors",
+  "license": "CC0-1.0",
+  "description": "Beside Arena on a second panel while you play: the temperatures Arena does not show with the fans turning, every core, the ping and what takes the most besides the game.",
+  "display": {
+    "model": "turing-9.2-usb",
+    "orientation": "landscape",
+    "width": 1920,
+    "height": 480
+  },
+  "palette": {
+    "bg": "#0A1119",
+    "bg2": "#060A0F",
+    "surface": "#14202E",
+    "line": "#1F3147",
+    "track": "#162332",
+    "text": "#EEF6FF",
+    "text2": "#B8CAE0",
+    "text3": "#8CA0B8",
+    "accent": "#13E5D7",
+    "cpu": "#13E5D7",
+    "gpu": "#A3AEFF",
+    "mem": "#E0A8FF",
+    "disk": "#8FD3FF",
+    "net": "#7EE8A6",
+    "warn": "#FFCB6B",
+    "crit": "#FF7A85"
+  },
+  "font": "builtin:Barlow-Medium",
+  "background": {
+    "color": "@bg",
+    "image": null
+  },
+  "refresh_ms": 1000,
+  "animation": {
+    "smoothing_ms": 600
+  },
+  "style": {
+    "card": "glass",
+    "radius": 18,
+    "glow": 0.6,
+    "backdrop": "gradient",
+    "display_font": "builtin:Barlow-SemiBold",
+    "text_font": "builtin:Barlow-Medium",
+    "card_opacity": 0.8
+  },
+  "widgets": [
+    {
+      "type": "module",
+      "id": "m-temps-0-0",
+      "module": "temps",
+      "col": 0,
+      "row": 0,
+      "cols": 3,
+      "rows": 2,
+      "items": "!cpu.temp\n!gpu.temp\ntemp.*"
+    },
+    {
+      "type": "module",
+      "id": "m-cores-3-0",
+      "module": "cores",
+      "col": 3,
+      "row": 0,
+      "cols": 3,
+      "rows": 1,
+      "total": false
+    },
+    {
+      "type": "module",
+      "id": "m-ping-3-1",
+      "module": "ping",
+      "col": 3,
+      "row": 1,
+      "cols": 3,
+      "rows": 1
+    },
+    {
+      "type": "module",
+      "id": "m-processes-6-0",
+      "module": "processes",
+      "col": 6,
+      "row": 0,
+      "cols": 2,
+      "rows": 2
+    }
+  ]
+}

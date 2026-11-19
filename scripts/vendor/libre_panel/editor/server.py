@@ -1,0 +1,3142 @@
+"""Local web server for the visual theme editor.
+
+Binds to 127.0.0.1 only. That keeps other computers out, not the other users of this one, and not
+a website the user visits (it can try a local port). So a request must carry the expected Host
+header, and the secret token of this run in the ``X-Libre-Panel`` header (access.py): everything
+but the app's own files needs it. Every route is in ``ROUTES``; one that is not there is not
+answered, and the token is asked for before the answer "not found".
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import math
+import os
+import re
+import select
+import socket
+import sys
+import threading
+import time
+import webbrowser
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import ParseResult, parse_qs, unquote, urlparse
+
+from libre_panel import __version__, agents, i18n, modes, notify, sequence
+from libre_panel.config import (
+    ALARM_THEME,
+    CONFIG_FILENAME,
+    DEFAULT_CARDS,
+    DEFAULT_SYMBOLS,
+    FAN_LOOKS,
+    FAN_PAINTS,
+    SYMBOL_PACKS,
+    Config,
+    ConfigError,
+    DeviceConfig,
+    config_dir,
+    edit_config,
+    hardware_name,
+    load_config,
+    set_config_value,
+    theme_chosen,
+    user_themes_dir,
+)
+from libre_panel.devices.base import DeviceError
+from libre_panel.devices.models import MODELS, PROTOCOLS
+from libre_panel.editor import access, drawings, history
+from libre_panel.editor import settings as app_settings
+from libre_panel.editor.community import Community, CommunityError
+from libre_panel.editor.news import News
+from libre_panel.editor.pictures import PictureError, Pictures, preview_slot_count
+from libre_panel.editor.presets import presets_for_editor
+from libre_panel.editor.updates import Install, UpdateError, Updates
+from libre_panel.fonts import BUILTIN_PREFIX, DEFAULT_FONT, builtin_font_path, builtin_fonts
+from libre_panel.i18n import t
+from libre_panel.icons import ICON_NAMES
+from libre_panel.render import fan, fan_looks
+from libre_panel.render.renderer import Renderer
+from libre_panel.sensors.base import TIME_SECOND, Reading, SensorHub, Snapshot
+from libre_panel.sensors.demo import demo_snapshot
+from libre_panel.sensors.hardware import detected_names
+from libre_panel.theme.adapt import adapt_theme, laid_out
+from libre_panel.theme.defaults import default_theme, panel_model
+from libre_panel.theme.model import (
+    COMMON_FIELDS,
+    EFFECT_FIELDS,
+    FINISHES,
+    LOOK_RANGES,
+    LOOK_SPECS,
+    PRIMARY_FIELDS,
+    THEME_FILENAME,
+    TOAST_ANCHORS,
+    WIDGET_SPECS,
+    ThemeError,
+    companion_for,
+    find_theme,
+    follows_first,
+    is_companion,
+    list_themes,
+    load_theme,
+    parse_theme,
+    resolve_asset,
+    save_theme,
+    switches_for,
+    theme_for,
+    unpaired_version,
+    valid_theme_name,
+    version_base,
+    version_stem,
+    with_accent,
+    with_card_opacity,
+    with_light_colours,
+)
+from libre_panel.theme.modules import (
+    detach,
+    make_grid,
+    module_info,
+    templates,
+)
+from libre_panel.theme.share import MAX_ZIP, ShareError, export_theme, import_theme
+
+log = logging.getLogger(__name__)
+
+# What the console's pages and plugins' pages share (kit.js, editor.css, stats.js), and the icon.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+APP_DIR = Path(__file__).resolve().parent / "app"  # the app: shell, views, vendored libraries
+MAX_JSON = 2 * 1024 * 1024
+MAX_ASSET = 10 * 1024 * 1024
+MAX_VIDEO = 64 * 1024 * 1024  # a video for an image widget (render/moving.py)
+MAX_MEDIA = 32 * 2**30  # a file for the Player (player.py), written as it comes
+PLAYER_ACTIONS = ("play", "pause", "resume", "toggle", "next", "previous", "seek", "set", "stop",
+                  "remove", "folder")  # fmt: skip
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
+ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ttf", ".otf", *VIDEO_EXTENSIONS}
+# Parts of the language catalog the editor needs.
+_EDITOR_TABLES = ("messages", "fields", "widgets", "enums", "icons")
+# Readings of sources that work on demand: a running panel has none of them until a theme (or a
+# service) shows one, so a sensor field offers them from here, whatever the live readings say.
+# (key, unit, label), as the sources give them; the demo values of the previews cover them too.
+ON_DEMAND = (
+    ("audio.volume", "%", "Volume"),
+    ("audio.muted", "", "Muted"),
+    ("cpu.load", "%", "CPU load"),  # the fast load
+    ("gpu.load", "%", "GPU load"),
+    ("media.title", "", "Title"),
+    ("media.artist", "", "Artist"),
+    ("media.album", "", "Album"),
+    ("media.source", "", "Player"),
+    ("media.state", "", "Media"),
+    ("media.playing", "", "Playing"),
+    ("media.duration", "s", "Length"),
+    ("media.position", "s", "Position"),
+    ("media.progress", "", "Progress"),
+    ("media.remaining", "s", "Remaining"),
+    ("game.fps", "fps", "Frames per second"),
+    ("game.frametime", "ms", "Frame time"),
+    ("game.low", "fps", "1% low"),
+    ("game.frametime_peak", "ms", "Frame time peak"),
+    ("game.fps_avg", "fps", "Average FPS of the round"),
+    ("game.fps_1low", "fps", "1% low of the round"),
+    ("game.fps_01low", "fps", "0.1% low of the round"),
+    ("game.frametime_avg", "ms", "Average frame time of the round"),
+    ("game.frametime_max", "ms", "Longest frame of the round"),
+    ("game.limiter", "", "Limited by"),
+    ("game.app", "", "Game"),
+    ("game.name", "", "Game"),
+    ("weather.rain.minutes", "min", "Rain starts or stops"),
+    ("weather.rain.text", "", "Rain"),
+    ("net.ping", "ms", "Ping"),
+    ("net.ping.lost", "%", "Ping lost"),
+    ("net.ping.host", "", "Ping host"),
+    ("audio.mic.muted", "", "Microphone muted"),
+    ("audio.mic.volume", "%", "Microphone level"),
+    ("power.watts", "W", "Power"),
+    ("power.today", "kWh", "Energy today"),
+    ("power.month", "kWh", "Energy this month"),
+    ("power.today.cost", "€", "Cost today"),  # (the currency of [services.power])
+    ("power.month.cost", "€", "Cost this month"),
+    ("timer.left", "s", "Time left"),
+    ("timer.text", "", "Time left"),
+    ("timer.running", "", "Timer runs"),
+    ("timer.share", "", "Time passed"),
+    ("timer.phase", "", "Timer"),
+    ("timer.rounds", "", "Rounds"),
+)
+# Pictures a source or service has, for an image widget (``"src": "@media.cover"``). They are
+# no readings: they come marked ``picture``, and a sensor field leaves them out.
+PICTURES = (
+    ("media.cover", "Album cover"),
+    ("media.app_icon", "Player icon"),
+    ("game.logo", "Game logo"),
+)
+_ASSET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+# The names /api/hardware talks about, and the setting in config.toml ([hardware]) of each.
+_HARDWARE_SETTINGS = {"cpu": "cpu_name", "gpu": "gpu_name", "memory": "memory_name"}
+
+
+def _natural(key: str) -> list[Any]:
+    """A key in the order people count (fan_2 before fan_10)."""
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", key)]
+
+
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml; charset=utf-8",
+    ".png": "image/png",
+}
+# The app's files (ES modules in folders) and the theme files the editor shows.
+_APP_TYPES = {**_CONTENT_TYPES, ".txt": "text/plain; charset=utf-8"}
+_APP_PATH = re.compile(r"^(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/){0,4}[A-Za-z0-9_-][A-Za-z0-9_.-]*$")
+_ASSET_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+}
+# A page of the panel: "normal", "report" or a mode ([modes.<name>] in config.toml).
+_MODE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+# The routes of the app's Settings, and the method of editor/settings.py::Settings behind each.
+_SETTINGS_GET = {
+    "/api/settings": "read",
+    "/api/panel": "panel",
+    "/api/clip": "clip_question",
+    "/api/system": "system",
+    "/api/unlock": "unlock",
+    "/api/about": "about",
+    "/api/report": "report",
+    "/api/scenes": "scenes",
+}
+_SETTINGS_POST = {
+    "/api/settings": "write",
+    "/api/system": "set_system",
+    "/api/unlock": "set_unlock",
+    "/api/location": "search_place",
+    "/api/open": "open_folder",
+    "/api/scenes": "set_scene",
+}
+# What a plugin's editor page may serve from its folder.
+_PAGE_TYPES = {
+    **_CONTENT_TYPES,
+    ".json": "application/json",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+}
+
+
+def _theme_list() -> list[dict[str, Any]]:
+    """The installed themes (theme.model.list_themes) with their names and panels, for
+    lists and galleries: read from each theme.json, without loading the theme."""
+    themes = list_themes()
+    for item in themes:
+        try:
+            data = json.loads((Path(item["path"]) / THEME_FILENAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        display = data.get("display") if isinstance(data, dict) else None
+        display = display if isinstance(display, dict) else {}
+        name = data.get("name") if isinstance(data, dict) else None
+        item["name"] = name if isinstance(name, str) and name.strip() else item["id"]
+        item["model"] = display.get("model") if isinstance(display.get("model"), str) else None
+        collection = data.get("collection") if isinstance(data, dict) else None
+        item["collection"] = collection if isinstance(collection, str) else ""
+        # a card slot that leaves its cards to the person (theme.modules.follows_cards): Start
+        # offers the cards while the theme is on the panel
+        widgets = data.get("widgets") if isinstance(data, dict) else None
+        item["cards"] = isinstance(widgets, list) and any(
+            isinstance(w, dict) and w.get("type") == "module" and w.get("module") == "cards"
+            and not str(w.get("items") or "").strip()
+            for w in widgets
+        )  # fmt: skip
+        item["size"] = (
+            [display["width"], display["height"]]
+            if all(isinstance(display.get(k), int) for k in ("width", "height"))
+            else None
+        )
+    return themes
+
+
+def _finish_types(types: list[str]) -> dict[str, list[str]]:
+    """The widget types each finish draws (any other is drawn flat): the editor offers a
+    finish only where it shows. A module counts when its finish reaches one of its parts."""
+    from libre_panel.render import finish
+
+    found: dict[str, list[str]] = {}
+    for name in FINISHES[1:]:
+        kinds = [kind for kind in types if kind != "module" and finish.get(name, kind)]
+        if any(finish.get(name, part) for part in finish.PART_TYPES):
+            kinds.append("module")
+        found[name] = kinds
+    return found
+
+
+def _look_ranges() -> dict[str, dict[str, list[float]]]:
+    """``LOOK_RANGES`` by block, for sliders that stop where the theme would refuse."""
+    found: dict[str, dict[str, list[float]]] = {}
+    for (block, key), (low, high) in LOOK_RANGES.items():
+        found.setdefault(block, {})[key] = [low, high]
+    return found
+
+
+class EditorState:
+    def __init__(self, config_path: Path | None = None, controls: Any = None) -> None:
+        self.config_path = config_path
+        self.controls = controls
+        self._hub: SensorHub | None = None
+        self._lock = threading.Lock()
+        self.pages: dict[str, Any] = {}  # plugin editor pages, created on first use
+        self.previews: dict[tuple, bytes] = {}  # pictures of saved themes
+        self.last_request: float | None = None  # when a page of the app last asked (monotonic)
+        self.previews_lock = threading.Lock()  # (held for a moment: the cache, never a drawing)
+        # the drawings of those pictures wait here for their turn; the requests that are
+        # answered at once (a theme to open, its live picture) never wait for it
+        self.preview_slots = threading.BoundedSemaphore(preview_slot_count())
+        # the app's pictures, in a process of their own in the background app (pictures.py)
+        self.pictures = Pictures(in_process=controls is None, turns=lambda: self.preview_slots)
+        self.restart = app_settings.Restart()  # settings the panel loop takes in when it restarts
+        self.start_screen_jobs: Any = None  # the panel's own screens (a test puts a fake panel)
+        self.news = News(config_path)  # whom Start tells what is new (news.py)
+        self.updates = Updates(config_path)  # whether a newer version is out (updates.py)
+        self.community = Community()  # the themes the community shares (community.py)
+        self.install = Install()  # "Update to …": its download and putting it in place
+        self._doctor: Any = None  # the panel test of Status → Diagnose (doctor_session.py)
+        self._experiment: Any = None  # the video experiment's run (experiment.py)
+        self._colours: Any = None  # the colour check and its A/B on a panel (colours.py)
+        self._load: Any = None  # what Libre Panel costs the PC, Status → Diagnose (load_report.py)
+
+    def experiment(self, controls: Any) -> Any:
+        """The video experiment's run, made on first use: it writes the settings as the app
+        does and reads every panel's numbers from the app's panel loop."""
+        with self._lock:
+            if self._experiment is None:
+                from libre_panel.editor.experiment import Experiment
+
+                def settings() -> Any:
+                    return app_settings.Settings(self.config_path, controls, self.restart)
+
+                def status_of() -> Any:
+                    return getattr(getattr(controls, "panel", None), "status", None)
+
+                def gpu() -> str:
+                    hub = getattr(status_of(), "hub", None)
+                    try:
+                        return str(hub.snapshot().value("gpu.name") or "") if hub else ""
+                    except Exception:  # (a name is a nice-to-have: the step is left out)
+                        return ""
+
+                self._experiment = Experiment(
+                    write=lambda changes: settings().write({"set": changes}),
+                    read=lambda: settings().read()["config"]["video"],
+                    status_of=status_of,
+                    gpu=gpu,
+                )
+            return self._experiment
+
+    def colours(self) -> Any:
+        """The colour check (Settings → Panel → Check the colours), made on first use."""
+        with self._lock:
+            if self._colours is None:
+                from libre_panel.editor.colours import ColourCheck
+
+                self._colours = ColourCheck(self.config_path, self.controls)
+            return self._colours
+
+    def doctor(self) -> Any:
+        """The panel test, made on first use: it gives the app's panel loop's panel to the
+        doctor while it runs (a plain editor has none)."""
+        with self._lock:
+            if self._doctor is None:
+                from libre_panel.doctor_session import Session
+
+                def devices() -> str:
+                    return app_settings.Settings(self.config_path, self.controls,
+                                                 self.restart).report()["text"]  # fmt: skip
+
+                def load() -> str:  # the report says what Libre Panel cost before the test
+                    from libre_panel.load_report import WINDOW_S
+
+                    return self.load_sampler().text(wait=WINDOW_S + 1.0)
+
+                panel = getattr(self.controls, "panel", None)
+                self._doctor = Session(panel, self.config_path, devices=devices, load=load)
+            return self._doctor
+
+    def load_sampler(self) -> Any:
+        """What Libre Panel costs this PC (load_report.py), made on first use: it samples only
+        while Status → Diagnose → Load (or the panel report) asks."""
+        with self._lock:
+            if self._load is None:
+                from libre_panel.load_report import LoadSampler
+
+                self._load = LoadSampler(lhm=self._lhm_status)
+            return self._load
+
+    def _lhm_status(self) -> Any:
+        """The status of LibreHardwareMonitor's source in the panel loop's hub (or this editor's
+        own), with what its rounds take; None where it is not read."""
+        status = getattr(getattr(self.controls, "panel", None), "status", None)
+        hub = getattr(status, "hub", None) or self._hub
+        if hub is None:
+            return None
+        from libre_panel.sensors.librehardwaremonitor import LibreHardwareMonitorProvider
+
+        for provider in list(hub.providers):
+            if isinstance(provider, LibreHardwareMonitorProvider):
+                return provider.status()
+        return None
+
+    def start_screen(self) -> Any:
+        """What writes the panel's boot logo and standby clip (devices/panel_files.py)."""
+        if self.start_screen_jobs is None:
+            from libre_panel.devices.panel_files import StartScreen
+
+            self.start_screen_jobs = StartScreen()
+        return self.start_screen_jobs
+
+    def live_snapshot(self):
+        """The readings for previews. In the background app they are the panel's
+        own: sources that drive hardware must not run twice in one process."""
+        from libre_panel.app import build_hub
+
+        host = getattr(self.controls, "plugin_host", None)
+        if host is not None:
+            return host.latest or Snapshot()
+        with self._lock:
+            if self._hub is None:
+                self._hub = build_hub(load_config(self.config_path))
+                self._hub.snapshot()  # rates need a previous sample
+            return self._hub.snapshot()
+
+    def _chosen(self) -> tuple[fan.Choices, str, dict[str, dict[str, bool]]]:
+        """What the user chose in config.toml for the fans (their look and colours), for
+        the weather symbols and the moon (their look) and for the themes' switches: the canvas
+        shows them as the panel does. Read again when the file changed."""
+        try:  # (the file load_config reads: without a path of its own, the usual one)
+            stamp = (self.config_path or config_dir() / CONFIG_FILENAME).stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        kept = getattr(self, "_fan_choices", None)
+        if kept is None or kept[0] != stamp:
+            try:
+                config = load_config(self.config_path)
+                chosen = (fan.Choices.of(config), config.symbols, config.switches, config.accent,
+                          tuple(config.cards), config.card_opacity,
+                          config.light_colours)  # fmt: skip
+            except (ConfigError, OSError):
+                chosen = kept[1] if kept is not None else (
+                    fan.Choices(), DEFAULT_SYMBOLS, {}, "", DEFAULT_CARDS, 0, False
+                )  # fmt: skip
+            kept = self._fan_choices = (stamp, chosen)
+        return kept[1]
+
+    def fan_choices(self) -> fan.Choices:
+        return self._chosen()[0]
+
+    def symbols(self) -> str:
+        return self._chosen()[1]
+
+    def cards(self) -> tuple[str, ...]:
+        """The person's cards for the card slots that leave them to the person (config.toml
+        ``cards``): the canvas and the themes' pictures show them as the panel does."""
+        return self._chosen()[4]
+
+    def accent(self) -> str | None:
+        """The accent colour every theme takes on the panel (config.toml ``accent``), for the
+        previews of the themes; None: their own."""
+        from libre_panel.accent import accent_of
+
+        return accent_of(self._chosen()[3])
+
+    def card_opacity(self) -> int:
+        """How much of the background the cards cover on the panel (config.toml
+        ``card_opacity``, per cent), for the previews of the themes."""
+        return self._chosen()[5]
+
+    def light_colours(self) -> bool:
+        """Whether the panel shows every theme in light colours (config.toml
+        ``light_colours``), for the previews of the themes."""
+        return self._chosen()[6]
+
+    def dressed(self, theme: Any) -> Any:
+        """``theme`` for a preview, as the panel shows it: in the accent, in light colours
+        where asked, its cards as see-through as on the panel."""
+        dressed = with_light_colours(with_accent(theme, self.accent()), self.light_colours())
+        return with_card_opacity(dressed, self.card_opacity())
+
+    def switches(self, theme: Any) -> dict[str, bool]:
+        """The person's choice of the switches of ``theme`` (one with its folder)."""
+        return switches_for(theme, self._chosen()[2])
+
+    def every_switch(self) -> dict[str, dict[str, bool]]:
+        """The person's choices of the themes' switches, as config.toml has them (``switches``
+        works one theme's out of them)."""
+        return self._chosen()[2]
+
+    def chosen_switches(self, theme_id: str) -> tuple[tuple[str, bool], ...]:
+        """The same by the theme's name, in a form a key of the previews can hold."""
+        every = self._chosen()[2]
+        chosen = {**every.get("*", {}), **every.get(version_base(theme_id) or theme_id, {})}
+        return tuple(sorted(chosen.items()))
+
+    def follow_config(self) -> None:
+        """config.toml was written: the sources of this editor's own hub (a plain editor;
+        in the background app the panel's follow the file by themselves) take it in."""
+        with self._lock:
+            hub = self._hub
+            if hub is None:
+                return
+            try:
+                hub.follow_config(load_config(self.config_path))
+            except ConfigError:
+                pass  # until the file is fixed they go on as they are
+
+    def close(self) -> None:
+        self.pictures.stop()
+        with self._lock:
+            if self._hub is not None:
+                self._hub.close()
+            load, colours = self._load, self._colours
+        if load is not None:
+            load.close()
+        if colours is not None:  # (a panel showing the colour check's picture shows its theme)
+            colours.close()
+
+
+_PART = re.compile(r"\{(\w+)([+*]?)\}")
+_PARTS = {"": "[^/]+", "+": ".+", "*": ".*"}
+
+
+def _compile(template: str) -> re.Pattern[str]:
+    """The pattern of a route's template: ``{name}`` is one part of the path, ``{name+}`` the
+    rest of it (one character or more), ``{name*}`` the rest, or nothing."""
+    pieces, last = [], 0
+    for part in _PART.finditer(template):
+        pieces.append(re.escape(template[last : part.start()]))
+        pieces.append(f"(?P<{part[1]}>{_PARTS[part[2]]})")
+        last = part.end()
+    pieces.append(re.escape(template[last:]))
+    return re.compile("".join(pieces))
+
+
+@dataclass(frozen=True)
+class Route:
+    """One way into the server (``ROUTES``): the method, the path as a template, what to do."""
+
+    method: str
+    template: str
+    handle: Callable[[EditorHandler, re.Match[str], ParseResult], None]
+    # the app's own files and those of plugins' pages (code, no data): no token needed
+    public: bool = False
+    # an <img> asks for it and cannot send the header: the token may be in the query (?token=)
+    picture: bool = False
+    # another program's notice: the notify key stands for the token, checked by the route
+    # itself, which does nothing but show it (notify.py)
+    notify: bool = False
+    pattern: re.Pattern[str] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pattern", _compile(self.template))
+
+
+# a panel beside the first: its pages, by the [[panels]] key of each one's theme
+BESIDE_PAGES = {"normal": "theme", "game": "game_theme", "media": "media_theme",
+                "alarm": "alarm_theme"}  # fmt: skip
+
+
+def _panel_number(text: str | None, config: Config) -> int | None:
+    """``?panel=2``: the panel's number (1 the first), None for one that is not there."""
+    try:
+        number = int(text or "1")
+    except ValueError:
+        return None
+    return number if 1 <= number <= len(config.panels) + 1 else None
+
+
+def _whole_of(query: dict[str, list[str]] | None, name: str) -> int:
+    """A whole number of the query (``?panel=1``); 0 where it is none."""
+    raw = ((query or {}).get(name) or [""])[0]
+    return int(raw) if raw.isdigit() else 0
+
+
+def _panel_at(config: Config, n: int) -> tuple[DeviceConfig, tuple[tuple[str, ...], int]] | None:
+    """Panel ``n`` (0: the one [device] names, 1: the first of [[panels]] ...): its device, and
+    where its loop finds it on the bus: the models the other panels name, and how many panels
+    before it name the same (two alike: the second's is the second on the bus); None past the
+    last."""
+    if n == 0:
+        device = config.device
+    elif 1 <= n <= len(config.panels):
+        device = config.for_panel(n - 1).device
+    else:
+        return None
+    models = [config.device.model, *(panel.device.model for panel in config.panels)]
+    return device, (device.beside, models[:n].count(device.model))
+
+
+def _panel_model(device: DeviceConfig, where: tuple[tuple[str, ...], int]) -> str:
+    """The model of a panel: as set, or (``"auto"``) as found on the bus where it is."""
+    if device.model != "auto":
+        return device.model
+    from libre_panel.devices import turzx_usb
+
+    found = turzx_usb.present_model(*where)
+    return found.id if found is not None else ""
+
+
+def _panel_s(config: Config, n: int, written: dict[str, Any]) -> bool:
+    """Whether the start screen just written (its ``model``) is panel ``n``'s: the only panel's
+    is; beside others it is that panel's model, as set or as found on the bus where it is. A
+    clip on another panel is never named in its settings."""
+    if n == 0 and not config.panels:
+        return True
+    place = _panel_at(config, n)
+    if place is None:
+        return False
+    model = _panel_model(*place)
+    return bool(model) and written.get("model") == model
+
+
+def _size_of(text: str) -> tuple[int, int] | None:
+    """``"960x320"``: a panel's size (None for anything else)."""
+    found = re.fullmatch(r"(\d{2,5})x(\d{2,5})", text or "")
+    return (int(found[1]), int(found[2])) if found else None
+
+
+def panel_sizes() -> list[dict[str, Any]]:
+    """Every size of a panel Libre Panel drives, landscape, and on end for a bar (as the
+    catalogue's models have them): ``size``, ``shape`` ("rect", "round") and the ``panels``."""
+    from libre_panel.theme.defaults import is_bar
+
+    found: dict[tuple[int, int, str], list[str]] = {}
+    for model in MODELS:
+        ways = ("landscape", "portrait") if is_bar(model) else ("landscape",)
+        for way in ways:
+            found.setdefault((*model.size(way), model.shape), []).append(model.label)
+    ordered = sorted(found.items(), key=lambda kv: kv[0][0] / kv[0][1])  # (tall to long)
+    return [{"size": [w, h], "shape": shape, "panels": sorted(set(names))}
+            for (w, h, shape), names in ordered]  # fmt: skip
+
+
+class EditorHandler(BaseHTTPRequestHandler):
+    server_version = f"LibrePanelEditor/{__version__}"
+    state: EditorState
+    allowed_hosts: set[str]
+    token: str  # what a request must carry (access.py); made with the server
+    # The running background app (tray or `start`); None for a plain `libre-panel editor`.
+    controls: Any = None
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        # the line of a request has its address, and a picture's address may have the token
+        shown = [access.hide_token(arg) if isinstance(arg, str) else arg for arg in args]
+        log.debug("editor: " + fmt, *shown)
+
+    # -- helpers -----------------------------------------------------------
+
+    def _send(self, status: int, body: bytes, content_type: str, filename: str = "") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if filename:  # a file to keep
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'",
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, data: Any, status: int = 200) -> None:
+        self._send(status, json.dumps(data).encode("utf-8"), "application/json")
+
+    def parse_request(self) -> bool:
+        self._body_read = False
+        return super().parse_request()
+
+    def _discard_body(self) -> None:
+        """Read what the client sent before answering without it. Closing a socket
+        with unread data resets the connection (at once on Windows), and the client
+        then sees a connection error instead of the answer."""
+        if getattr(self, "_body_read", True):
+            return
+        self._body_read = True
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return
+        if 0 < length <= MAX_ASSET:
+            self.rfile.read(length)
+
+    def _error(self, message: str, status: int = 400, reason: str = "") -> None:
+        """An error answer; ``reason`` names a kind the app tells by itself ("token": the page
+        is from an earlier run of Libre Panel)."""
+        self._discard_body()
+        self._json({"error": message, **({"reason": reason} if reason else {})}, status)
+
+    def _host_ok(self) -> bool:
+        """Only the names this server listens under are answered (a web page that reaches it
+        through a name of its own gets nothing), and a browser's request only from a page of
+        the app itself."""
+        if self.headers.get("Host", "") not in self.allowed_hosts:
+            self._error("forbidden host", HTTPStatus.FORBIDDEN)
+            return False
+        origin = self.headers.get("Origin")  # sent by a browser on a request from another page
+        if origin is not None and origin not in {f"http://{host}" for host in self.allowed_hosts}:
+            self._error("forbidden origin", HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
+    def _token_ok(self, url: ParseResult, route: Route | None) -> bool:
+        """Whether the request carries this run's token: in the header, or, for a picture, which
+        an <img> asks for and cannot send a header with, in the query."""
+        given = self.headers.get(access.HEADER)
+        if given is None and route is not None and route.picture:
+            given = (parse_qs(url.query).get(access.NAME) or [""])[0]
+        return access.matches(given, self.token)
+
+    def _read_body(self, limit: int, too_large: str = "request too large") -> bytes | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > limit:
+            self._error(too_large, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return None
+        self._body_read = True
+        return self.rfile.read(length)
+
+    def _read_json(self) -> Any:
+        body = self._read_body(MAX_JSON)
+        if body is None:
+            return None
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._error("invalid JSON")
+            return None
+
+    # -- the routes --------------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._serve("GET")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._serve("POST")
+
+    def _serve(self, method: str) -> None:
+        """Answer a request: only to a name of this server and only with the token, but for
+        the app's own files. The token is asked for first, also for a path that is no route:
+        only those who may use the server learn what is there."""
+        if not self._host_ok():
+            return
+        url = urlparse(self.path)
+        route, match = None, None
+        for candidate in ROUTES:
+            found = candidate.method == method and candidate.pattern.fullmatch(url.path)
+            if found:
+                route, match = candidate, found
+                break
+        open_ = route is not None and (route.public or route.notify)
+        if not open_ and not self._token_ok(url, route):
+            return self._error(
+                t(
+                    "Access token missing or wrong. Open Libre Panel from its window or its "
+                    "tray icon, or with the address that libre-panel editor prints."
+                ),
+                HTTPStatus.FORBIDDEN,
+                reason="token",
+            )
+        if route is None or match is None:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        if not open_:  # a page of this run of the app asks (light mode, light.py)
+            self.state.last_request = time.monotonic()
+            self.state.pictures.warm()  # (its pictures come next)
+        route.handle(self, match, url)
+        self._discard_body()  # a route that answers without asking for its body
+
+    # -- plugin editor pages ---------------------------------------------------
+
+    def _page_class(self, page_id: str) -> Any:
+        from libre_panel.plugins.loader import registry
+
+        return registry().get("editor_pages", page_id)
+
+    def _pages(self) -> list[dict[str, str]]:
+        from libre_panel.plugins.loader import registry
+
+        pages = []
+        for page_id in registry().names("editor_pages"):
+            cls = self._page_class(page_id)
+            folder = cls.folder() if cls is not None else None
+            if folder is None or not (folder / "index.html").is_file():
+                continue
+            title = cls.title.get(i18n.language()) or cls.title.get("en") or page_id
+            pages.append({"id": page_id, "title": title, "icon": cls.icon})
+        return pages
+
+    def _page_file(self, page_id: str, name: str) -> None:
+        cls = self._page_class(page_id)
+        folder = cls.folder() if cls is not None else None
+        content_type = _PAGE_TYPES.get(Path(name).suffix.lower())
+        if folder is None or content_type is None:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        base = folder.resolve()
+        file = (base / name).resolve()
+        if not file.is_relative_to(base) or not file.is_file():
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        self._send(200, file.read_bytes(), content_type)
+
+    def _page_api(self, method: str, page_id: str, path: str, query: dict, body: Any) -> None:
+        from libre_panel.plugins.pages import PageContext
+
+        cls = self._page_class(page_id)
+        if cls is None:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        pages = self.state.pages
+        if page_id not in pages:
+            pages[page_id] = cls(PageContext(self.controls, self.state.config_path))
+        try:
+            status, data, *kind = pages[page_id].handle(method, path, query, body)
+            if isinstance(data, bytes):  # a file, e.g. a picture: (status, bytes, content type)
+                payload, content_type = data, kind[0] if kind else "application/octet-stream"
+            else:
+                payload, content_type = json.dumps(data).encode("utf-8"), "application/json"
+        except Exception as exc:  # a broken page must not take the editor down
+            log.exception("editor page %s failed", page_id)
+            return self._error(f"{page_id}: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+        self._send(int(status), payload, content_type)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _static(self, name: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name.startswith("."):
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        file = STATIC_DIR / name
+        if not file.is_file():
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        content_type = _CONTENT_TYPES.get(file.suffix, "application/octet-stream")
+        self._send(200, file.read_bytes(), content_type)
+
+    # -- the app ---------------------------------------------------------------
+
+    def _app_file(self, name: str) -> None:
+        """A file of the app: its page, modules, styles and vendored libraries."""
+        content_type = _APP_TYPES.get(Path(name).suffix.lower())
+        if not _APP_PATH.fullmatch(name) or ".." in name or content_type is None:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        base = APP_DIR.resolve()
+        file = (base / name).resolve()
+        if not file.is_relative_to(base) or not file.is_file():
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        self._send(200, file.read_bytes(), content_type)
+
+    def _font(self, name: str) -> None:
+        """The bundled fonts, for the app's own text (never from the network)."""
+        path = builtin_font_path(BUILTIN_PREFIX + name.removesuffix(".ttf"))
+        if not name.endswith(".ttf") or path is None:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        self._send(200, path.read_bytes(), "font/ttf")
+
+    def _asset_file(self, theme_id: str, rel: str) -> None:
+        """An image or font of a theme, for the library of pictures and their previews."""
+        try:
+            file = resolve_asset(find_theme(theme_id), rel)
+        except ThemeError:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        content_type = _ASSET_TYPES.get(file.suffix.lower())
+        if content_type is None or not file.is_file():
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        self._send(200, file.read_bytes(), content_type)
+
+    def _theme_preview(self, theme_id: str, query: dict[str, list[str]]) -> None:
+        """A saved theme as a picture (``?w=`` its width), for lists of themes; with
+        ``?size=WxH`` as a panel of that size shows it (theme.adapt.laid_out: Design's
+        sizes). The pictures are kept until the theme changes."""
+        try:
+            width = max(64, min(1920, int((query.get("w") or ["480"])[0])))
+        except ValueError:
+            width = 480
+        size = _size_of((query.get("size") or [""])[0])
+        try:
+            folder = find_theme(theme_id)
+            stamp = (folder / THEME_FILENAME).stat().st_mtime_ns
+        except (ThemeError, OSError):
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        chosen = self.state.chosen_switches(theme_id)  # (as the panel shows it)
+        accent = self.state.accent()
+        cards = self.state.cards()
+        see = self.state.card_opacity()
+        light = self.state.light_colours()
+        key = (theme_id, stamp, width, i18n.language(), self.state.symbols(), chosen, accent, cards,
+               see, size, light)  # fmt: skip
+        png = self._kept_preview(key)
+        if png is None:
+            # A page asks for a screenful of these at once: they are drawn two at a time
+            # (preview_slots), the others wait for a turn, and a request that is answered at
+            # once (the theme to open) does not wait for any of them.
+            with self.state.preview_slots:
+                png = self._kept_preview(key)  # (drawn while this one waited)
+                if png is None:
+                    if self._client_gone():  # the page left: nobody waits for this picture
+                        return
+                    try:
+                        png = self.state.pictures.ask(
+                            "theme_preview", str(folder), size, width, accent,
+                            self.state.symbols(), chosen, cards, see, light,
+                        )  # fmt: skip
+                    except PictureError as exc:
+                        if exc.kind != "ThemeError":
+                            raise
+                        return self._error(str(exc), HTTPStatus.NOT_FOUND)
+                    with self.state.previews_lock:
+                        cache = self.state.previews
+                        while len(cache) >= 48:  # the oldest go first
+                            cache.pop(next(iter(cache)))
+                        cache[key] = png
+        self._send(200, png, "image/png")
+
+    def _theme_sizes(self, theme_id: str) -> None:
+        """How the theme comes on every panel size (Design → the theme's menu → Every panel
+        size): ``version`` the one shown there (its version for that size or way up), ``how``
+        "made" for it, "laid_out" from ``from`` (its version for the nearest shape:
+        theme.adapt.laid_out), or "scaled" into it with the background round it."""
+        try:
+            find_theme(theme_id)
+        except ThemeError:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        out = []
+        for entry in panel_sizes():
+            size = tuple(entry["size"])
+            way = "portrait" if size[1] > size[0] else "landscape"
+            version = theme_for(theme_id, way, size)
+            try:
+                theme = load_theme(find_theme(version))
+            except ThemeError:
+                continue
+            fitted = laid_out(theme, size)
+            if fitted is not theme:
+                how, source = "laid_out", fitted.root.name if fitted.root else version
+            else:
+                how = "made" if (theme.width, theme.height) == size else "scaled"
+                source = version
+            out.append({**entry, "version": version, "how": how, "from": source})
+        self._json({"theme": theme_id, "sizes": out})
+
+    def _make_version(self, theme_id: str) -> None:
+        """``POST /api/themes/{theme}/version`` with ``{"width", "height"}``: a version of the
+        theme made for that size (Every panel size → *Make a version for this size*), in the
+        person's themes folder as ``<theme>-<width>x<height>``, begun as the panels of that size
+        show the theme now: its version for the nearest shape laid out on it, or the theme
+        scaled into it. From then on that size shows it, it is the person's to change as any
+        theme of theirs, and a theme of theirs with versions for more than one size is laid out
+        on the other sizes from the one nearest in shape (theme.adapt.laid_out)."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        try:
+            width, height = int(payload.get("width")), int(payload.get("height"))
+        except (TypeError, ValueError):
+            return self._error("width and height: whole numbers")
+        try:
+            find_theme(theme_id)
+        except ThemeError:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        stem = version_stem(theme_id)
+        name = f"{stem}-{width}x{height}"
+        if not (16 <= width <= 4096 and 16 <= height <= 4096) or not valid_theme_name(name):
+            return self._error("display size must be between 16 and 4096 pixels")
+        try:
+            find_theme(name)
+        except ThemeError:
+            pass
+        else:
+            return self._error(t("It has a version for this size already: {name}.", name=name),
+                               HTTPStatus.CONFLICT)  # fmt: skip
+        way = "portrait" if height > width else "landscape"
+        try:
+            theme = load_theme(find_theme(theme_for(stem, way, (width, height))))
+            fitted = laid_out(theme, (width, height))
+            if (fitted.width, fitted.height) == (width, height) and fitted.root is not None:
+                data, source = fitted.to_dict(), Path(fitted.root).name
+            else:  # scaled into the panel, as it was shown
+                data = adapt_theme(theme.to_dict(), "custom", way, "scale", width, height)
+                source = Path(theme.root).name if theme.root is not None else None
+            data["name"] = f"{theme.name or stem} {width}×{height}"
+            folder = save_theme(name, data, source)
+        except (ThemeError, OSError, ValueError) as exc:
+            return self._error(str(exc))
+        self._json({"id": name, "path": str(folder)})
+
+    def _kept_preview(self, key: tuple) -> bytes | None:
+        with self.state.previews_lock:
+            return self.state.previews.get(key)
+
+    def _client_gone(self) -> bool:
+        """Whether the browser closed this request's connection (a page it left, a picture it
+        no longer needs): then there is nobody to draw for. An answer is not sent in the
+        middle of a request, and a client that is still there has sent nothing more."""
+        try:
+            ready, _, _ = select.select([self.connection], [], [], 0)
+            return bool(ready) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def _fan_look(self, query: dict[str, list[str]]) -> None:
+        """``GET /api/fan-look?look=libre&paint=own``: a fan of that look as a picture
+        (PNG), in its square frame and the app's accent: the tiles of Settings show them."""
+        look = (query.get("look") or [fan_looks.DEFAULT])[0]
+        paint = (query.get("paint") or ["theme"])[0]
+        if look not in fan_looks.LOOKS or paint not in FAN_PAINTS:
+            return self._error("unknown look or colours", HTTPStatus.NOT_FOUND)
+        self._send(200, self.state.pictures.ask("fan_look", look, paint), "image/png")
+
+    _symbol_tiles: dict[str, bytes] = {}
+
+    def _symbols_look(self, query: dict[str, list[str]]) -> None:
+        """``GET /api/symbols-look?pack=vivid``: the weather symbols and the moon in that look
+        as a picture (PNG), on a panel's dark ground: the tiles of Settings show them. The
+        sun behind a cloud and snow, lit, by day, and the moon waxing."""
+        pack = (query.get("pack") or [DEFAULT_SYMBOLS])[0]
+        if pack not in SYMBOL_PACKS:
+            return self._error("unknown look", HTTPStatus.NOT_FOUND)
+        png = self._symbol_tiles.get(pack)
+        if png is None:
+            png = self._symbol_tiles[pack] = self.state.pictures.ask("symbols_look", pack)
+        self._send(200, png, "image/png")
+
+    def _readings(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        """Sensor values for the editor's pickers (``?keys=a,b``; all without it) and
+        the recent history of some (``?history=a``): live where there are live ones,
+        sample values otherwise, each marked ``sample``."""
+        snapshot = demo_snapshot()
+        live = False
+        measured: set[str] = set()  # the keys this computer gives; the rest are samples
+        try:
+            current = self.state.live_snapshot()
+            live = bool(current.readings)
+            measured = set(current.readings)
+            snapshot.readings.update(current.readings)
+            snapshot.history.update({k: v for k, v in current.history.items() if len(v) > 1})
+        except Exception as exc:  # live sensors are optional for the editor
+            log.debug("live sensors unavailable: %s", exc)
+
+        def plain(value: Any) -> Any:  # JSON has no NaN
+            return None if isinstance(value, float) and not math.isfinite(value) else value
+
+        wanted = [k for k in ",".join(query.get("keys", [])).split(",") if k]
+        readings = {}
+        for key in wanted or sorted(snapshot.readings):
+            reading = snapshot.readings.get(key)
+            if reading is not None and not key.startswith("_"):
+                readings[key] = {
+                    "value": plain(reading.value),
+                    "unit": reading.unit,
+                    "label": reading.label,
+                    # a sample value: this computer gives none for the key (a fan it does not
+                    # have), so the panel shows nothing there
+                    "sample": key not in measured,
+                }
+        if not wanted or TIME_SECOND in wanted:  # the clock's own (a seconds run): always live
+            second = snapshot.value(TIME_SECOND)
+            readings[TIME_SECOND] = {
+                "value": second, "unit": "s", "label": "Seconds of the minute", "sample": False
+            }  # fmt: skip
+        history = {}
+        for key in ",".join(query.get("history", [])).split(","):
+            values = snapshot.history.get(key) if key else None
+            if values:
+                history[key] = [plain(round(v, 3)) for v in values[-60:]]
+        return {"live": live, "readings": readings, "history": history}
+
+    def _panel_state(self) -> dict[str, Any]:
+        """What the running app says about its panel (``panel`` of ``/api/app``); empty
+        without one, or when it cannot say."""
+        if self.controls is None:
+            return {}
+        try:
+            return self.controls.snapshot()["panel"] or {}
+        except Exception as exc:  # the panel's state is a nice-to-have here
+            log.debug("no panel state: %s", exc)
+            return {}
+
+    def _panel_pages(self, query: dict[str, list[str]] | None = None) -> None:
+        """The pages of the panel: the theme it shows normally (config.toml's, else the
+        panel's own default), the theme of each mode ([modes.<name>], game mode's among
+        them, with its frame rate; None: the normal one) and the round report's (the memory
+        service's ``report_theme``), and which page is on show now, whether config.toml names
+        a theme at all (``chosen``) and the panel's own ``default``. The console's
+        ``control/themes`` has the first two. ``?panel=2``: those of a panel beside the first
+        (:meth:`_beside_pages`)."""
+        from libre_panel.services.game import MODE as GAME_MODE
+        from libre_panel.services.memory import Memory
+
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        number = _panel_number((query or {}).get("panel", ["1"])[0], config)
+        if number is None:
+            return self._error("no such panel", HTTPStatus.NOT_FOUND)
+        if number > 1:
+            return self._json(self._beside_pages(config, number - 2))
+        panel = self._panel_state()
+        # the panel's own default: the running app's word, else worked out from the config
+        default = panel.get("default_theme") or default_theme(panel_model(config.device))
+        pages = [{"id": "normal", "theme": config.theme if config.theme_given else default,
+                  "sequence": config.sequence.active}]  # fmt: skip
+        own = (GAME_MODE, modes.MEDIA, modes.IDLE)
+        names = [*own, *sorted(name for name in config.modes if name not in own)]
+        game = config.services.options.get(GAME_MODE, {})
+        for name in names:
+            mode = config.modes.get(name)
+            theme, fps = (mode.theme or None, mode.fps) if mode else (None, None)
+            page = {"id": name, "mode": name, "theme": theme, "fps": fps, "on": True,
+                    "suggested": list(modes.SUGGESTED.get(name, ()))}  # fmt: skip
+            if name == GAME_MODE:  # game mode's page is the game service switching by itself
+                page["on"] = (GAME_MODE in config.services.enabled
+                              and game.get("automatic", True) is not False)  # fmt: skip
+                page["service"] = GAME_MODE
+            elif name in (modes.MEDIA, modes.IDLE):  # the pages Libre Panel switches to itself
+                page.update(on=modes.page_on(config, name), theme=modes.page_theme(config, name),
+                            own=True)  # fmt: skip
+                if name == modes.IDLE:
+                    page["minutes"] = modes.idle_minutes(config)
+            pages.append(page)
+        memory = config.services.options.get(Memory.name, {})
+        report = memory.get("report_theme", Memory.options["report_theme"][1])
+        pages.append(
+            {
+                "id": "report",
+                "service": Memory.name,
+                "theme": report if isinstance(report, str) and report else None,
+                "on": Memory.name in config.services.enabled and memory.get("report", True) is True,
+                "suggested": list(modes.SUGGESTED[modes.REPORT]),
+            }
+        )
+        chosen = theme_chosen(config.path)  # false on a first start: Start offers the themes
+        self._json(
+            {
+                "pages": pages,
+                "shown": panel.get("theme"),
+                "mode": panel.get("mode"),
+                "chosen": chosen,
+                "default": default,
+            }
+        )
+
+    def _i18n(self) -> dict[str, Any]:
+        try:
+            setting = load_config(self.state.config_path).language
+        except ConfigError:
+            setting = "auto"
+        return {
+            "language": i18n.language(),
+            "setting": setting,
+            "languages": i18n.LANGUAGES,
+            **{k: v for k, v in i18n.catalog(i18n.language()).items() if k in _EDITOR_TABLES},
+        }
+
+    def _specs(self) -> dict[str, Any]:
+        presets = presets_for_editor()
+        for preset in presets["presets"]:
+            preset["name"] = i18n.t(preset["name"])
+        models = [{**m.to_dict(), "default_theme": default_theme(m)} for m in MODELS]
+        for model in models:
+            for said in ("notes", "limits"):
+                if model.get(said):
+                    model[said] = i18n.t(model[said])
+        widgets = {t: {k: list(v) for k, v in spec.items()} for t, spec in WIDGET_SPECS.items()}
+        plugins = drawings.plugin_specs()
+        widgets.update(plugins["widgets"])
+        presets["presets"] += plugins["presets"]
+        return {
+            "version": __version__,
+            "widgets": widgets,
+            "widget_labels": plugins["widget_labels"],
+            "screens": plugins["screens"],
+            "toasts": plugins["toasts"],
+            "toast_anchors": list(TOAST_ANCHORS),
+            "common": {k: list(v) for k, v in COMMON_FIELDS.items()},
+            "effect_fields": list(EFFECT_FIELDS),
+            # names for values a name of its own would not say (the language's catalog first)
+            "enum_labels": {**fan_looks.labels(), "theme": "the theme's", "own": "the look's own"},
+            # what the inspector shows first for each widget type
+            "primary": {kind: list(keys) for kind, keys in PRIMARY_FIELDS.items()},
+            # which widget types each finish draws (flat draws all)
+            "finishes": _finish_types(list(widgets)),
+            # the panel's look, block by block: Theme -> Look
+            "look": {
+                name: {k: list(v) for k, v in spec.items()} for name, spec in LOOK_SPECS.items()
+            },
+            # the range each numeric field of a look block accepts: {block: {field: [low, high]}}
+            "look_ranges": _look_ranges(),
+            "models": models,
+            "protocols": PROTOCOLS,
+            "fonts": [BUILTIN_PREFIX + name for name in builtin_fonts()],
+            "default_font": DEFAULT_FONT,
+            "icons": list(ICON_NAMES),
+            "modules": module_info(),
+            **presets,
+        }
+
+    def _assets(self, theme_id: str) -> None:
+        try:
+            folder = find_theme(theme_id)
+        except ThemeError as exc:
+            return self._error(str(exc), HTTPStatus.NOT_FOUND)
+        files = sorted(
+            path.relative_to(folder).as_posix()
+            for path in folder.rglob("*")
+            if path.is_file() and path.suffix.lower() in ASSET_EXTENSIONS
+        )
+        self._json(files)
+
+    def _get_theme(self, theme_id: str) -> None:
+        try:
+            folder = find_theme(theme_id)
+            theme = load_theme(folder)
+        except ThemeError as exc:
+            return self._error(str(exc), HTTPStatus.NOT_FOUND)
+        builtin = not folder.resolve().is_relative_to(user_themes_dir().resolve())
+        self._json(
+            {
+                "id": theme_id,
+                "builtin": builtin,
+                "theme": theme.to_dict(),
+                "warnings": theme.warnings,
+            }
+        )
+
+    def _sensors(self) -> list[dict[str, Any]]:
+        """Every key a theme can show: those that work on demand, the demo's and the panel's
+        own (a source's unit and label come last, so they win), and the pictures."""
+        found: dict[str, dict[str, Any]] = {
+            key: {"key": key, "unit": unit, "label": label} for key, unit, label in ON_DEMAND
+        }
+        readings = dict(demo_snapshot().readings)
+        try:
+            readings.update(self.state.live_snapshot().readings)
+        except Exception as exc:  # live sensors are optional for the editor
+            log.debug("live sensors unavailable: %s", exc)
+        for key, reading in readings.items():
+            found[key] = {"key": key, "unit": reading.unit, "label": reading.label}
+            if reading.device:  # (the editor lists a source's raw readings under it)
+                found[key]["device"] = reading.device
+        for key, label in PICTURES:
+            found[key] = {"key": key, "unit": "", "label": label, "picture": True}
+        return [found[key] for key in sorted(found)]
+
+    # -- what POST routes do ---------------------------------------------------------
+
+    def _post_page(self, page_id: str, path: str, query: dict[str, list[str]]) -> None:
+        """A plugin's page gets what it was sent (a JSON object) and the answer is its own."""
+        body = self._read_json()
+        if body is None:
+            return
+        self._page_api("POST", page_id, path, query, body)
+
+    def _set_language(self) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        setting = payload.get("language") if isinstance(payload, dict) else None
+        if setting not in ("auto", *i18n.LANGUAGES):
+            return self._error(f"language must be auto or one of {', '.join(i18n.LANGUAGES)}")
+        try:
+            set_config_value("language", setting, self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc))
+        i18n.set_language(setting)  # the tray and the panel follow at once
+        self._json(self._i18n())
+
+    def _beside_pages(self, config: Config, n: int) -> dict[str, Any]:
+        """The pages of the panel beside the first at ``[[panels]]`` ``n``: its theme, and the
+        theme it shows while the first panel is in a game, plays music or is at rest, and
+        during an alarm. While it follows the first panel (``follows``: [[panels]] follow, else
+        when its theme is a companion), it shows the companion of the first panel's theme
+        (Arena Companion beside Arena), and so does a page without a theme (None); else its
+        own theme."""
+        panel = config.panels[n]
+        running = self._panel_state().get("more") or []
+        now = next((item for item in running if item.get("index") == n), {})
+        follows = follows_first(panel.follow, panel.theme)
+        pages = [{"id": "normal", "theme": panel.theme or now.get("theme") or None,
+                  "beside": True, "companion": follows, "follows": follows}]  # fmt: skip
+        for page, key in BESIDE_PAGES.items():
+            if page == "normal":
+                continue
+            theme = getattr(panel, key) or None
+            pages.append({"id": page, "theme": theme, "on": True, "beside": True,
+                          "follows": follows and theme is None and page != "alarm"})  # fmt: skip
+        return {"pages": pages, "shown": now.get("theme"), "mode": None, "chosen": True,
+                "default": panel.theme, "panel": n + 2}  # fmt: skip
+
+    def _set_panel_page(self) -> None:
+        """``{"page": ..., "theme": ...}`` and, for a mode, ``{"fps": ...}``: what a page of
+        the panel shows, written to config.toml. ``page`` is "normal", "report" (the round
+        report) or a mode's name; a mode's empty theme is the normal one's."""
+        from libre_panel.services.memory import Memory
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        page = payload.get("page") if isinstance(payload, dict) else None
+        if not isinstance(page, str) or not _MODE_NAME.fullmatch(page):
+            return self._error('expected {"page": "normal", "report" or a mode, ...}')
+        if payload.get("panel", 1) != 1:
+            return self._set_beside_page(payload, page)
+        theme = payload.get("theme")
+        fps = payload.get("fps")
+        on = payload.get("on")
+        minutes = payload.get("minutes")
+        if theme is not None and not isinstance(theme, str):
+            return self._error("theme must be a theme name")
+        if fps is not None and (isinstance(fps, bool) or not isinstance(fps, int)):
+            return self._error("fps must be a whole number")
+        if on is not None and (not isinstance(on, bool) or page == "normal"):
+            return self._error("on is true or false, for every page but the normal one")
+        if minutes is not None and (
+            page != modes.IDLE or isinstance(minutes, bool)
+            or not isinstance(minutes, int | float) or not 0.5 <= minutes <= 1440
+        ):  # fmt: skip
+            return self._error("minutes (0.5 to 1440) are the idle page's")
+        if page in ("normal", "report") and (fps is not None or (theme is not None and not theme)):
+            return self._error(f"the page {page} needs a theme and has no frame rate of its own")
+        if page in ("normal", "report") and theme is None and on is None:
+            return self._error(f"the page {page} needs a theme")
+        if page == "normal" and theme:  # (the pair version, put on it while a companion ran)
+            theme = unpaired_version(theme) or theme
+        keys = {"normal": "theme", "report": f"services.{Memory.name}.report_theme"}
+        key = keys.get(page, f"modes.{page}.theme")
+        changes: list[tuple[str, str, Any]] = []
+        if theme is not None:
+            changes.append(("value", key, theme))
+        if fps is not None:
+            changes.append(("value", f"modes.{page}.fps", fps))
+        if minutes is not None:
+            changes.append(("value", "modes.idle.minutes", minutes))
+        try:
+            if on is not None:
+                changes.extend(self._page_switch(page, on))
+            if theme:
+                find_theme(theme)
+            if page == "normal" and load_config(self.state.config_path).sequence.active:
+                # one theme chosen: the screens in turn stop (they are kept, to go on later)
+                changes.append(("value", "sequence.on", False))
+            if changes:
+                edit_config(*changes, path=self.state.config_path)
+        except ThemeError as exc:
+            return self._error(str(exc))
+        except (ConfigError, OSError) as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._panel_pages()
+
+    def _set_beside_page(self, payload: dict[str, Any], page: str) -> None:
+        """``{"panel": 2, "page": "media", "theme": ...}``: the theme a page of a panel beside
+        the first shows (an empty one: the companion of the first panel's theme, else its
+        own), written to its ``[[panels]]`` table. The normal page's theme is the panel's own
+        from then on, whatever the first panel shows; ``{"page": "normal", "follow": true}``
+        has it show the companion of the first panel's theme again (Lumen Companion beside
+        Lumen, Arena Companion beside Arena)."""
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        number = _panel_number(str(payload.get("panel")), config)
+        theme = payload.get("theme")
+        follow = payload.get("follow") is True and page == "normal"
+        if number is None or number < 2:
+            return self._error("no such panel", HTTPStatus.NOT_FOUND)
+        if follow and theme is None:  # (its theme kept where it is a companion)
+            own = config.panels[number - 2].theme
+            theme = own if is_companion(own) else companion_for(config.theme) or ALARM_THEME
+        if (
+            page not in BESIDE_PAGES
+            or not isinstance(theme, str)
+            or (page == "normal" and not theme)
+        ):
+            return self._error(
+                "a page of a panel beside the first: normal, game, media or alarm, with a theme "
+                "(none: the companion's, for all but normal), or normal with follow: true"
+            )
+        try:
+            if theme:
+                find_theme(theme)
+            settings = app_settings.Settings(self.state.config_path, self.controls,
+                                             self.state.restart)  # fmt: skip
+            tables = settings.read()["config"]["panels"]
+            table = {**tables[number - 2], BESIDE_PAGES[page]: theme}
+            if page == "normal":  # chosen: its own, or the companion of the first's again
+                table["follow"] = follow
+            tables[number - 2] = table
+            settings.write({"set": {"panels": tables}})
+        except ThemeError as exc:
+            return self._error(str(exc))
+        except app_settings.SettingsError as exc:
+            return self._error(str(exc), exc.status)
+        except (ConfigError, OSError) as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._json(self._beside_pages(load_config(self.state.config_path), number - 2))
+
+    def _see_news(self) -> None:
+        """``{"seen": "0.6"}``: the card of a release's news was closed (news.py)."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        seen = payload.get("seen") if isinstance(payload, dict) else None
+        try:
+            self._json(self.state.news.see(seen if isinstance(seen, str) else ""))
+        except ValueError as exc:
+            self._error(str(exc))
+
+    def _check_updates(self) -> bool | None:
+        try:
+            return load_config(self.state.config_path).check_updates
+        except ConfigError:
+            return None  # config.toml cannot be read: nothing is asked
+
+    def _history(self, query: dict[str, list[str]]) -> None:
+        """What the memory kept in ``?span=day`` (week, month), for History (history.py), and
+        whether the memory service is switched on."""
+        span = (query.get("span") or ["day"])[0]
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        try:
+            found = history.history(history.database(config), span, time.time())
+        except ValueError as exc:
+            return self._error(str(exc))
+        power = None  # the span's energy and its cost, where the power service prices it
+        if "power" in config.services.enabled:
+            power = history.energy(found["summary"], config.services.options.get("power") or {})
+        self._json({**found, "memory": "memory" in config.services.enabled, "power": power})
+
+    def _outside_notice(self, method: str, url: ParseResult) -> None:
+        """A notice from another program (notify.py): only where ``allow_notify`` is on and
+        with the notify key (the header, or ``?key=``); ``text``, ``title``, ``seconds``,
+        ``icon`` and ``level`` in the address or, posted, as JSON."""
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        if not config.allow_notify:
+            return self._error(
+                t("Notices from other programs are switched off (Settings → Game mode and more)."),
+                HTTPStatus.FORBIDDEN,
+            )
+        params: dict[str, Any] = {k: v[0] for k, v in parse_qs(url.query).items()}
+        given = self.headers.get(notify.HEADER) or params.get("key", "")
+        params.pop("key", None)
+        if not access.matches(given, notify.read_key()):
+            return self._error(t("The notify key is missing or wrong."), HTTPStatus.FORBIDDEN)
+        if method == "POST" and self.headers.get("Content-Length", "0") != "0":
+            body = self._read_json()
+            if body is None:
+                return None
+            if not isinstance(body, dict):
+                return self._error('expected {"text": "..."}')
+            params.update(body)
+        try:
+            options = notify.notice(params)
+        except notify.NoticeError as exc:
+            return self._error(str(exc))
+        from libre_panel.plugins.pages import PageContext
+
+        delivery = PageContext(self.controls, self.state.config_path).notify(**options)
+        self._json({"shown": delivery.shown, "reason": delivery.reason})
+
+    def _ai_in(self, kind: str, url: ParseResult) -> None:
+        """A hook event of Claude Code or Codex, or Claude Code's status line (agents.py): only
+        while AI activity is on (Settings → Game mode and more) and with the AI key (``?key=``
+        or the header). The status line is answered with the line it shows."""
+        params: dict[str, str] = {k: v[0] for k, v in parse_qs(url.query).items()}
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        if "agents" not in config.services.enabled:
+            return self._error(
+                t("AI activity is switched off (Settings → Game mode and more)."),
+                HTTPStatus.FORBIDDEN,
+            )
+        given = self.headers.get(agents.HEADER) or params.get("key", "")
+        if not access.matches(given, agents.read_key()):
+            return self._error(t("The AI key is missing or wrong."), HTTPStatus.FORBIDDEN)
+        agent = params.get("agent", "")
+        if agent not in agents.AGENTS:
+            return self._error("agent: claude or codex")
+        body = self._read_body(agents.MAX_BODY)
+        if body is None:
+            return None
+        try:
+            data = json.loads(body.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return self._error("invalid JSON")
+        if not isinstance(data, dict):
+            return self._error("expected a JSON object")
+        if kind == "hook":
+            agents.BOARD.hook(agent, data)
+            return self._send(HTTPStatus.NO_CONTENT, b"", "text/plain")
+        line = agents.BOARD.status(agent, data)
+        self._send(HTTPStatus.OK, line.encode("utf-8"), "text/plain; charset=utf-8")
+
+    def _ai_setup(self, method: str) -> None:
+        """For Settings: whether Claude Code and Codex are there and set up (GET); with
+        ``{"agent", "action": "preview" | "install" | "remove", "status_line"}`` (POST) what
+        Libre Panel adds to their settings, or adds it (a copy of the file is kept), or takes it
+        out again."""
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        on = "agents" in config.services.enabled
+        paths = {"claude": agents.claude_settings_path(), "codex": agents.codex_hooks_path()}
+        options = config.services.options.get("agents", {})
+        if method == "GET":
+            found = {}
+            for agent, path in paths.items():
+                try:
+                    current = agents.read_settings(path)
+                    state, problem = agents.installed(current), ""
+                except (OSError, ValueError) as exc:
+                    state, problem = {}, str(exc)
+                ago, what = agents.BOARD.last_heard(agent)
+                # the plan's usage: where it came from, or why not (asked: the service asks)
+                usage = {
+                    **agents.BOARD.usage(agent),
+                    "asked": on and options.get(f"{agent}_usage", True) is not False,
+                }
+                found[agent] = {"program": agents.program(agent) is not None, "path": str(path),
+                                **state, "problem": problem, "heard": ago,
+                                "heard_what": what, "usage": usage}  # fmt: skip
+            return self._json({"on": on, "port": self.server.server_address[1], **found})
+        payload = self._read_json()
+        if payload is None:
+            return None
+        agent = payload.get("agent") if isinstance(payload, dict) else None
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if agent not in paths or action not in ("preview", "install", "remove"):
+            return self._error('expected {"agent": "claude"|"codex", "action": ...}')
+        if not on and action != "remove":
+            return self._error(
+                t("AI activity is switched off (Settings → Game mode and more)."),
+                HTTPStatus.CONFLICT,
+            )
+        path = paths[agent]
+        try:
+            current = agents.read_settings(path)
+        except (OSError, ValueError) as exc:
+            return self._error(t("{file} cannot be read: {error}", file=str(path), error=exc))
+        if action == "remove":
+            after = agents.without_ours(current)
+        else:
+            port, secret = self.server.server_address[1], agents.key(create=True)
+            if agent == "claude":
+                line = payload.get("status_line") is True
+                after = agents.claude_plan(current, port, secret, line)
+            else:
+                after = agents.codex_plan(current, port, secret)
+        text = json.dumps(after, indent=2, ensure_ascii=False)
+        if action == "preview":
+            before = json.dumps(current, indent=2, ensure_ascii=False)
+            return self._json({"path": str(path), "after": text, "before": before})
+        try:
+            kept = agents.write_settings(path, after)
+        except OSError as exc:
+            return self._error(t("{file} cannot be written: {error}", file=str(path), error=exc))
+        self._json({"done": True, "path": str(path), "backup": str(kept) if kept else None,
+                    **agents.installed(after)})  # fmt: skip
+
+    def _notify_key(self, renew: bool = False) -> None:
+        """For Settings: the notify key (made where there is none; ``renew``: a new one), the
+        address that shows a notice and the command that does."""
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        if not config.allow_notify:
+            return self._json({"on": False})
+        key = notify.new_key() if renew else notify.key(create=True)
+        port = self.server.server_address[1]
+        self._json(
+            {
+                "on": True,
+                "key": key,
+                "address": notify.address(port, key, t("Render finished")),
+                "command": app_settings.cli_command(f'notify "{t("Render finished")}"'),
+            }
+        )
+
+    def _update(self, query: dict[str, list[str]]) -> None:
+        """Whether a newer version is out (updates.py); ``?now=1`` asks GitHub at once."""
+        self._json(self.state.updates.state(self._check_updates(), now="now" in query))
+
+    def _update_install(self) -> None:
+        """``{"action": "download"}``: fetch the newer version for this kind of install and
+        check it; ``{"action": "install"}``: put it in place, and this app quits for it to
+        start (the Windows setup, the portable zip, the AppImage), or show the folder of the
+        download (the Linux tarball). Answers as ``GET /api/update/install`` (updates.py)."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        action = payload.get("action") if isinstance(payload, dict) else None
+        try:
+            if action == "download":
+                update = self.state.updates.state(self._check_updates())
+                answer = self.state.install.download(update["latest"] if update["newer"] else None)
+            elif action == "install":
+                controls = self.controls
+                quit = None if controls is None else (lambda: controls.act("quit"))
+                answer = self.state.install.install(quit)
+            else:
+                return self._error('expected {"action": "download" or "install"}')
+        except UpdateError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._json(answer)
+
+    def _update_later(self) -> None:
+        """``{"later": "0.7.0"}``: the card of that version was closed (updates.py)."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        later = payload.get("later") if isinstance(payload, dict) else None
+        version = later if isinstance(later, str) else ""
+        try:
+            self._json(self.state.updates.later(version, self._check_updates()))
+        except ValueError as exc:
+            self._error(str(exc))
+
+    def _page_switch(self, page: str, on: bool) -> list[tuple[str, str, Any]]:
+        """What switching a page on or off writes: game mode's page is the game service
+        switching by itself (switched on, the service runs), the round report's is the memory
+        service's report (likewise), and any other is its mode's ``on``."""
+        from libre_panel.services.game import MODE as GAME_MODE
+        from libre_panel.services.memory import Memory
+
+        services = {GAME_MODE: (GAME_MODE, "automatic"), "report": (Memory.name, "report")}
+        if page not in services:
+            return [("value", f"modes.{page}.on", on)]
+        service, option = services[page]
+        changes: list[tuple[str, str, Any]] = [("value", f"services.{service}.{option}", on)]
+        enabled = load_config(self.state.config_path).services.enabled
+        if on and service not in enabled:
+            changes.append(("value", "services.enabled", [*enabled, service]))
+        return changes
+
+    def _sequence(self) -> None:
+        """The screens in turn: their steps (a theme and its seconds each), whether they
+        show, and where the running panel stands in them (``now``: the step's index and
+        theme and the seconds left of it; None while it shows no sequence)."""
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        steps = [{"theme": step.theme, "seconds": step.seconds} for step in config.sequence.steps]
+        now = self._panel_state().get("sequence") if config.sequence.active else None
+        self._json(
+            {
+                "on": config.sequence.on,
+                "steps": steps,
+                "now": now,
+                "shortest_s": sequence.SHORTEST_S,
+                "longest_s": sequence.LONGEST_S,
+            }
+        )
+
+    def _set_sequence(self) -> None:
+        """``{"on": true, "steps": [{"theme": "almanac", "seconds": 300}, ...]}``: the screens
+        in turn, written to config.toml ([sequence]); without steps they are off."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("on"), bool):
+            return self._error('expected {"on": true or false, "steps": [...]}')
+        raw = payload.get("steps", [])
+        if not isinstance(raw, list) or not all(isinstance(step, dict) for step in raw):
+            return self._error('steps: expected a list of {"theme": ..., "seconds": ...}')
+        try:
+            steps = sequence.parse_steps(
+                [{"theme": step.get("theme"), "seconds": step.get("seconds")} for step in raw]
+            )
+            for step in steps:
+                find_theme(step.theme)
+            edit_config(
+                ("value", "sequence.on", payload["on"] and bool(steps)),
+                ("tables", "sequence.steps", [step.to_table() for step in steps]),
+                path=self.state.config_path,
+            )
+        except (sequence.StepError, ThemeError) as exc:
+            return self._error(str(exc))
+        except (ConfigError, OSError) as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._sequence()
+
+    # -- the panel's own screens (devices/panel_files.py) -------------------------------------
+
+    def _mounted(self, n: int = 0) -> str:
+        """How panel ``n`` (0: the first) is mounted, for its own screens: "portrait" for a bar
+        on end (they are drawn upright), else "landscape"."""
+        try:
+            place = _panel_at(load_config(self.state.config_path), n)
+        except ConfigError:
+            place = None
+        way = place[0].orientation if place is not None else ""
+        return "portrait" if way == "portrait" else "landscape"
+
+    def _start_screen(self, query: dict[str, list[str]] | None = None) -> None:
+        """The TURZX USB panels whose boot logo and standby clip Libre Panel can make, and the
+        one at hand: panel ``panel`` (0, the first, if not given), as config.toml names it, else
+        as found on the USB bus where it is; drawn upright for a bar on end; and the looks they
+        come in."""
+        from libre_panel.devices import panel_files
+        from libre_panel.render import bootscreen
+
+        n = _whole_of(query, "panel")
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError:
+            config = None
+        place = _panel_at(config, n) if config is not None else None
+        device, where = place if place is not None else (DeviceConfig(), panel_files.FIRST)
+        configured = device.model
+        way = self._mounted(n)
+        usb = [model.id for model in panel_files.models()]
+        model = configured if configured in usb else None
+        if model is None:
+            try:
+                from libre_panel.devices.turzx_usb import present_model
+
+                found = present_model(*where)
+                model = found.id if found is not None and found.id in usb else None
+            except Exception:  # (no pyusb, no access: nothing found)
+                model = None
+        self._json(
+            {
+                "models": [
+                    {
+                        "id": m.id,
+                        "label": m.label,
+                        "size": list(m.size(way)),
+                        "measured": m.id in panel_files.MEASURED,
+                    }  # (the 9.2": where SPUR II measured it all)
+                    for m in panel_files.models()
+                ],  # fmt: skip
+                "model": model,
+                "panel": n,
+                "orientation": way,
+                "runs_panel": self.controls is not None,
+                "names": {"logo": panel_files.BOOT_LOGO, "clip": panel_files.STANDBY_CLIP},
+                "designs": list(bootscreen.designs()),  # the looks, Libre Panel's own first
+            }
+        )
+
+    def _start_screen_model(self, query: dict[str, list[str]]) -> Any:
+        from libre_panel.devices import panel_files
+
+        try:
+            return panel_files.model_of((query.get("model") or [""])[0])
+        except DeviceError:
+            return None
+
+    @staticmethod
+    def _start_screen_design(query: dict[str, list[str]]) -> str | None:
+        """The look ``?design=`` names (Libre Panel's own without one); None for no such look."""
+        from libre_panel.devices import panel_files
+
+        try:
+            return panel_files.design_of((query.get("design") or [""])[0])
+        except DeviceError:
+            return None
+
+    def _backup_file(self) -> None:
+        """The person's settings and own themes in one zip, to keep (backup.py)."""
+        from libre_panel.backup import make_backup
+
+        try:
+            data = make_backup(self.state.config_path)
+        except OSError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        name = f"libre-panel-backup-{time.strftime('%Y-%m-%d')}.zip"
+        self._send(200, data, "application/zip", filename=name)
+
+    def _restore_backup(self) -> None:
+        """A backup (the zip's bytes) put in place: its config.toml and its themes. Refused
+        while Libre Panel runs with administrator rights: config.toml may name programs it
+        would start with them."""
+        from libre_panel.backup import MAX_TOTAL, BackupError, restore_backup
+
+        if access.elevated():
+            return self._error(
+                t("While Libre Panel runs with administrator rights, a backup is not restored "
+                  "here: its config.toml may name programs that would be started with those "
+                  "rights."),
+                HTTPStatus.FORBIDDEN,
+            )  # fmt: skip
+        data = self._read_body(MAX_TOTAL)
+        if data is None:
+            return None
+        try:
+            done = restore_backup(data, self.state.config_path)
+        except BackupError as exc:
+            return self._error(str(exc), HTTPStatus.BAD_REQUEST)
+        except OSError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        follow = getattr(self.controls, "follow_config", None)
+        if callable(follow):
+            follow()  # the services take the restored settings; the panel sees the file
+        self._json(done)
+
+    def _settings_folder(self) -> Path:
+        path = self.state.config_path
+        return path.parent if path is not None else config_dir()
+
+    def _across_upload(self) -> None:
+        """``POST /api/across`` with a picture's file: the picture across all panels that are
+        placed (arrangement.py), kept in the settings folder without its metadata, and named
+        in config.toml (``across``)."""
+        from libre_panel import arrangement
+
+        data = self._read_body(arrangement.MAX_BYTES)
+        if data is None:
+            return None
+        folder = self._settings_folder()
+        try:
+            name = arrangement.save_picture(data, folder)
+            edit_config(("value", "across", name), path=self.state.config_path)
+        except arrangement.PictureError as exc:
+            return self._error(str(exc), HTTPStatus.BAD_REQUEST)
+        except (ConfigError, OSError) as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        follow = getattr(self.controls, "follow_config", None)
+        if callable(follow):
+            follow()
+        self._json({"across": name, "stamp": (folder / name).stat().st_mtime_ns})
+
+    # -- the Player (player.py) ------------------------------------------------------------
+
+    def _player(self) -> None:
+        """``GET /api/player``: the library (the videos and pictures of its folder), what plays,
+        the panels it can play on, and whether the running app is there to play them."""
+        from dataclasses import asdict
+
+        from libre_panel import player
+
+        self._json({
+            "available": self.controls is not None,
+            "folder": str(player.folder()),
+            "library": [asdict(found) for found in player.library()],
+            "playing": player.status(),
+            "panels": self._player_panels(),
+            "ffmpeg": player.has_ffmpeg(),
+            "fits": list(player.FITS),
+            "loops": list(player.LOOPS),
+        })  # fmt: skip
+
+    def _player_panels(self) -> list[dict[str, Any]]:
+        """The panels to play on: ``{number, name}``, 1 the first, then [[panels]] that are on."""
+        from libre_panel.devices.models import find_model
+
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError:
+            return [{"number": 1, "name": ""}]
+        status = getattr(getattr(self.controls, "panel", None), "status", None)
+        model = find_model(config.device.model) or find_model(getattr(status, "model", "") or "")
+        panels = [{"number": 1, "name": model.label if model is not None else ""}]
+        for n, panel in enumerate(config.panels):
+            if panel.on:
+                beside = find_model(panel.device.model)
+                panels.append({"number": n + 2, "name": beside.label if beside else ""})
+        return panels
+
+    def _player_picture(self, query: dict[str, list[str]]) -> None:
+        """``GET /api/player/picture?name=...&w=320``: a picture of a file of the library."""
+        from libre_panel import player
+
+        name = (query.get("name") or [""])[0]
+        try:
+            width = int((query.get("w") or ["320"])[0])
+        except ValueError:
+            return self._error("w: expected a whole number")
+        data = player.thumbnail(name, width)
+        if data is None:
+            return self._error(t("no picture of it"), HTTPStatus.NOT_FOUND)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _player_action(self) -> None:
+        """``POST /api/player {"action": ...}``: play the library's ``names`` on ``panels`` from
+        ``start`` ("play", with ``fit``, ``loop``, ``shuffle``, ``picture_s``), "pause",
+        "resume", "toggle", "next", "previous", "seek" (``seconds``), "set" (``fit``, ``loop``,
+        ``shuffle``, ``picture_s``), "stop"; "remove" a file (``name``), open the "folder".
+        The answer is :meth:`_player`'s."""
+        from libre_panel import player
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        if not isinstance(payload, dict):
+            return self._error('expected {"action": ...}')
+        action = payload.get("action")
+        try:
+            if action == "play":
+                if self.controls is None:
+                    return self._error(t("the Player plays on the panels of the running app"),
+                                       HTTPStatus.CONFLICT)  # fmt: skip
+                names = payload.get("names")
+                if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                    return self._error('names: expected ["file.mp4", ...]')
+                panels = payload.get("panels", [1])
+                if not isinstance(panels, list) or not all(
+                    isinstance(n, int) and not isinstance(n, bool) for n in panels
+                ):
+                    return self._error("panels: expected [1, ...]")
+                player.play(names, panels, start=payload.get("start"),
+                            fit=payload.get("fit", "cover"), loop=payload.get("loop", "all"),
+                            shuffle=bool(payload.get("shuffle", False)),
+                            picture_s=payload.get("picture_s", player.PICTURE_S))  # fmt: skip
+            elif action in ("pause", "resume", "toggle", "next", "previous", "stop"):
+                {"pause": player.pause, "resume": player.resume, "toggle": player.toggle,
+                 "next": player.next_item, "previous": player.previous_item,
+                 "stop": player.stop}[action]()  # fmt: skip
+            elif action == "seek":
+                seconds = payload.get("seconds")
+                if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+                    return self._error("seconds: expected a number")
+                player.seek(float(seconds))
+            elif action == "set":
+                player.configure(fit=payload.get("fit"), loop=payload.get("loop"),
+                                 shuffle=payload.get("shuffle"),
+                                 picture_s=payload.get("picture_s"))  # fmt: skip
+            elif action == "remove":
+                player.remove(payload.get("name"))
+            elif action == "folder":
+                from libre_panel.tray import open_path
+
+                where = player.folder()
+                where.mkdir(parents=True, exist_ok=True)
+                open_path(where)
+            else:
+                return self._error(f"action: one of {', '.join(PLAYER_ACTIONS)}")
+        except player.PlayerError as exc:
+            return self._error(str(exc))
+        self._player()
+
+    def _mirror(self, query: dict[str, list[str]] | None = None) -> None:
+        """``GET /api/mirror``: what a panel can show as a monitor here (the monitors; with
+        ``?windows=1`` the windows too), what it shows now, the panels, and whether the running
+        app is there to show it (mirror.py, capture.py)."""
+        from dataclasses import asdict
+
+        from libre_panel import capture, extend, mirror
+
+        where = capture.platform()
+        listed = (query or {}).get("windows", ["0"])[0] == "1"
+        size = self._panel_frame(1)
+        self._json({
+            "available": self.controls is not None,
+            "platform": where,
+            "monitors": [asdict(m) for m in capture.monitors(where)],
+            "windows": [asdict(w) for w in capture.windows(where)] if listed else None,
+            "showing": mirror.status(),
+            "panels": self._player_panels(),
+            "fits": list(mirror.FITS),
+            "size": list(size) if size else None,
+            "extend": {**extend.state(size, where), **extend.setup_state()},
+        })  # fmt: skip
+
+    def _panel_frame(self, number: int) -> tuple[int, int] | None:
+        """The size of panel ``number``'s frames (1 the first), as config.toml and the panel
+        say; None where its model is not known."""
+        from libre_panel.app import panel_config, panel_size
+        from libre_panel.devices.models import find_model
+
+        try:
+            config = load_config(self.state.config_path)
+            config = panel_config(config, None if number <= 1 else number - 2)
+        except ConfigError:
+            return None
+        status = getattr(getattr(self.controls, "panel", None), "status", None)
+        reported = find_model(getattr(status, "model", "") or "") if number <= 1 else None
+        return panel_size(config, reported)
+
+    def _mirror_action(self) -> None:
+        """``POST /api/mirror``: ``{"action": "show", "source": {kind, id, name, region, fit,
+        cursor}, "panels": [1]}`` shows it on those panels as a monitor; ``{"action":
+        "stop"}`` the themes again. The answer is :meth:`_mirror`'s."""
+        from libre_panel import mirror
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        if not isinstance(payload, dict):
+            return self._error('expected {"action": ...}')
+        action = payload.get("action")
+        if action == "show":
+            if self.controls is None:
+                return self._error(t("a panel shows the screen in the running app"),
+                                   HTTPStatus.CONFLICT)  # fmt: skip
+            panels = payload.get("panels", [1])
+            if not isinstance(panels, list) or not all(
+                isinstance(n, int) and not isinstance(n, bool) for n in panels
+            ):
+                return self._error("panels: expected [1, ...]")
+            try:
+                source = mirror.source_of(payload.get("source"))
+                size = self._panel_frame(min(panels)) if panels else None
+                mirror.show(source, panels, size)
+            except mirror.MirrorError as exc:
+                return self._error(str(exc))
+        elif action == "stop":
+            mirror.stop()
+        elif action == "setup":  # the panel's own monitor (Windows: the driver, its size)
+            from libre_panel import extend
+
+            size = self._panel_frame(1)
+            if size is None:
+                return self._error(t("the panel's size is not known: choose its model in Settings"))
+            extend.start_setup(size)
+        else:
+            return self._error("action: show, stop or setup")
+        self._mirror()
+
+    def _player_upload(self, query: dict[str, list[str]]) -> None:
+        """``POST /api/player/media?name=clip.mp4`` with the file: into the library, written as
+        it comes (a video of gigabytes too) and put in place once it is whole."""
+        from libre_panel import player
+
+        name = (query.get("name") or [""])[0]
+        if not player.valid_name(name):
+            return self._error(t("{name}: a video or a picture with a name of its own",
+                                 name=name[:80]))  # fmt: skip
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_MEDIA:
+            return self._error(t("a file of {gb} GB at most", gb=MAX_MEDIA // 2**30),
+                               HTTPStatus.REQUEST_ENTITY_TOO_LARGE)  # fmt: skip
+        where = player.folder()
+        part = where / f".{name}.part"
+        try:
+            where.mkdir(parents=True, exist_ok=True)
+            import shutil
+
+            if shutil.disk_usage(where).free < length + 64 * 2**20:
+                return self._error(t("not enough room on the disk for it"),
+                                   HTTPStatus.INSUFFICIENT_STORAGE)  # fmt: skip
+            self._body_read = True
+            left = length
+            with part.open("wb") as out:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 2**20))
+                    if not chunk:
+                        raise OSError("the upload ended before the file did")
+                    out.write(chunk)
+                    left -= len(chunk)
+            os.replace(part, where / name)
+        except OSError as exc:
+            part.unlink(missing_ok=True)
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        found = player.info(where / name)
+        if found is None:
+            (where / name).unlink(missing_ok=True)
+            return self._error(t("{name} is no video or picture that can be played", name=name))
+        log.info("player: %s added (%d MB)", name, length // 2**20)
+        self._player()
+
+    def _panels_photo(self) -> None:
+        """``GET /api/panels/photo``: one picture of all panels that are on, where they stand
+        (Settings → Panels), each with what it shows now, to keep or share."""
+        from libre_panel import arrangement
+        from libre_panel.devices.models import find_model
+
+        status = getattr(getattr(self.controls, "panel", None), "status", None)
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        if status is None:
+            return self._error(t("the panels show no picture now"), HTTPStatus.NOT_FOUND)
+        more = getattr(status, "more", {}) or {}
+        statuses = [status, *(more.get(n) for n in range(len(config.panels)))]
+        host = getattr(self.controls, "plugin_host", None)
+        frames = [getattr(host, "shown", None), *(getattr(s, "shown", None) for s in statuses[1:])]
+        devices = [config.device, *(panel.device for panel in config.panels)]
+        on = [True, *(panel.on for panel in config.panels)]
+        panels = []
+        for n, rect in enumerate(arrangement.laid_out(config, statuses)):
+            if rect is None or not on[n]:
+                continue
+            told = getattr(statuses[n], "model", "") or ""
+            model = find_model(devices[n].model) or (find_model(told) if told else None)
+            panels.append((rect, frames[n], getattr(model, "shape", "") == "round", n + 1))
+        if not any(frame is not None for _, frame, _, _ in panels):
+            return self._error(t("the panels show no picture now"), HTTPStatus.NOT_FOUND)
+        picture = arrangement.photo(panels)
+        buffer = io.BytesIO()
+        picture.save(buffer, "PNG", optimize=True)
+        name = f"libre-panel-{time.strftime('%Y-%m-%d')}.png"
+        self._send(200, buffer.getvalue(), "image/png", filename=name)
+
+    def _round_picture(self) -> None:
+        """``POST /api/history/picture {"id": 1760000000123}``: the report of that round (Status
+        → History) as the panel shows it (the round report's page, in the version of its theme for
+        the panel), in a picture of the panel as *Picture of all panels* takes one, kept in the
+        person's Pictures folder (in ``Libre Panel``), which then opens: ``{"file", "folder",
+        "opened"}``. 404 for a round that is not kept or had no frame rates."""
+        from libre_panel import arrangement
+        from libre_panel.devices.models import find_model
+        from libre_panel.services.downloads import pictures_folder
+        from libre_panel.services.memory import Memory
+        from libre_panel.services.round_report import readings
+        from libre_panel.tray import open_path
+
+        payload = self._read_json()
+        if payload is None:
+            return None
+        ident = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(ident, int) or isinstance(ident, bool):
+            return self._error('expected {"id": 1760000000123}, a round of /api/history')
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        memory = config.services.options.get(Memory.name, {})
+        compare = memory.get("report_compare", Memory.options["report_compare"][1])
+        compare = compare if isinstance(compare, int) and compare > 0 else 10
+        found = history.round_report(history.database(config), ident, compare)
+        if found is None:
+            return self._error(
+                t("This round has no report: it is no longer kept, or it had no frame rates."),
+                HTTPStatus.NOT_FOUND,
+            )
+        report, last = found
+        # the theme of the round report's page ("" there: no theme of its own, only the data)
+        name = memory.get("report_theme") or Memory.options["report_theme"][1]
+        status = getattr(getattr(self.controls, "panel", None), "status", None)
+        told = getattr(status, "model", "") or ""
+        model = find_model(config.device.model) or (find_model(told) if told else None)
+        way = "portrait" if config.device.orientation == "portrait" else "landscape"
+        name = theme_for(str(name), config.device.orientation, model.size(way) if model else None)
+        try:
+            theme = load_theme(find_theme(name))
+        except ThemeError as exc:
+            return self._error(str(exc), HTTPStatus.NOT_FOUND)
+        found_readings = {
+            key: Reading(key, value, unit, label)
+            for key, (value, unit, label) in readings(report).items()
+        }
+        images = {}
+        host = getattr(self.controls, "plugin_host", None)
+        logo = host.images().get("game.logo") if host is not None and last else None
+        if logo is not None:  # the game service keeps the last game's logo: this round's
+            images["game.logo"] = logo
+        ended = float(report["session"]["ended"])
+        snapshot = Snapshot(readings=found_readings, now=datetime.fromtimestamp(ended),
+                            images=images)  # fmt: skip
+        renderer = Renderer(self.state.dressed(theme), preview=True)
+        renderer.symbols = self.state.symbols()
+        renderer.switches = dict(self.state.chosen_switches(name))
+        try:
+            frame, _boxes = renderer.render(snapshot)
+        finally:
+            renderer.close()
+        size = arrangement.millimetres(find_model(theme.model) or model, frame.size)
+        width, height = size or (frame.width * arrangement.GUESS_MM_PER_PX,
+                                 frame.height * arrangement.GUESS_MM_PER_PX)  # fmt: skip
+        picture = arrangement.photo([((0.0, 0.0, width, height), frame, False, 1)])
+        folder = pictures_folder() / "Libre Panel"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path = history.free_name(folder, history.picture_name(report["session"]["game"], ended))
+            picture.save(path, "PNG", optimize=True)
+        except OSError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        try:
+            open_path(folder)
+            opened = True
+        except OSError:
+            opened = False  # (kept all the same: the answer says where)
+        self._json({"file": str(path), "folder": str(folder), "opened": opened})
+
+    def _send_modules(self) -> None:
+        """``POST /api/panels/send {"panel": 2, "modules": [...]}``: modules of the theme in
+        Design sent to the theme another panel shows (distribute.py), a copy of its own first
+        where that is built in."""
+        from libre_panel import distribute
+
+        payload = self._read_json()
+        if payload is None:
+            return None
+        number, modules = payload.get("panel"), payload.get("modules")
+        if not isinstance(number, int) or isinstance(number, bool) or not isinstance(modules, list):
+            return self._error('expected {"panel": 2, "modules": [...]}')
+        if not 1 <= len(modules) <= 32 or not all(isinstance(m, dict) for m in modules):
+            return self._error("modules: 1 to 32 of them")
+        status = getattr(getattr(self.controls, "panel", None), "status", None)
+        beside = (getattr(status, "more", {}) or {}).get(number - 2)
+        try:
+            done = distribute.send(modules, number, self.state.config_path, beside)
+        except distribute.SendError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._json(done)
+
+    def _across_picture(self) -> None:
+        """``GET /api/across/picture``: the picture across the panels, small, for the app."""
+        from libre_panel import arrangement
+
+        try:
+            across = load_config(self.state.config_path).across
+        except ConfigError:
+            across = ""
+        loaded = arrangement.load(arrangement.across_path(across, self._settings_folder()))
+        if loaded is None:
+            return self._error("no picture across the panels", HTTPStatus.NOT_FOUND)
+        small = loaded[0].copy()
+        small.thumbnail((1200, 1200))
+        buffer = io.BytesIO()
+        small.save(buffer, "JPEG", quality=85)
+        self._send(200, buffer.getvalue(), "image/jpeg")
+
+    def _start_screen_picture(self, query: dict[str, list[str]]) -> None:
+        """``?model=turing-9.2-usb&what=logo|clip&w=960&design=aurora``: the boot logo (PNG)
+        or the standby clip (an animated WebP) in a look as the app shows them."""
+        from libre_panel.devices import panel_files
+
+        model = self._start_screen_model(query)
+        what = (query.get("what") or ["logo"])[0]
+        design = self._start_screen_design(query)
+        if model is None or what not in ("logo", "clip") or design is None:
+            return self._error("unknown panel, picture or look", HTTPStatus.NOT_FOUND)
+        try:
+            width = max(120, min(1920, int((query.get("w") or ["960"])[0])))
+        except ValueError:
+            width = 960
+        way = self._mounted(_whole_of(query, "panel"))
+        picture = self.state.pictures.ask("start_screen_preview", model.id, what, width, way,
+                                          design)  # fmt: skip
+        self._send(200, picture, panel_files.picture_type(picture))
+
+    def _start_screen_file(self, query: dict[str, list[str]]) -> None:
+        """``?model=...&what=logo|clip&design=...``: the boot logo's JPEG or the standby clip
+        (H.264) as the panel takes them, to keep: the clip in the range of values the panel at
+        ``panel`` gets its video in."""
+        from libre_panel.devices.turzx_video import full_range
+
+        model = self._start_screen_model(query)
+        what = (query.get("what") or ["logo"])[0]
+        design = self._start_screen_design(query)
+        if model is None or what not in ("logo", "clip") or design is None:
+            return self._error("unknown panel, file or look", HTTPStatus.NOT_FOUND)
+        n = _whole_of(query, "panel")
+        try:
+            place = _panel_at(load_config(self.state.config_path), n)
+        except ConfigError:
+            place = None
+        video_range = place[0].video_range if place is not None else "auto"
+        try:
+            data = self.state.pictures.ask("start_screen_file", model.id, what, self._mounted(n),
+                                           design, full_range(video_range, model))  # fmt: skip
+        except PictureError as exc:
+            if exc.kind != "DeviceError":
+                raise
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        name = f"{model.id}-{'boot.jpg' if what == 'logo' else 'standby.h264'}"
+        kind = "image/jpeg" if what == "logo" else "application/octet-stream"
+        self._send(200, data, kind, filename=name)
+
+    def _start_screen_action(self) -> None:
+        """``{"action": "state" | "logo" | "remove-logo" | "clip", "model": ..., "panel": n,
+        "design": ...}``:
+        what is on panel ``n`` (0, the first, if not given), or its boot logo or standby clip
+        written or taken away. Only on the person's own click: the panels' themes are paused
+        first (and stay paused, so the panel shows what was written; the app resumes them)."""
+        from libre_panel.devices import panel_files
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if action not in ("state", "logo", "remove-logo", "clip"):
+            return self._error('expected {"action": "state", "logo", "remove-logo" or "clip"}')
+        model = None
+        if payload.get("model"):
+            try:
+                model = panel_files.model_of(str(payload["model"]))
+            except DeviceError as exc:
+                return self._error(str(exc))
+        try:
+            design = panel_files.design_of(payload.get("design") or None)
+        except DeviceError as exc:
+            return self._error(str(exc))
+        n = payload.get("panel", 0)
+        if isinstance(n, bool) or not isinstance(n, int):
+            return self._error("panel: expected a whole number")
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        place = _panel_at(config, n)
+        if place is None:
+            return self._error(f"panel {n}: there is no such panel")
+        device, where = place
+        way = self._mounted(n)
+        paused = False
+        if self.controls is not None:
+            self.controls.act("pause")  # the panels are free for this, and stay so
+            paused = True
+        screen = self.state.start_screen()
+        try:
+            if action == "state":
+                result = screen.state(model, where)
+            elif action == "logo":
+                result = screen.write_logo(model, way, where, design)
+            elif action == "remove-logo":
+                result = screen.remove_logo(model, where)
+            else:
+                result = screen.write_clip(device.brightness, model, way, where, design,
+                                           device.video_range)  # fmt: skip
+                # the video mode names the clip it plays: the panel's own, where it went there
+                if not device.video.local_clip and _panel_s(config, n, result):
+                    self._name_clip(n)
+        except DeviceError as exc:
+            log.warning("start screen: %s failed: %s", action, exc)
+            return self._json({"error": str(exc), "paused": paused}, HTTPStatus.CONFLICT)
+        except (ConfigError, OSError) as exc:
+            return self._json({"error": str(exc), "paused": paused}, HTTPStatus.CONFLICT)
+        log.info("start screen: %s done: %s", action, result)
+        self._json({**result, "paused": paused})
+
+    def _name_clip(self, n: int) -> None:
+        """The standby clip just written named as what panel ``n`` plays in the video mode:
+        in [device] video for the first, in its own [[panels]] video for another."""
+        from libre_panel.devices import panel_files
+
+        if n == 0:
+            edit_config(("value", "video.local_clip", panel_files.STANDBY_CLIP),
+                        ("value", "video.clip_asked", True),
+                        path=self.state.config_path)  # fmt: skip
+            return
+        settings = app_settings.Settings(self.state.config_path, self.controls, self.state.restart)
+        panels = settings.read()["config"]["panels"]
+        video = panels[n - 1]["video"]
+        panels[n - 1]["video"] = {**video, "local_clip": panel_files.STANDBY_CLIP,
+                                  "clip_asked": True}  # fmt: skip
+        try:
+            settings.write({"set": {"panels": panels}})
+        except app_settings.SettingsError as exc:
+            raise ConfigError(str(exc)) from exc
+
+    def _settings(self, method: str, body: bool = False) -> None:
+        """A route of the Settings (editor/settings.py): its answer, or why it is refused."""
+        args = []
+        if body:
+            payload = self._read_json()
+            if payload is None:
+                return
+            args.append(payload)
+        settings = app_settings.Settings(self.state.config_path, self.controls, self.state.restart)
+        try:
+            self._json(getattr(settings, method)(*args))
+        except app_settings.SettingsError as exc:
+            self._error(str(exc), exc.status)
+        except Exception as exc:  # the app shows the reason; a dropped connection says nothing
+            log.exception("settings: %s failed", method)
+            self._error(f"{type(exc).__name__}: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _preset_previews(self) -> None:
+        """Each building block (presets.py and plugins') drawn in the given palette,
+        for the library."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        palette = payload.get("palette") if isinstance(payload, dict) else None
+        previews = self.state.pictures.ask("preset_previews", palette, self.state.symbols())
+        self._json({"previews": previews})
+
+    def _hardware(self, refresh: bool = False) -> None:
+        """The names of the processor, graphics card and memory: what Libre Panel finds
+        (``detected``, as the panel would show it) and the user's own text for each
+        (``custom``, empty: the detected one). ``?refresh=1`` asks the computer again."""
+        try:
+            config = load_config(self.state.config_path)
+        except ConfigError as exc:
+            return self._error(str(exc))
+        card = config.sensors.options.get("librehardwaremonitor", {}).get("gpu")
+        found = detected_names(card if isinstance(card, str) else "", refresh)
+        own = config.hardware
+        custom = {"cpu": own.cpu_name, "gpu": own.gpu_name, "memory": own.memory_name}
+        answer: dict[str, Any] = {
+            part: {"detected": found[part], "custom": custom[part]} for part in custom
+        }
+        answer["fans"] = self._fans(config)
+        # how the fans turn, for all of them ("": Noctua's G2 in the theme's colours)
+        answer["fan_look"] = {
+            "look": own.fan_look,
+            "paint": own.fan_paint,
+            "looks": [{"id": key, "label": label} for key, label in fan_looks.labels().items()],
+        }
+        self._json(answer)
+
+    def _fans(self, config: Any) -> list[dict[str, Any]]:
+        """The fans this computer reads, each ``{key, detected, custom, value}``: the name it
+        goes by without one of the user's own (FanControl's, else the sensor's), the user's,
+        and its speed now (which tells one from the other). A fan named but not read now
+        stays in the list, so that its name can be taken back."""
+        from libre_panel.sensors.fan_names import FanNames, is_fan
+
+        try:
+            readings = self.state.live_snapshot().readings
+        except Exception as exc:  # live sensors are optional here
+            log.debug("live sensors unavailable: %s", exc)
+            readings = {}
+        names = FanNames()
+        names.follow_config(config)
+        own = config.hardware.fans
+        fans = {}
+        for key, reading in readings.items():
+            if is_fan(key, reading):
+                value = reading.value if isinstance(reading.value, int | float) else None
+                fans[key] = {
+                    "key": key,
+                    "detected": names.detected(reading, readings),
+                    "custom": own.get(key, ""),
+                    "value": round(value) if value is not None and math.isfinite(value) else None,
+                }
+        hw = config.hardware
+        for key in [*own, *hw.fan_looks, *hw.fan_paints]:
+            fans.setdefault(
+                key, {"key": key, "detected": "", "custom": own.get(key, ""), "value": None}
+            )
+        for key, fan_ in fans.items():  # its own look and colours ("": as all fans)
+            fan_["look"], fan_["paint"] = hw.fan_looks.get(key, ""), hw.fan_paints.get(key, "")
+        return [fans[key] for key in sorted(fans, key=_natural)]
+
+    def _set_hardware(self) -> None:
+        """Set the user's own text for any of ``cpu``, ``gpu`` and ``memory``, and for fans
+        (``{"fans": {"fan.lpc.fan_1": "Intake"}}``); "" gives the detected name back. The
+        fans' look and colours: ``fan_look`` and ``fan_paint`` for all of them, and
+        ``fan_looks`` / ``fan_paints`` by sensor ("" for "as all of them"). Answers like the
+        GET."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        tables = ("fans", "fan_looks", "fan_paints")
+        choices = {"fan_look": FAN_LOOKS, "fan_paint": FAN_PAINTS}
+        by_fan = {"fan_looks": FAN_LOOKS, "fan_paints": FAN_PAINTS}
+
+        def fan_table(value: Any) -> bool:
+            return isinstance(value, dict) and all(
+                isinstance(k, str) and k.strip() and isinstance(v, str) for k, v in value.items()
+            )
+
+        parts = (
+            {k: v for k, v in payload.items() if k not in (*tables, *choices)}
+            if isinstance(payload, dict)
+            else None
+        )
+        if (
+            not isinstance(payload, dict)
+            or not payload
+            or not set(parts) <= set(_HARDWARE_SETTINGS)
+            or not all(isinstance(text, str) for text in parts.values())
+            or not all(fan_table(payload[k]) for k in tables if k in payload)
+            or not all(
+                payload[k] in ("", *allowed) for k, allowed in choices.items() if k in payload
+            )
+            or not all(
+                v in ("", *allowed)
+                for k, allowed in by_fan.items()
+                for v in payload.get(k, {}).values()
+            )
+        ):
+            return self._error(
+                'expected text for "cpu", "gpu" or "memory", "fans" by sensor, or the fans\' '
+                '"fan_look" and "fan_paint" (also "fan_looks" and "fan_paints" by sensor): '
+                '{"cpu": "My CPU", "fans": {"fan.lpc.fan_1": "Intake"}, "fan_look": "libre"}'
+            )
+        try:
+            changes: list[tuple[str, str, Any]] = []
+            for part, text in parts.items():
+                name = f"hardware.{_HARDWARE_SETTINGS[part]}"
+                changes.append(("value", name, hardware_name(text, name)))
+            for key in choices:
+                if key in payload:
+                    changes.append(("value", f"hardware.{key}", payload[key]))
+            if any(key in payload for key in tables):
+                hw = load_config(self.state.config_path).hardware
+                kept = {
+                    "name": dict(hw.fans),
+                    "look": dict(hw.fan_looks),
+                    "paint": dict(hw.fan_paints),
+                }
+                given = (("fans", "name"), ("fan_looks", "look"), ("fan_paints", "paint"))
+                for table, field in given:
+                    for key, text in payload.get(table, {}).items():
+                        if field == "name":
+                            text = hardware_name(text, f"hardware.fans ({key})")
+                        if text:
+                            kept[field][key.strip()] = text
+                        else:
+                            kept[field].pop(key.strip(), None)
+                sensors = sorted(set().union(*kept.values()), key=_natural)
+                rows = [
+                    {
+                        "sensor": key,
+                        **{f: kept[f][key] for f in ("name", "look", "paint") if key in kept[f]},
+                    }
+                    for key in sensors
+                ]
+                changes.append(("tables", "hardware.fans", rows))
+            edit_config(*changes, path=self.state.config_path)  # all of them in one write
+        except (ConfigError, OSError) as exc:
+            return self._error(str(exc))
+        self.state.follow_config()
+        self._hardware()
+
+    def _app_action(self) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        if self.controls is None:
+            return self._error("this editor does not run the panel", HTTPStatus.NOT_FOUND)
+        if not isinstance(payload, dict) or not isinstance(payload.get("action"), str):
+            return self._error('expected {"action": ...}')
+        try:
+            snapshot = self.controls.act(payload["action"], payload.get("value"))
+        except (ValueError, ConfigError, OSError, RuntimeError) as exc:
+            return self._error(str(exc))
+        self._json({"available": True, **snapshot})
+
+    def _doctor_action(self) -> None:
+        """``POST /api/doctor``: ``{"action": "start"}``, ``{"action": "answer", "answer":
+        {...}}`` or ``{"action": "cancel"}``; answers the test's state (``GET /api/doctor``)."""
+        from libre_panel.doctor_session import SessionError
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        action = payload.get("action") if isinstance(payload, dict) else None
+        session = self.state.doctor()
+        try:
+            if action == "start":
+                answer = session.start()
+            elif action == "answer":
+                answer = session.answer(payload.get("answer"))
+            elif action == "cancel":
+                answer = session.cancel()
+            else:
+                return self._error('expected {"action": "start", "answer" or "cancel"}')
+        except SessionError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._json(answer)
+
+    def _logs(self, query: dict[str, list[str]]) -> None:
+        """``GET /api/logs?level=WARNING``: the log's last entries (logview.py) and whether it
+        is written in detail."""
+        from libre_panel import logview
+
+        level = (query.get("level") or ["DEBUG"])[0].upper()
+        self._json({"entries": logview.entries(level), "verbose": logview.verbose(),
+                    "levels": list(logview.LEVELS)})  # fmt: skip
+
+    def _logs_file(self) -> None:
+        """``GET /api/logs/file``: the whole log to keep, without the person's folders."""
+        from libre_panel import logview
+
+        body = logview.text().encode("utf-8")
+        self._send(200, body, "text/plain; charset=utf-8", filename="libre-panel-log.txt")
+
+    def _experiment(self) -> None:
+        """``GET /api/experiment``: the video experiment's run as it stands (experiment.py)."""
+        self._json(self.state.experiment(self.controls).state())
+
+    def _experiment_action(self) -> None:
+        """``POST /api/experiment {"action": "start"}`` or ``"stop"``: the video experiment,
+        begun on the running app's panels, or ended, with the settings from before it back."""
+        from libre_panel.editor.experiment import ExperimentError
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        action = payload.get("action") if isinstance(payload, dict) else None
+        runner = self.state.experiment(self.controls)
+        if action == "start":
+            if self.controls is None:
+                return self._error("the experiment needs the running app", HTTPStatus.CONFLICT)
+            try:
+                runner.start()
+            except ExperimentError as exc:
+                return self._error(str(exc), HTTPStatus.CONFLICT)
+        elif action == "stop":
+            runner.stop()
+        else:
+            return self._error('expected {"action": "start" or "stop"}')
+        self._json(runner.state())
+
+    def _colour_check(self, query: dict[str, list[str]]) -> None:
+        """``GET /api/colour-check?panel=1``: the colour check as it stands, what panel ``n``
+        (1 the first) runs and feeds, what to do about it, and the A/B (editor/colours.py)."""
+        from libre_panel.editor.colours import ColourError
+
+        try:
+            number = int((query.get("panel") or ["1"])[0])
+        except ValueError:
+            return self._error("panel: expected a whole number")
+        try:
+            self._json(self.state.colours().state(number))
+        except ColourError as exc:
+            self._error(str(exc), exc.status)
+
+    def _colour_check_action(self) -> None:
+        """``POST /api/colour-check {"action": "check" | "show" | "range" | "stop", "panel": n}``:
+        the check begun with panel ``n``'s settings, size and range, its picture shown on that
+        panel for the eye (the running app only): converted by the card and the processor in
+        turn ("show"), or in limited and full range ("range"), or that ended."""
+        from libre_panel.editor.colours import ColourError
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        action = payload.get("action") if isinstance(payload, dict) else None
+        number = payload.get("panel", 1) if isinstance(payload, dict) else 1
+        runner = self.state.colours()
+        try:
+            if action == "check":
+                runner.start_check(number)
+            elif action == "show":
+                runner.start_show(number)
+            elif action == "range":
+                runner.start_show(number, kind="range")
+            elif action == "stop":
+                runner.stop_show()
+            else:
+                return self._error('expected {"action": "check", "show", "range" or "stop"}')
+            self._json(runner.state(number if isinstance(number, int) else 1))
+        except ColourError as exc:
+            self._error(str(exc), exc.status)
+
+    def _logs_action(self) -> None:
+        """``POST /api/logs {"verbose": true}``: every detail into the log until the app starts
+        again, or only what matters."""
+        from libre_panel import logview
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        on = payload.get("verbose") if isinstance(payload, dict) else None
+        if not isinstance(on, bool):
+            return self._error('expected {"verbose": true or false}')
+        logview.set_verbose(on)
+        self._json({"verbose": logview.verbose()})
+
+    def _app_state(self) -> None:
+        """``GET /api/app``: the background app's state, if this editor belongs to one."""
+        if self.controls is None:
+            return self._json({"available": False})
+        self._json({"available": True, **self.controls.snapshot()})
+
+    def _base_folder(self, base: Any) -> Path | None:
+        if isinstance(base, str) and valid_theme_name(base):
+            try:
+                return find_theme(base)
+            except ThemeError:
+                return None
+        return None
+
+    def _render(self) -> None:
+        """Design's and Look's picture of the theme it is given (drawings.render)."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        root = self._base_folder(payload.get("base"))
+        live = None
+        if payload.get("live"):
+            try:
+                current = self.state.live_snapshot()
+                live = (dict(current.readings),
+                        {k: list(v) for k, v in current.history.items() if len(v) > 1})  # fmt: skip
+            except Exception as exc:
+                log.warning("live sensors unavailable: %s", exc)
+        try:
+            answer = self.state.pictures.ask(
+                "render", payload.get("theme"), str(root) if root is not None else None,
+                self.state.cards(), self.state.fan_choices(), self.state.symbols(),
+                self.state.every_switch(), live, payload.get("notice"), payload.get("look"),
+            )  # fmt: skip
+        except PictureError as exc:
+            if exc.kind not in ("ThemeError", "BadRequest"):
+                raise
+            return self._error(str(exc))
+        self._json(answer)
+
+    def _module_previews(self) -> None:
+        """Each module kind in a 2x1 box with the given look, for the library."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        try:
+            previews = self.state.pictures.ask(
+                "module_previews", payload.get("palette"), payload.get("style"),
+                self.state.symbols(),
+            )  # fmt: skip
+        except PictureError as exc:
+            if exc.kind != "ThemeError":
+                raise
+            return self._error(str(exc))
+        self._json({"previews": previews})
+
+    def _templates(self) -> None:
+        """Starting layouts of modules for a panel."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        try:
+            width, height = int(payload["width"]), int(payload["height"])
+            grid = make_grid(width, height, None, str(payload.get("model", "custom")))
+        except (KeyError, TypeError, ValueError) as exc:
+            return self._error(f"bad size: {exc}")
+        self._json({"grid": grid.to_dict(), "templates": templates(grid.columns, grid.rows)})
+
+    def _detach(self) -> None:
+        """A module's parts as plain widgets."""
+        payload = self._read_json()
+        if payload is None:
+            return
+        try:
+            theme = parse_theme(payload.get("theme"), root=self._base_folder(payload.get("base")))
+        except ThemeError as exc:
+            return self._error(str(exc))
+        self._json({"widgets": detach(theme, str(payload.get("id", "")))})
+
+    def _adapt(self) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        try:
+            result = adapt_theme(
+                payload.get("theme"),
+                model=str(payload.get("model", "custom")),
+                orientation=str(payload.get("orientation", "landscape")),
+                mode=str(payload.get("mode", "scale")),
+                width=int(payload.get("width") or 0),
+                height=int(payload.get("height") or 0),
+            )
+        except (ThemeError, KeyError, ValueError, TypeError) as exc:
+            return self._error(str(exc))
+        self._json({"theme": result})
+
+    def _save(self, theme_id: str) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        source = payload.get("source")
+        try:
+            folder = save_theme(
+                theme_id, payload.get("theme"), source if isinstance(source, str) else None
+            )
+        except (ThemeError, OSError) as exc:
+            return self._error(str(exc))
+        self._json({"ok": True, "id": theme_id, "path": str(folder)})
+
+    def _export_theme(self, theme_id: str) -> None:
+        """A theme as one .zip to give to someone: its theme.json and the pictures and fonts it
+        names (theme/share.py)."""
+        try:
+            data, filename = export_theme(theme_id)
+        except ShareError as exc:
+            return self._error(str(exc))
+        except ThemeError as exc:
+            return self._error(str(exc), HTTPStatus.NOT_FOUND)
+        self._send(200, data, "application/zip", filename=filename)
+
+    def _import_theme(self, query: dict[str, list[str]]) -> None:
+        """``POST /api/themes/import`` with a shared theme's .zip as the body (its bytes, and
+        ``?name=`` the file's name): put in the person's themes folder under a name of its own
+        (theme/share.py), answered with ``{id, name, files}``. A theme named "import" is saved
+        here as any other: its body is JSON, an import's a zip."""
+        if self.headers.get("Content-Type", "").startswith("application/json"):
+            return self._save("import")
+        too_large = t("The file is larger than {size} MB: a shared theme may be at most that.",
+                      size=MAX_ZIP // (1024 * 1024))  # fmt: skip
+        data = self._read_body(MAX_ZIP, too_large)
+        if data is None:
+            return None
+        try:
+            done = import_theme(data, name=(query.get("name") or [""])[0])
+        except ShareError as exc:
+            return self._error(str(exc))
+        except OSError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._json(done)
+
+    def _community_preview(self, theme_id: str) -> None:
+        """The preview of a theme the community shares, as GitHub has it (kept an hour)."""
+        data = self.state.community.preview(theme_id)
+        if data is None:
+            return self._error("not found", HTTPStatus.NOT_FOUND)
+        self._send(200, data, "image/png")
+
+    def _community_look(self, theme_id: str, query: dict[str, list[str]]) -> None:
+        """``?model=turing-12.3-usb``: a theme the community shares as it would show on that
+        panel, adapted where it is made for another size (community.py); nothing installed."""
+        model = (query.get("model") or [""])[0]
+        try:
+            data = self.state.community.look_on(theme_id, model)
+        except KeyError:
+            return self._error(f"unknown panel model {model!r}")
+        except (CommunityError, ShareError, ThemeError, ValueError) as exc:
+            return self._error(str(exc))
+        self._send(200, data, "image/png")
+
+    def _community_install(self) -> None:
+        """``{"id": "aurora"}``: a theme the community shares, downloaded, checked against the
+        list's SHA-256 and put in the person's themes folder (community.py); with ``"model"``,
+        one made for another size adapted to that panel."""
+        payload = self._read_json()
+        if payload is None:
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
+            return self._error('expected {"id": "<the id of a theme in the community list>"}')
+        model = payload.get("model") or ""
+        if not isinstance(model, str):
+            return self._error('"model" is the id of a panel model')
+        try:
+            done = self.state.community.install(payload["id"], model)
+        except KeyError:
+            return self._error(f"unknown panel model {model!r}")
+        except (CommunityError, ShareError, ThemeError) as exc:
+            return self._error(str(exc))
+        except OSError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        self._json(done)
+
+    def _upload_asset(self, theme_id: str, query: dict[str, list[str]]) -> None:
+        name = (query.get("name") or [""])[0]
+        if not valid_theme_name(theme_id):
+            return self._error("invalid theme name")
+        if not _ASSET_NAME.fullmatch(name) or Path(name).suffix.lower() not in ASSET_EXTENSIONS:
+            return self._error(f"asset must be one of: {', '.join(sorted(ASSET_EXTENSIONS))}")
+        folder = user_themes_dir() / theme_id
+        if not (folder / "theme.json").is_file():
+            return self._error("save the theme before adding images or fonts")
+        video = Path(name).suffix.lower() in VIDEO_EXTENSIONS
+        body = self._read_body(MAX_VIDEO if video else MAX_ASSET)
+        if body is None:
+            return
+        target = folder / "assets" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+        self._json({"ok": True, "path": f"assets/{name}"})
+
+
+def _refresh_asked(query: str) -> bool:
+    """``?refresh=1`` (and ``?refresh``): ask the computer for its hardware's names again."""
+    asked = parse_qs(query, keep_blank_values=True).get("refresh")
+    return asked is not None and asked[0] not in ("0", "false")
+
+
+# Every route of the server, the first that fits answers. A request needs the token, unless the
+# route is ``public``; tests/test_editor_access.py goes through this list.
+ROUTES: tuple[Route, ...] = (
+    # -- the app: its page, modules, fonts, styles; the files of plugins' pages -----------------
+    Route("GET", "/", lambda h, m, u: h._app_file("index.html"), public=True),
+    Route("GET", "/index.html", lambda h, m, u: h._app_file("index.html"), public=True),
+    # a bookmark of the old editor leads to the app
+    Route("GET", "/classic", lambda h, m, u: h._redirect("/"), public=True),
+    Route("GET", "/classic/", lambda h, m, u: h._redirect("/"), public=True),
+    Route("GET", "/classic/index.html", lambda h, m, u: h._redirect("/"), public=True),
+    Route("GET", "/app/fonts/{name*}", lambda h, m, u: h._font(m["name"]), public=True),
+    Route("GET", "/app/{name*}", lambda h, m, u: h._app_file(m["name"]), public=True),
+    Route("GET", "/static/{name*}", lambda h, m, u: h._static(m["name"]), public=True),
+    Route(
+        "GET",
+        "/plugins/{page}/{name*}",
+        lambda h, m, u: h._page_file(m["page"], m["name"] or "index.html"),
+        public=True,
+    ),
+    # -- reading ------------------------------------------------------------------------------
+    Route("GET", "/api/specs", lambda h, m, u: h._json(h._specs())),
+    Route("GET", "/api/themes", lambda h, m, u: h._json(_theme_list())),
+    Route("GET", "/api/themes/{theme}/assets", lambda h, m, u: h._assets(m["theme"])),
+    Route(
+        "GET",
+        "/api/themes/{theme}/assets/{rel+}",
+        lambda h, m, u: h._asset_file(m["theme"], unquote(m["rel"])),
+        picture=True,
+    ),
+    Route(
+        "GET",
+        "/api/themes/{theme}/preview",
+        lambda h, m, u: h._theme_preview(m["theme"], parse_qs(u.query)),
+        picture=True,
+    ),
+    Route("GET", "/api/themes/{theme}/export", lambda h, m, u: h._export_theme(m["theme"])),
+    Route("GET", "/api/themes/{theme}/sizes", lambda h, m, u: h._theme_sizes(m["theme"])),
+    # the themes the community shares: the list and the previews, from GitHub (community.py)
+    Route("GET", "/api/community/themes", lambda h, m, u: h._json(h.state.community.themes())),
+    Route(
+        "GET",
+        "/api/community/themes/{theme}/preview",
+        lambda h, m, u: h._community_preview(m["theme"]),
+        picture=True,
+    ),
+    Route(
+        "GET",
+        "/api/community/themes/{theme}/look",
+        lambda h, m, u: h._community_look(m["theme"], parse_qs(u.query)),
+        picture=True,
+    ),
+    Route("GET", "/api/readings", lambda h, m, u: h._json(h._readings(parse_qs(u.query)))),
+    Route("GET", "/api/pages", lambda h, m, u: h._panel_pages(parse_qs(u.query))),
+    Route("GET", "/api/sequence", lambda h, m, u: h._sequence()),
+    Route("GET", "/api/news", lambda h, m, u: h._json(h.state.news.state())),
+    Route("GET", "/api/update", lambda h, m, u: h._update(parse_qs(u.query))),
+    Route("GET", "/api/update/install", lambda h, m, u: h._json(h.state.install.state())),
+    Route("GET", "/api/history", lambda h, m, u: h._history(parse_qs(u.query))),
+    Route("POST", "/api/history/picture", lambda h, m, u: h._round_picture()),
+    # a notice from another program: with the notify key instead of the token (notify.py)
+    Route("POST", "/api/ai/hook", lambda h, m, u: h._ai_in("hook", u), notify=True),
+    Route("POST", "/api/ai/status", lambda h, m, u: h._ai_in("status", u), notify=True),
+    Route("GET", "/api/ai/setup", lambda h, m, u: h._ai_setup("GET")),
+    Route("POST", "/api/ai/setup", lambda h, m, u: h._ai_setup("POST")),
+    Route("GET", "/api/notify", lambda h, m, u: h._outside_notice("GET", u), notify=True),
+    Route("POST", "/api/notify", lambda h, m, u: h._outside_notice("POST", u), notify=True),
+    Route("GET", "/api/notify-key", lambda h, m, u: h._notify_key()),
+    Route("POST", "/api/notify-key", lambda h, m, u: h._notify_key(renew=True)),
+    *(
+        Route("GET", path, lambda h, m, u, name=name: h._settings(name))
+        for path, name in _SETTINGS_GET.items()
+    ),
+    Route("GET", "/api/themes/{theme+}", lambda h, m, u: h._get_theme(m["theme"])),
+    Route("GET", "/api/sensors", lambda h, m, u: h._json(h._sensors())),
+    Route("GET", "/api/i18n", lambda h, m, u: h._json(h._i18n())),
+    Route("GET", "/api/app", lambda h, m, u: h._app_state()),
+    Route("GET", "/api/doctor", lambda h, m, u: h._json(h.state.doctor().status())),
+    Route("GET", "/api/load", lambda h, m, u: h._json(h.state.load_sampler().report())),
+    Route("GET", "/api/logs", lambda h, m, u: h._logs(parse_qs(u.query))),
+    Route("GET", "/api/experiment", lambda h, m, u: h._experiment()),
+    Route("GET", "/api/colour-check", lambda h, m, u: h._colour_check(parse_qs(u.query))),
+    Route("GET", "/api/player", lambda h, m, u: h._player()),
+    Route("GET", "/api/mirror", lambda h, m, u: h._mirror(parse_qs(u.query))),
+    Route(
+        "GET",
+        "/api/player/picture",
+        lambda h, m, u: h._player_picture(parse_qs(u.query)),
+        picture=True,
+    ),
+    Route("GET", "/api/logs/file", lambda h, m, u: h._logs_file(), picture=True),
+    Route("GET", "/api/hardware", lambda h, m, u: h._hardware(_refresh_asked(u.query))),
+    Route("GET", "/api/fan-look", lambda h, m, u: h._fan_look(parse_qs(u.query)), picture=True),
+    Route(
+        "GET", "/api/symbols-look", lambda h, m, u: h._symbols_look(parse_qs(u.query)), picture=True
+    ),
+    Route(
+        "GET", "/api/backup/file", lambda h, m, u: h._backup_file(), picture=True
+    ),  # a link that downloads it carries the token in its address
+    Route("POST", "/api/backup", lambda h, m, u: h._restore_backup()),
+    Route("POST", "/api/across", lambda h, m, u: h._across_upload()),
+    Route("GET", "/api/across/picture", lambda h, m, u: h._across_picture(), picture=True),
+    Route("GET", "/api/panels/photo", lambda h, m, u: h._panels_photo(), picture=True),
+    Route("POST", "/api/panels/send", lambda h, m, u: h._send_modules()),
+    Route("GET", "/api/start-screen", lambda h, m, u: h._start_screen(parse_qs(u.query))),
+    Route(
+        "GET",
+        "/api/start-screen/picture",
+        lambda h, m, u: h._start_screen_picture(parse_qs(u.query)),
+        picture=True,
+    ),
+    Route(
+        "GET",
+        "/api/start-screen/file",
+        lambda h, m, u: h._start_screen_file(parse_qs(u.query)),
+        picture=True,  # a link that downloads it carries the token in its address
+    ),
+    Route("GET", "/api/plugins/pages", lambda h, m, u: h._json(h._pages())),
+    Route(
+        "GET",
+        "/api/plugins/{page}/{rest*}",
+        lambda h, m, u: h._page_api("GET", m["page"], m["rest"], parse_qs(u.query), None),
+        picture=True,  # a page may answer with a picture
+    ),
+    # -- writing ------------------------------------------------------------------------------
+    Route("POST", "/api/render", lambda h, m, u: h._render()),
+    Route("POST", "/api/adapt", lambda h, m, u: h._adapt()),
+    Route("POST", "/api/module-previews", lambda h, m, u: h._module_previews()),
+    Route("POST", "/api/templates", lambda h, m, u: h._templates()),
+    Route("POST", "/api/detach", lambda h, m, u: h._detach()),
+    Route("POST", "/api/app", lambda h, m, u: h._app_action()),
+    Route("POST", "/api/doctor", lambda h, m, u: h._doctor_action()),
+    Route("POST", "/api/logs", lambda h, m, u: h._logs_action()),
+    Route("POST", "/api/experiment", lambda h, m, u: h._experiment_action()),
+    Route("POST", "/api/colour-check", lambda h, m, u: h._colour_check_action()),
+    Route("POST", "/api/player", lambda h, m, u: h._player_action()),
+    Route("POST", "/api/mirror", lambda h, m, u: h._mirror_action()),
+    Route("POST", "/api/player/media", lambda h, m, u: h._player_upload(parse_qs(u.query))),
+    Route("POST", "/api/language", lambda h, m, u: h._set_language()),
+    Route("POST", "/api/pages", lambda h, m, u: h._set_panel_page()),
+    Route("POST", "/api/sequence", lambda h, m, u: h._set_sequence()),
+    Route("POST", "/api/news", lambda h, m, u: h._see_news()),
+    Route("POST", "/api/update", lambda h, m, u: h._update_later()),
+    Route("POST", "/api/update/install", lambda h, m, u: h._update_install()),
+    Route("POST", "/api/start-screen", lambda h, m, u: h._start_screen_action()),
+    *(
+        Route("POST", path, lambda h, m, u, name=name: h._settings(name, body=True))
+        for path, name in _SETTINGS_POST.items()
+    ),
+    Route("POST", "/api/preset-previews", lambda h, m, u: h._preset_previews()),
+    Route("POST", "/api/hardware", lambda h, m, u: h._set_hardware()),
+    Route(
+        "POST",
+        "/api/plugins/{page}/{rest*}",
+        lambda h, m, u: h._post_page(m["page"], m["rest"], parse_qs(u.query)),
+    ),
+    Route(
+        "POST",
+        "/api/themes/{theme}/assets",
+        lambda h, m, u: h._upload_asset(m["theme"], parse_qs(u.query)),
+    ),
+    Route("POST", "/api/themes/import", lambda h, m, u: h._import_theme(parse_qs(u.query))),
+    Route("POST", "/api/themes/{theme}/version", lambda h, m, u: h._make_version(m["theme"])),
+    Route("POST", "/api/community/install", lambda h, m, u: h._community_install()),
+    Route("POST", "/api/themes/{theme*}", lambda h, m, u: h._save(m["theme"])),
+)
+
+
+def hold_port(sock: Any, platform: str = sys.platform) -> bool:
+    """On Windows, keep the port to this server alone: there SO_REUSEADDR (Python's
+    default for HTTP servers) lets another program bind it too and take requests, and
+    the token in them. Returns whether the address may be reused (elsewhere it may)."""
+    if platform != "win32":
+        return True
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    return False
+
+
+class EditorServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # The app's page asks for its hundred scripts and styles at once, over as many connections
+    # as the browser opens: socketserver's queue of 5 waiting connections was too short for
+    # that. Windows turns a connection away at once when the queue is full (Linux lets it
+    # wait), and a script that did not come left the app's page empty, its view never shown
+    # (seen on Windows with both panels busy and the app opened again after light mode).
+    request_queue_size = 128
+
+    def __init__(self, address: tuple[str, int], handler: type[EditorHandler]) -> None:
+        super().__init__(address, handler)
+        self.token = handler.token  # what a request must carry (access.py)
+
+    def server_bind(self) -> None:
+        self.allow_reuse_address = hold_port(self.socket)
+        super().server_bind()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A browser that closes a tab mid-request is normal, not an error.
+        import sys
+
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            log.debug("editor: client went away")
+            return
+        log.exception("editor: request failed")
+
+
+def make_server(
+    port: int = 8765, config_path: Path | None = None, controls: Any = None, token: str = ""
+) -> EditorServer:
+    """The editor's server, not yet serving. Its ``token`` is new, unless given (access.py)."""
+    state = EditorState(config_path, controls)
+    handler = type(
+        "Handler",
+        (EditorHandler,),
+        {
+            "state": state,
+            "allowed_hosts": set(),
+            "controls": controls,
+            "token": token or access.new_token(),
+        },
+    )
+    server = EditorServer(("127.0.0.1", port), handler)
+    real_port = server.server_address[1]
+    handler.allowed_hosts = {f"127.0.0.1:{real_port}", f"localhost:{real_port}"}
+    server.editor_state = state  # type: ignore[attr-defined]
+    return server
+
+
+def serve(
+    port: int = 8765,
+    open_browser: bool = True,
+    config_path: Path | None = None,
+    browser: bool = False,
+    view: str = "design",
+) -> None:
+    """Serve the app until Ctrl+C, or until its window is closed: it opens in a window of
+    its own when pywebview can show one (``browser``: in the browser anyway)."""
+    from libre_panel import window
+
+    try:
+        server = make_server(port, config_path)
+    except OSError:  # port taken: any free port will do
+        server = make_server(0, config_path)
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    # the address with the token: the way into the app for whoever started it (access.py)
+    print(
+        f"Libre Panel theme editor running at {access.with_token(url, server.token)}"
+        "  (Ctrl+C to stop)"
+    )
+    # a release build for Linux has no window of its own: the system's Python draws it
+    system = open_browser and not browser and window.system_python() is not None
+    backend = None if browser or not open_browser or system else window.load_backend()
+    if backend is not None:
+        thread = threading.Thread(target=server.serve_forever, name="editor", daemon=True)
+        thread.start()
+        try:
+            window.run_window(url, view, webview=backend, token=server.token)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server.editor_state.close()  # type: ignore[attr-defined]
+        return
+    if system:  # (in a process of its own; this one serves until Ctrl+C)
+        window.open_window(url, view, token=server.token)
+    elif open_browser:
+        webbrowser.open(access.with_token(window.view_url(url, view), server.token))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        server.editor_state.close()  # type: ignore[attr-defined]

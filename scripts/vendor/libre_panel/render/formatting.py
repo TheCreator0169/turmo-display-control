@@ -1,0 +1,162 @@
+"""Format strings for shared themes.
+
+Themes come from strangers, so ``str.format`` is locked down: only the named
+fields ``value``, ``unit`` and ``label`` exist, attribute/index access is
+refused and absurd widths are rejected. Extra format specs:
+``{value:bytes}`` (1.2 MB), ``{value:duration}`` (3d 5h), ``{value:clock}``
+(3:07, a song's length), ``{value:gb}`` (a size in GB from the reading's own
+unit: 13.5) and ``{value:rate}`` with ``{value:rate_unit}`` (a data rate as a
+number and its unit apart, as SPUR II sets them: 519 and KB/s, from 1 MB/s
+1.2 and MB/s) and ``{value:upper}`` (a text in capitals: ``{label:upper}`` makes
+of a reading's name a heading, in the language of the panel).
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import string
+from contextvars import ContextVar
+from functools import lru_cache
+from typing import Any
+
+_ALLOWED_FIELDS = {"value", "unit", "label"}
+_UNIT: ContextVar[str] = ContextVar("unit", default="")  # the reading's, for {value:gb}
+# Sizes in bytes of the units a reading may come in (binary, as the sources count)
+_SIZES = {"B": 1, "KB": 1024, "KiB": 1024, "MB": 1024**2, "MiB": 1024**2, "GB": 1024**3,
+          "GiB": 1024**3, "TB": 1024**4, "TiB": 1024**4}  # fmt: skip
+_HUGE_NUMBER = re.compile(r"\d{4,}")
+MAX_OUTPUT = 200
+
+
+class FormatError(ValueError):
+    pass
+
+
+# A number's spec: Python's (.0f, d, %, ...) or one of ours that shows an amount
+_COUNTING = re.compile(r"\{value:(bytes|rate|rate_unit|gb|[^{}A-Za-z]*[bcdeEfFgGnoxX%])\}")
+
+
+def counts(fmt: str) -> bool:
+    """Whether ``fmt`` shows its value as a number, which may count to a new reading
+    (``{value:.0f}°``, ``{value:bytes}/s``), not a text, a name or a song's time."""
+    return bool(_COUNTING.search(fmt))
+
+
+def human_bytes(value: float) -> str:
+    value = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1000 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{value:.1f} TB"  # pragma: no cover
+
+
+def human_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def clock_duration(seconds: float) -> str:
+    """A length the way players show it: 3:07, 1:02:45."""
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def rate_parts(value: float) -> tuple[str, str]:
+    """A data rate (bytes per second) as a number and its unit: whole KB/s
+    below 1 MB/s (else idle traffic would read 0.0), MB/s with a decimal above."""
+    kilobytes = float(value) / 1024
+    if kilobytes < 1024:
+        return f"{kilobytes:.0f}", "KB/s"
+    return f"{kilobytes / 1024:.1f}", "MB/s"
+
+
+def auto_format(value: Any, unit: str = "") -> str:
+    """A reading shown the usual way for its unit: 45%, 61°, 2.4 MB/s, 3h 5m."""
+    if isinstance(value, str):
+        return value
+    if value is None or isinstance(value, bool):
+        return "--"
+    if unit == "B/s":
+        return human_bytes(value) + "/s"
+    if unit == "B":
+        return human_bytes(value)
+    if unit == "s":
+        return human_duration(value)
+    if unit in ("GiB", "GB"):
+        return f"{value:.1f} GB" if value < 100 else f"{value:.0f} GB"
+    if unit in ("%", "°C", "°F", "°"):
+        return f"{value:.0f}{unit}"
+    number = f"{value:.1f}" if abs(value) < 10 and value != int(value) else f"{value:.0f}"
+    return f"{number} {unit}" if unit else number
+
+
+class _SafeFormatter(string.Formatter):
+    def get_field(self, field_name: str, args: Any, kwargs: dict[str, Any]) -> Any:
+        if field_name not in _ALLOWED_FIELDS:
+            raise FormatError(f"unknown field {{{field_name}}}; use value, unit or label")
+        return kwargs[field_name], field_name
+
+    def format_field(self, value: Any, format_spec: str) -> str:
+        if _HUGE_NUMBER.search(format_spec):
+            raise FormatError("format width too large")
+        if format_spec == "bytes":
+            return human_bytes(value)
+        if format_spec == "duration":
+            return human_duration(value)
+        if format_spec == "clock":
+            return clock_duration(value)
+        if format_spec in ("rate", "rate_unit"):
+            return rate_parts(value)[format_spec == "rate_unit"]
+        if format_spec == "upper":
+            return str(value).upper()
+        if format_spec == "gb":
+            size = _SIZES.get(_UNIT.get().removesuffix("/s"), 1024**3)
+            return f"{float(value) * size / 1024**3:.1f}"
+        return super().format_field(value, format_spec)
+
+
+_FORMATTER = _SafeFormatter()
+
+
+def safe_format(fmt: str, value: Any, unit: str = "", label: str = "") -> str:
+    """``fmt`` with the reading's ``value``, ``unit`` and ``label``. A text depends on nothing
+    else, so the last ones made are kept (:func:`_kept`): a steady value, a list's names, the
+    same few numbers of a value that glides back and forth are made once."""
+    try:
+        hash(value)
+    except TypeError:  # (a value that is no key, e.g. a list: made each time)
+        return _made(fmt, value, unit, label)
+    # the value's type and the sign of a zero go with it: 1, 1.0 and True are equal as keys
+    # but not as texts, nor are 0.0 and -0.0 ("{value:.0f}" makes "0" and "-0")
+    sign = math.copysign(1.0, value) if isinstance(value, float) and value == 0 else 0.0
+    return _kept(fmt, value.__class__, value, sign, unit, label)
+
+
+@lru_cache(maxsize=1024)
+def _kept(fmt: str, kind: type, value: Any, sign: float, unit: str, label: str) -> str:
+    """The text :func:`_made` makes, kept by all it depends on (errors are not kept)."""
+    return _made(fmt, value, unit, label)
+
+
+def _made(fmt: str, value: Any, unit: str, label: str) -> str:
+    token = _UNIT.set(unit or "")
+    try:
+        text = _FORMATTER.format(fmt, value=value, unit=unit, label=label)
+    except FormatError:
+        raise
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+        raise FormatError(str(exc)) from exc
+    finally:
+        _UNIT.reset(token)
+    return text[:MAX_OUTPUT]

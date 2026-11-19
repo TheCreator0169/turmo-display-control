@@ -1,0 +1,3010 @@
+"""Modules: building blocks that fill cells of a theme's grid.
+
+A module widget names a kind ("ring", "weather" ...), the cells it covers
+on the theme's grid (``col``, ``row``, ``cols``, ``rows``) and a few
+options. Before a theme is drawn, every module becomes plain widgets laid
+out for its size, the way home-screen widgets show more the larger they
+are: a 1x1 CPU ring shows the load, a 2x1 one adds temperature, power and
+the processor's name, a 4x1 one a history graph as well.
+
+Colours, fonts and the card behind each module come from the theme's look:
+the palette roles in ``ROLES`` and the ``style`` section. A theme without
+them gets the "arctic" look of SPUR II (libre_panel.design has the looks). Labels are in the user's
+language.
+"""
+
+from __future__ import annotations
+
+import math
+import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from typing import Any
+
+from PIL import ImageColor
+
+from libre_panel import timezones
+from libre_panel.design import (
+    DEFAULT_LOOK,
+    LOOKS,
+    MODULE_LABEL,
+    MODULE_PADDING,
+    MODULE_PADDING_BARE,
+    STYLE_DEFAULTS,
+)
+from libre_panel.devices.models import find_model
+from libre_panel.fonts import builtin_font_path
+from libre_panel.fonts.fallback import truetype
+from libre_panel.i18n import t
+
+# -- looks -------------------------------------------------------------------
+
+# Palette roles the modules paint with.
+ROLES = (
+    "bg", "bg2", "surface", "line", "track", "text", "text2", "text3",
+    "accent", "cpu", "gpu", "mem", "disk", "net", "warn", "crit",
+)  # fmt: skip
+
+CARDS = ("glass", "flat", "outline", "none")
+BACKDROPS = ("gradient", "flat")
+
+
+def look_theme_parts(look: str) -> tuple[dict[str, str], dict[str, Any]]:
+    """The palette and style a look sets (for the editor's look picker)."""
+    chosen = LOOKS[look]
+    return dict(chosen["palette"]), {**STYLE_DEFAULTS, **chosen["style"]}
+
+
+# -- sources -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Source:
+    label: str
+    load: str  # the main reading
+    fmt: str  # its format
+    icon: str
+    role: str  # palette role of its colour
+    details: tuple[tuple[str, str, str], ...] = ()  # (sensor, format, label)
+    name: str = ""  # the hardware's name, if the sensors report one
+    low: float | None = 0
+    high: float | None = 100
+    scale: str = "linear"
+
+
+def _sources() -> dict[str, Source]:
+    # Built on use: the labels follow the language.
+    rate = "{value:bytes}/s"
+    return {
+        "cpu": Source(
+            "CPU", "cpu.load", "{value:.0f}%", "cpu", "cpu",
+            (("cpu.temp", "{value:.0f}°C", t("Temp")), ("cpu.power", "{value:.0f} W", t("Power")),
+             ("cpu.freq", "{value:.0f} MHz", t("Clock"))),
+            name="cpu.name",
+        ),
+        "gpu": Source(
+            "GPU", "gpu.load", "{value:.0f}%", "gpu", "gpu",
+            (("gpu.temp", "{value:.0f}°C", t("Temp")), ("gpu.power", "{value:.0f} W", t("Power")),
+             ("gpu.fan", "{value:.0f} RPM", t("Fan"))),
+            name="gpu.name",
+        ),
+        "mem": Source(
+            t("RAM"), "mem.load", "{value:.0f}%", "ram", "mem",
+            (("mem.used", "{value:.1f} GB", t("Used")), ("mem.total", "{value:.0f} GB", t("Total")),
+             ("swap.load", "{value:.0f}%", t("Swap"))),
+            name="mem.name",
+        ),
+        "disk": Source(
+            t("Disk"), "disk.load", "{value:.0f}%", "disk", "disk",
+            (("disk.used", "{value:.0f} GB", t("Used")),
+             ("disk.total", "{value:.0f} GB", t("Total")), ("disk.read", rate, t("Read"))),
+        ),
+        "net": Source(
+            t("Network"), "net.down", rate, "network", "net",
+            (("net.down", rate, t("Down")), ("net.up", rate, t("Up"))),
+            low=0, high=None, scale="sqrt",
+        ),
+        # (for the fan instrument: the module's ``sensor`` names another fan)
+        "fan": Source(t("Fan"), "gpu.fan", "{value:.0f} RPM", "fan", "gpu", low=0, high=None),
+    }  # fmt: skip
+
+
+# -- the grid ----------------------------------------------------------------
+
+GRID_DEFAULTS: dict[str, int] = {"columns": 0, "rows": 0, "gap": 0, "margin": 0}  # 0 = automatic
+MIN_CELL = 4  # px: a grid never has cells smaller than this (it has fewer of them instead)
+GRID_CELLS = 96  # columns or rows a theme may ask for: half cells of 48 place to about 20 px
+
+
+@dataclass(frozen=True)
+class Grid:
+    x: int
+    y: int
+    cell_w: float
+    cell_h: float
+    gap: int
+    columns: int
+    rows: int
+
+    def box(self, col: int, row: int, cols: int, rows: int) -> list[int]:
+        x0 = self.x + col * (self.cell_w + self.gap)
+        y0 = self.y + row * (self.cell_h + self.gap)
+        x1 = x0 + cols * self.cell_w + (cols - 1) * self.gap
+        y1 = y0 + rows * self.cell_h + (rows - 1) * self.gap
+        return [round(x0), round(y0), round(x1) - round(x0), round(y1) - round(y0)]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "x": self.x,
+            "y": self.y,
+            "cell_w": self.cell_w,
+            "cell_h": self.cell_h,
+            "gap": self.gap,
+            "columns": self.columns,
+            "rows": self.rows,
+        }
+
+
+def _fitting(cells: int, fit: int) -> int:
+    while cells > max(fit, 48) and cells % 2 == 0:
+        cells //= 2
+    return min(cells, fit)
+
+
+def make_grid(
+    width: int, height: int, settings: dict[str, int] | None = None, model: str = "custom"
+) -> Grid:
+    """The cells of a ``width`` x ``height`` frame.
+
+    Automatic values give cells of about half the short side (two rows on a
+    bar, three columns on a 3.5" panel) and keep clear of strips the panel's
+    bezel hides. A grid that asks for finer cells than ``MIN_CELL`` px has fewer.
+    """
+    given = {**GRID_DEFAULTS, **(settings or {})}
+    short = min(width, height)
+    margin = given["margin"] or max(4, min(28, round(short * 0.05)))
+    gap = given["gap"] or max(3, min(20, round(short * 0.035)))
+    left = top = right = bottom = margin
+    panel = find_model(model)
+    if panel is not None:
+        orientation = "landscape" if width >= height else "portrait"
+        hidden = panel.hidden_edges(orientation)
+        top, right = top + hidden["top"], right + hidden["right"]
+        bottom, left = bottom + hidden["bottom"], left + hidden["left"]
+    usable_w = max(1, width - left - right)
+    usable_h = max(1, height - top - bottom)
+    target = max(64, min(240, short / 2))
+    columns = given["columns"] or max(1, round(usable_w / target))
+    rows = given["rows"] or max(1, round(usable_h / target))
+    # no more cells than fit: 48 cells and a gap of 1 px each do not go into 78 px; a grid
+    # finer than 48 halves first, so its modules keep whole cells (96 → 48 on a small panel)
+    columns = _fitting(columns, max(1, (usable_w + gap) // (MIN_CELL + gap)))
+    rows = _fitting(rows, max(1, (usable_h + gap) // (MIN_CELL + gap)))
+    cell_w = max(1.0, (usable_w - (columns - 1) * gap) / columns)
+    cell_h = max(1.0, (usable_h - (rows - 1) * gap) / rows)
+    return Grid(left, top, cell_w, cell_h, gap, columns, rows)
+
+
+# -- building ----------------------------------------------------------------
+
+CAP_TOP = 0.30  # Barlow: the top of capitals and digits below the text's y, per font size
+CAP = 0.70  # their height, per font size
+CLOCK_WIDTH = 2.65  # "00:00" in font sizes
+
+
+@lru_cache(maxsize=64)
+def _width_per_size(font: str, text: str) -> float:
+    """How wide ``text`` is in ``font``, per pixel of font size, as the panel draws it: what the
+    font has no glyph for (Chinese, Japanese, Korean) in the system font that draws it."""
+    path = builtin_font_path(font)
+    if path is None:  # a theme's own font: about as wide as Barlow, a wide character a square
+        if text == "00:00":
+            return CLOCK_WIDTH
+        return sum(1.0 if unicodedata.east_asian_width(ch) in "WF" else 0.55 for ch in text)
+    return truetype(str(path), 100).getlength(text) / 100
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    """Any colour a theme may hold ("#0b8", "#0B8C84CC", "teal") as red, green, blue."""
+    red, green, blue = ImageColor.getrgb(color)[:3]
+    return red, green, blue
+
+
+def _alpha(color: str) -> int:
+    """How opaque a colour a theme may hold is, 0 to 255 (255 for one without alpha)."""
+    found = ImageColor.getrgb(color)
+    return found[3] if len(found) > 3 else 255
+
+
+def _hex(color: str) -> str:
+    """``color`` as "#RRGGBB", or "#RRGGBBAA" where it is not opaque: the form the modules
+    mix (the mix is opaque) and fade (:func:`faded`)."""
+    alpha = _alpha(color)
+    return "#{:02X}{:02X}{:02X}".format(*_rgb(color)) + (f"{alpha:02X}" if alpha < 255 else "")
+
+
+def faded(color: str, share: float) -> str:
+    """``color`` as "#RRGGBBAA" with ``share`` of the opacity it has."""
+    return "#{:02X}{:02X}{:02X}{:02X}".format(*_rgb(color), round(_alpha(color) * share))
+
+
+def mix(a: str, b: str, amount: float) -> str:
+    """``a`` moved ``amount`` (0-1) of the way to ``b``."""
+    ca, cb = _rgb(a), _rgb(b)
+    return "#" + "".join(f"{round(x + (y - x) * amount):02X}" for x, y in zip(ca, cb, strict=True))
+
+
+_CARDLESS = ("clock", "text", "analog", "image")  # kinds without a card unless asked
+
+
+def _finished() -> set[str]:
+    """The widget types with a ``finish`` field (theme.model)."""
+    from libre_panel.theme.model import WIDGET_SPECS
+
+    return {kind for kind, spec in WIDGET_SPECS.items() if "finish" in spec and kind != "module"}
+
+
+class _Build:
+    """Collects the widgets of one module, laid out in its box."""
+
+    def __init__(
+        self,
+        module: dict[str, Any],
+        box: list[int],
+        colors: dict[str, str],
+        style: dict[str, Any],
+    ) -> None:
+        self.module = module
+        self.x, self.y, self.w, self.h = box
+        self.cols, self.rows = module["cols"], module["rows"]
+        self.colors = colors
+        self.style = style
+        self.u = min(self.w, self.h)
+        self.card_on = module["card"] == "on" or (
+            module["card"] == "auto" and module["module"] not in _CARDLESS
+        )
+        self.card_on = self.card_on and style["card"] != "none"
+        padding = MODULE_PADDING if self.card_on else MODULE_PADDING_BARE
+        self.pad = round(_clamp(self.u * padding[0], padding[1], padding[2]))
+        self.ix, self.iy = self.x + self.pad, self.y + self.pad
+        self.iw, self.ih = self.w - 2 * self.pad, self.h - 2 * self.pad
+        # small labels: every size of type in a module is a multiple of theirs
+        self.ts = round(_clamp(self.u * MODULE_LABEL[0], MODULE_LABEL[1], MODULE_LABEL[2]))
+        self.glow = float(style["glow"])
+        self.out: list[dict[str, Any]] = []
+        self.needs = ""  # added to every widget (a source's fallback)
+
+    # colours
+    def c(self, role: str) -> str:
+        return self.colors[role]
+
+    def tint(self, role: str) -> str:
+        """The module's own colour if it has one, else the role's."""
+        return self.module.get("color") or self.c(role)
+
+    def deep(self, color: str) -> str:
+        return mix(color, self.c("surface"), 0.55)
+
+    # widgets
+    def add(self, kind: str, name: str, **fields: Any) -> dict[str, Any]:
+        widget = {"type": kind, "id": name, **fields}
+        if self.needs:
+            own = widget.get("needs", "")
+            widget["needs"] = f"{own},{self.needs}" if own else self.needs
+        finish = self.module.get("finish", "flat")
+        if self.style.get("light"):  # in light colours (theme.light_colours)
+            from libre_panel.theme.light_colours import light_part
+
+            finish = light_part(widget, finish)
+        if finish != "flat" and kind in _finished():  # its parts are drawn with it where they can
+            widget.setdefault("finish", finish)
+        self.out.append(widget)
+        return widget
+
+    def card(self, outline: bool = True) -> None:
+        """The card's surface and, unless ``outline`` is off (a slot draws its own frame, in
+        the colour of the card it shows), its thin outline."""
+        if not self.card_on:
+            return
+        radius = round(self.style["radius"] * self.frame_u / 200)
+        kind = self.style["card"]
+        see = float(self.style.get("card_opacity", 1.0))  # (a theme from before: all of it)
+        fill = {"glass": faded(self.c("surface"), 0.9 * see),
+                "flat": faded(self.c("surface"), see)}.get(kind)  # fmt: skip
+        outline = self.c("line") if outline and kind in ("glass", "outline") else None
+        self.add(
+            "rect", "card", x=self.x, y=self.y, w=self.w, h=self.h, color=fill,
+            radius=radius, outline=outline, outline_width=max(1, round(self.frame_u / 160)),
+        )  # fmt: skip
+
+    @property
+    def frame_u(self) -> float:
+        """What a card's corners and outline scale with: its size, up to half the panel's
+        height (so a big card is framed as the others, not heavier). Every card has it, the
+        lit ones too (render.slot frames a slot by the same rule)."""
+        return min(self.u, self.style.get(FRAME_U) or self.u)
+
+    def _text_fields(self, size: float, cap_top: float, font: str, **kw: Any) -> dict[str, Any]:
+        size = max(6, round(size))
+        fields = {"font": self.style[font], "font_size": size, "y": round(cap_top - CAP_TOP * size)}
+        fields.update(kw)
+        return fields
+
+    def label(self, name: str, text: str, x: float, cap_top: float, size: float,
+              color: str | None = None, align: str = "left", width: float = 0) -> None:  # fmt: skip
+        fields = self._text_fields(size, cap_top, "text_font")
+        self.add(
+            "text", name, x=round(x), text=text.upper(), color=color or self.c("text3"),
+            letter_spacing=max(1, round(fields["font_size"] * 0.14)), align=align,
+            max_width=round(width), tabular=False, **fields,
+        )  # fmt: skip
+
+    def value(self, name: str, sensor: str, fmt: str, x: float, cap_top: float, size: float,
+              color: str | None = None, align: str = "left", width: float = 0,
+              font: str = "display_font", tabular: bool = True, **kw: Any) -> None:  # fmt: skip
+        from libre_panel.render.formatting import counts  # (render imports the theme model)
+
+        fields = self._text_fields(size, cap_top, font)
+        kw.setdefault("smooth", counts(fmt))  # a number counts to a new reading, as the rings
+        self.add(
+            "metric", name, x=round(x), sensor=sensor, format=fmt,
+            color=color or self.c("text"), align=align, max_width=round(width),
+            tabular=tabular, **fields, **kw,
+        )  # fmt: skip
+
+    def clock(self, name: str, fmt: str, x: float, cap_top: float, size: float,
+              color: str | None = None, align: str = "left", width: float = 0,
+              font: str = "display_font", **kw: Any) -> None:  # fmt: skip
+        fields = self._text_fields(size, cap_top, font)
+        self.add(
+            "clock", name, x=round(x), format=fmt, color=color or self.c("text"), align=align,
+            max_width=round(width), **fields, **kw,
+        )  # fmt: skip
+
+    def ring(self, name: str, sensor: str, x: float, y: float, d: float, color: str,
+             low: float | None = 0, high: float | None = 100) -> None:  # fmt: skip
+        d = round(d)
+        self.add(
+            "gauge", name, x=round(x), y=round(y), w=d, h=d, sensor=sensor,
+            min=0 if low is None else low, max=100 if high is None else high,
+            thickness=max(3, round(d * 0.08)), color=self.deep(color), color2=color,
+            background=self.c("track"), cap="round", glow=round(0.45 * self.glow, 2),
+            glow_radius=max(2, round(d * 0.05)), smooth=True,
+        )  # fmt: skip
+
+    def bar(self, name: str, sensor: str, x: float, y: float, w: float, h: float,
+            color: str, low: float | None = 0, high: float | None = 100,
+            scale: str = "linear") -> None:  # fmt: skip
+        h = max(2, round(h))
+        self.add(
+            "bar", name, x=round(x), y=round(y), w=max(4, round(w)), h=h, sensor=sensor,
+            min=0 if low is None else low, max=100 if high is None else high, scale=scale,
+            color=self.deep(color), color2=color, background=self.c("track"), radius=h // 2,
+            glow=round(0.3 * self.glow, 2), glow_radius=max(2, h),
+        )  # fmt: skip
+
+    def graph(self, name: str, sensor: str, x: float, y: float, w: float, h: float,
+              color: str, low: float | None = 0, high: float | None = 100,
+              scale: str = "linear", fill: bool = True, unit: float = 0) -> None:  # fmt: skip
+        """A graph, its line and glow as thick as the module is large (``unit``: as one of that
+        size's)."""
+        w, h, u = max(8, round(w)), max(8, round(h)), unit or self.u
+        self.add(
+            "graph", name, x=round(x), y=round(y), w=w, h=h, sensor=sensor, min=low, max=high,
+            scale=scale, history=max(30, min(300, w // 3)), color=color, fill=fill,
+            fill_fade=True, smooth=True, line_width=max(1, round(u / 110)),
+            glow=round(0.35 * self.glow, 2), glow_radius=max(2, round(u / 40)),
+        )  # fmt: skip
+
+    def icon(self, name: str, icon: str, x: float, y: float, size: float, color: str) -> None:
+        size = max(8, round(size))
+        self.add(
+            "icon", name, x=round(x), y=round(y), size=size, icon=icon, color=color,
+            stroke=round(_clamp(size / 14, 1.5, 3.5), 1),
+        )  # fmt: skip
+
+    def listing(self, name: str, items: str, x: float, y: float, w: float, h: float,
+                color: str, style: str = "bars", size: float = 0, **kw: Any) -> None:  # fmt: skip
+        """A list of readings (temperatures, drives, cores ...), as many as fit."""
+        self.add(
+            "list", name, x=round(x), y=round(y), w=max(4, round(w)), h=max(4, round(h)),
+            items=items, style=style, font=self.style["display_font"],
+            label_font=self.style["text_font"], font_size=max(7, round(size or self.ts * 1.3)),
+            color=self.c("text"), muted=self.c("text3"), color2=color,
+            **{"background": self.c("track"), **kw},
+        )  # fmt: skip
+
+    def head(self, icon: str, title: str, color: str, room: float = 0) -> float:
+        """Icon and title at the top (``room`` kept free on the right); returns
+        the height they take."""
+        self.icon("icon", icon, self.ix, self.iy - self.ts * 0.1, self.ts * 1.5, color)
+        self.label("title", title, self.ix + self.ts * 2.1, self.iy + self.ts * 0.15,
+                   self.ts * 1.05, color=color, width=self.iw - self.ts * 2.1 - room)  # fmt: skip
+        return self.ts * 2.4
+
+    # shapes of the box
+    @property
+    def aspect(self) -> float:
+        return self.iw / max(1, self.ih)
+
+    @property
+    def large(self) -> bool:
+        return self.cols >= 2 and self.rows >= 2
+
+
+def _detail_rows(b: _Build, src: Source, x: float, top: float, width: float, height: float,
+                 color: str, title: bool = True) -> None:  # fmt: skip
+    """Source title, the hardware name and detail rows in a column."""
+    y = top
+    if title:
+        size = b.ts * 1.15
+        b.label("title", b.module["title"] or src.label, x, y, size, color=color, width=width)
+        y += CAP * size + b.ts * 0.9
+        if src.name and height - (y - top) > b.ts * 6:
+            b.value("name", src.name, "{value}", x, y, b.ts * 0.95, color=b.c("text3"),
+                    width=width, font="text_font", tabular=False, fallback="",
+                    hide_if_missing=True, fit="ellipsis")  # fmt: skip
+            y += CAP * b.ts * 0.95 + b.ts * 1.1
+    room = top + height - y
+    count = min(len(src.details), 3, int(room // (b.ts * 2.6)))
+    if count < 1:
+        return
+    row = min(room / count, b.u * 0.26)
+    value_size = min(row * 0.56, b.u * 0.17, width * 0.2)
+    for i, (sensor, fmt, text) in enumerate(src.details[:count]):
+        base = y + i * row + (row - CAP * value_size) / 2
+        b.label(
+            f"d{i}-label", text, x, base + CAP * (value_size - b.ts) / 2, b.ts, width=width * 0.4
+        )
+        b.value(f"d{i}", sensor, fmt, x + width, base, value_size, align="right",
+                width=width * 0.58, hide_if_missing=True,
+                color_rules=_heat(b) if sensor.endswith(".temp") else [])  # fmt: skip
+
+
+def _heat(b: _Build) -> list[dict[str, Any]]:
+    return [{"above": 75, "color": b.c("warn")}, {"above": 88, "color": b.c("crit")}]
+
+
+def _ring_inside(b: _Build, src: Source, cx: float, cy: float, d: float, color: str) -> None:
+    value_size, label_size = d * 0.25, max(7, d * 0.085)
+    gap = d * 0.05
+    total = CAP * value_size + gap + CAP * label_size
+    top = cy - total / 2
+    b.value("value", src.load, src.fmt, cx, top, value_size, align="center", width=d * 0.66)
+    b.label("label", b.module["title"] or src.label, cx, top + CAP * value_size + gap,
+            label_size, color=color, align="center", width=d * 0.6)  # fmt: skip
+
+
+def build_ring(b: _Build, src: Source) -> None:
+    color = b.tint(src.role)
+    b.card()
+    a = b.aspect
+    if b.large and 0.7 < a < 1.6:  # big square: ring and details, history below
+        top_h = min(b.ih * 0.58, b.iw * 0.5)
+        _ring_wide(b, src, color, b.ix, b.iy, b.iw, top_h)
+        gy = b.iy + top_h + b.pad
+        b.graph("history", src.load, b.ix, gy, b.iw, b.iy + b.ih - gy, color,
+                src.low, src.high, src.scale)  # fmt: skip
+    elif a >= 1.45:
+        _ring_wide(b, src, color, b.ix, b.iy, b.iw, b.ih, graph_below=b.large)
+    elif a <= 0.72:  # tall: ring on top, details below
+        d = b.iw
+        b.ring("ring", src.load, b.ix, b.iy, d, color, src.low, src.high)
+        _ring_inside(b, src, b.ix + d / 2, b.iy + d / 2, d, color)
+        room = b.ih - d - b.pad
+        if room > b.ts * 3:
+            graph_h = room * 0.45 if room > d * 0.9 else 0
+            _detail_rows(b, src, b.ix, b.iy + d + b.pad, b.iw, room - graph_h, color, False)
+            if graph_h:
+                b.graph("history", src.load, b.ix, b.iy + b.ih - graph_h, b.iw, graph_h, color,
+                        src.low, src.high, src.scale)  # fmt: skip
+    else:  # compact
+        d = min(b.iw, b.ih)
+        x, y = b.ix + (b.iw - d) / 2, b.iy + (b.ih - d) / 2
+        b.ring("ring", src.load, x, y, d, color, src.low, src.high)
+        _ring_inside(b, src, x + d / 2, y + d / 2, d, color)
+
+
+def _ring_wide(b: _Build, src: Source, color: str, x: float, y: float, w: float, h: float,
+               graph_below: bool = False) -> None:  # fmt: skip
+    d = h
+    b.ring("ring", src.load, x, y, d, color, src.low, src.high)
+    _ring_inside(b, src, x + d / 2, y + d / 2, d, color)
+    rest = w - d - b.pad
+    if rest < b.ts * 5:
+        return
+    column = min(rest, d * 1.3)
+    graph_w = rest - column - b.pad
+    if graph_w > d * 0.8:  # a long box: the history on the right
+        _detail_rows(b, src, x + d + b.pad, y + h * 0.04, column, h * 0.92, color)
+        b.graph("history", src.load, x + d + column + 2 * b.pad, y + h * 0.12, graph_w, h * 0.76,
+                color, src.low, src.high, src.scale)  # fmt: skip
+    elif graph_below:  # a big box: the history under the details
+        _detail_rows(b, src, x + d + b.pad, y, rest, h * 0.6, color)
+        b.graph("history", src.load, x + d + b.pad, y + h * 0.66, rest, h * 0.34, color,
+                src.low, src.high, src.scale)  # fmt: skip
+    else:
+        _detail_rows(b, src, x + d + b.pad, y + h * 0.04, column, h * 0.92, color)
+
+
+def build_stat(b: _Build, src: Source) -> None:
+    """A large number with its name; a bar and a history graph when there is room."""
+    color = b.tint(src.role)
+    b.card()
+    sensor, fmt = src.load, src.fmt
+    if b.module["source"] == "sensor":
+        sensor = b.module["sensor"] or "cpu.load"
+        fmt = b.module["format"] or "{value:.0f}{unit}"
+    title = b.module["title"] or (src.label if b.module["source"] != "sensor" else sensor)
+    a = b.aspect
+    b.icon("icon", src.icon, b.ix, b.iy - b.ts * 0.1, b.ts * 1.5, color)
+    b.label("title", title, b.ix + b.ts * 2.1, b.iy + b.ts * 0.15, b.ts * 1.05, color=color,
+            width=b.iw - b.ts * 2.1)  # fmt: skip
+    head = b.ts * 1.9
+    tall = a <= 0.72
+    graph_room = b.large or a >= 2.4 or tall
+    stacked = b.large or tall  # the history under the number
+    body_h = b.ih - head
+    if graph_room and stacked:
+        body_h = b.ih * 0.5 - head
+    size = min(body_h * 0.62, b.iw * (0.3 if a < 2.4 else 0.18))
+    cap_top = b.iy + head + (body_h - CAP * size) * (0.35 if graph_room else 0.45)
+    width = b.iw if not (graph_room and not stacked) else b.iw * 0.42
+    b.value("value", sensor, fmt, b.ix, cap_top, size, width=width)
+    known = b.module["source"] != "sensor" and src.high is not None
+    if known and not (graph_room and stacked) and b.ih > b.ts * 6:
+        bar_h = max(3, b.u * 0.035)
+        b.bar("bar", sensor, b.ix, b.iy + b.ih - bar_h, width, bar_h, color,
+              src.low, src.high, src.scale)  # fmt: skip
+    src_known = b.module["source"] in ("cpu", "gpu", "mem", "disk")
+    if stacked and b.large and a >= 1.6 and src_known:  # room beside the number: details
+        _detail_rows(b, src, b.ix + b.iw * 0.5, b.iy, b.iw * 0.5, b.ih * 0.5, color, False)
+    if graph_room:
+        if stacked:
+            gy = b.iy + b.ih * 0.5 + b.pad / 2
+            b.graph(
+                "history",
+                sensor,
+                b.ix,
+                gy,
+                b.iw,
+                b.iy + b.ih - gy,
+                color,
+                src.low if known else None,
+                src.high if known else None,
+                src.scale,
+            )
+        else:
+            gx = b.ix + width + b.pad
+            b.graph(
+                "history",
+                sensor,
+                gx,
+                b.iy + head,
+                b.ix + b.iw - gx,
+                b.ih - head,
+                color,
+                src.low if known else None,
+                src.high if known else None,
+                src.scale,
+            )
+
+
+def build_graph(b: _Build, src: Source) -> None:
+    """A history graph under its name and current value."""
+    color = b.tint(src.role)
+    b.card()
+    sensor, fmt = src.load, src.fmt
+    if b.module["source"] == "sensor":
+        sensor = b.module["sensor"] or "cpu.load"
+        fmt = b.module["format"] or "{value:.0f}{unit}"
+    known = b.module["source"] != "sensor"
+    title = b.module["title"] or (src.label if known else sensor)
+    value_size = _clamp(b.ih * 0.17, b.ts * 1.2, b.ts * 3.2)
+    b.label("title", title, b.ix, b.iy + (CAP * value_size - CAP * b.ts) / 2, b.ts, color=color,
+            width=b.iw * 0.5)  # fmt: skip
+    b.value("value", sensor, fmt, b.ix + b.iw, b.iy, value_size, align="right", width=b.iw * 0.55)
+    gy = b.iy + CAP * value_size + b.pad * 0.8
+    b.graph("history", sensor, b.ix, gy, b.iw, b.iy + b.ih - gy, color,
+            src.low if known else None, src.high if known else None, src.scale)  # fmt: skip
+
+
+def build_bars(b: _Build, _src: Source) -> None:
+    """Rows with a bar each: CPU, RAM, disk and GPU, as many as fit."""
+    b.card()
+    sources = _sources()
+    order = [sources[k] for k in ("cpu", "mem", "disk", "gpu")]
+    wide = b.aspect >= 2.2
+    row_min = b.ts * (2.2 if wide else 3.3)
+    count = int(_clamp(b.ih // row_min, 1, 4))
+    row = b.ih / count
+    for i, src in enumerate(order[:count]):
+        color = b.c(src.role)
+        top = b.iy + i * row
+        needs = src.load if src.role == "gpu" else ""
+        size = min(row * (0.42 if wide else 0.3), b.ts * 1.6)
+        bar_h = max(3, round(min(row * 0.14, b.u * 0.03)))
+        if wide:
+            mid = top + row / 2
+            label_w = b.iw * 0.2
+            value_w = b.iw * 0.2
+            b.label(f"r{i}-label", src.label, b.ix, mid - CAP * b.ts / 2, b.ts, color=color,
+                    width=label_w)  # fmt: skip
+            b.bar(f"r{i}-bar", src.load, b.ix + label_w, mid - bar_h / 2,
+                  b.iw - label_w - value_w - b.pad, bar_h, color)  # fmt: skip
+            b.value(f"r{i}-value", src.load, src.fmt, b.ix + b.iw, mid - CAP * size / 2, size,
+                    align="right", width=value_w)  # fmt: skip
+        else:
+            b.label(f"r{i}-label", src.label, b.ix, top + row * 0.12 + CAP * (size - b.ts) / 2,
+                    b.ts, color=color, width=b.iw * 0.5)  # fmt: skip
+            b.value(f"r{i}-value", src.load, src.fmt, b.ix + b.iw, top + row * 0.12, size,
+                    align="right", width=b.iw * 0.5)  # fmt: skip
+            b.bar(f"r{i}-bar", src.load, b.ix, top + row * 0.12 + CAP * size + row * 0.16,
+                  b.iw, bar_h, color)  # fmt: skip
+        if needs:
+            for w in b.out[-3:]:
+                w["needs"] = needs
+
+
+def build_network(b: _Build, src: Source) -> None:
+    """Download and upload; a graph of the download when there is room."""
+    color = b.tint("net")
+    up_color = mix(color, b.c("text"), 0.45)
+    b.card()
+    a = b.aspect
+    stacked = b.large or a <= 0.72  # the graph under the numbers
+    graph = a >= 1.45 or stacked
+    column = b.iw if not graph or stacked else min(b.iw * 0.45, b.ih * 1.6)
+    lines_h = b.ih if not (graph and stacked) else b.ih * 0.45
+    size = min(lines_h * 0.26, column * 0.16)
+    icon = size * 0.95
+    rate = "{value:bytes}/s"
+    for i, (key, name, tone) in enumerate((("net.down", "download", color),
+                                           ("net.up", "upload", up_color))):  # fmt: skip
+        cap_top = b.iy + lines_h * (0.18 + 0.5 * i)
+        b.icon(f"{name}-icon", name, b.ix, cap_top + CAP * size / 2 - icon / 2, icon, tone)
+        b.value(name, key, rate, b.ix + icon * 1.35, cap_top, size, width=column - icon * 1.35)
+    if not graph:
+        return
+    if stacked:
+        gx, gy, gw, gh = b.ix, b.iy + lines_h + b.pad, b.iw, b.ih - lines_h - b.pad
+    else:
+        gx, gy = b.ix + column + b.pad, b.iy
+        gw, gh = b.iw - column - b.pad, b.ih
+    b.graph("down-history", "net.down", gx, gy, gw, gh, color, 0, None, "sqrt")
+    b.graph("up-history", "net.up", gx, gy, gw, gh, up_color, 0, None, "sqrt", fill=False)
+
+
+def build_clock(b: _Build, _src: Source) -> None:
+    """The time, the seconds when wide enough, and the date."""
+    b.card()
+    a = b.aspect
+    if a <= 0.72:  # tall: hours over minutes
+        size = min(b.iw / 1.3, b.ih * 0.34)
+        date_size = max(8, size * 0.2)
+        gap = size * 0.22
+        block = 2 * CAP * size + gap + date_size * 1.2 + CAP * date_size
+        top = b.iy + (b.ih - block) / 2
+        cx = b.ix + b.iw / 2
+        glow = round(0.3 * b.glow, 2)
+        b.clock("hours", "%H", cx, top, size, align="center", glow=glow,
+                glow_radius=max(2, round(size / 12)))  # fmt: skip
+        b.clock("minutes", "%M", cx, top + CAP * size + gap, size, align="center",
+                color=b.c("accent"), glow=round(0.6 * b.glow, 2),
+                glow_radius=max(2, round(size / 12)))  # fmt: skip
+        b.clock("date", "%a %d %b", cx, top + 2 * CAP * size + gap + date_size * 1.2, date_size,
+                color=b.c("text2"), align="center", width=b.iw, font="text_font",
+                tabular=False)  # fmt: skip
+        return
+    seconds = a >= 2.2
+    date_ratio = 0.2
+    clock_width = _width_per_size(b.style["display_font"], "00:00")
+    size = min(b.ih / (1 + date_ratio * 2.2), b.iw / (clock_width + (0.62 if seconds else 0)))
+    date_size = max(8, size * date_ratio)
+    block = CAP * size + date_size * 1.1 + CAP * date_size
+    # the seconds run along a line under the date where the card has room (Almanac's)
+    line = b.ih - block > size * 0.9
+    line_h, line_gap = max(2, round(size * 0.012)), date_size * 1.6
+    if line:
+        block += line_gap + line_h
+    top = b.iy + (b.ih - block) / 2
+    left = a >= 1.45
+    x = b.ix if left else b.ix + b.iw / 2
+    align = "left" if left else "center"
+    glow = round(0.3 * b.glow, 2)
+    b.clock("time", "%H:%M", x, top, size, align=align, width=b.iw, glow=glow,
+            glow_radius=max(2, round(size / 12)))  # fmt: skip
+    if seconds:
+        sx = x + clock_width * size + size * 0.08
+        b.clock("seconds", "%S", sx, top, size * 0.36, color=b.c("accent"),
+                glow=round(0.7 * b.glow, 2), glow_radius=max(2, round(size / 16)))  # fmt: skip
+    fmt = "%A · %d %B" if b.iw > size * 4.2 else "%a %d %b"
+    date_top = top + CAP * size + date_size * 1.1
+    b.clock("date", fmt, x, date_top, date_size, color=b.c("text2"), align=align, width=b.iw,
+            font="text_font", tabular=False)  # fmt: skip
+    if line:
+        line_w = clock_width * size + (size * 0.62 if seconds else 0)
+        lx = x if left else x - line_w / 2
+        ly = date_top + CAP * date_size + line_gap
+        b.add("rect", "seconds-groove", x=round(lx), y=round(ly), w=round(line_w), h=line_h,
+              color=b.c("track"))  # fmt: skip
+        b.add("bar", "seconds-run", x=round(lx), y=round(ly), w=round(line_w), h=line_h,
+              sensor="time.second", min=0, max=60, color=b.c("accent"), background=None,
+              radius=0, smooth=False, end_dot=round(line_h * 2.25, 1))  # fmt: skip
+
+
+def build_date(b: _Build, _src: Source) -> None:
+    """A calendar sheet: the day, the weekday, the month; the month's days when large."""
+    b.card()
+    _date_layout(b)
+
+
+def _date_layout(b: _Build) -> None:
+    a = b.aspect
+    if (b.large and a >= 1.6) or a >= 3.0:  # the sheet beside the month
+        width = min(b.iw * 0.4, b.ih * 1.3)
+        _sheet(b, b.ix, b.iy, width, b.ih)
+        _month(b, b.ix + width + b.pad, b.iy, b.iw - width - b.pad, b.ih)
+    elif b.large or (a <= 0.72 and b.ih >= b.iw * 1.6):  # the sheet above the month
+        top = b.ih * (0.32 if b.large else 0.4)
+        _sheet(b, b.ix, b.iy, b.iw, top)
+        _month(b, b.ix, b.iy + top + b.pad * 0.5, b.iw, b.ih - top - b.pad * 0.5)
+    else:
+        _sheet(b, b.ix, b.iy, b.iw, b.ih)
+
+
+def _month(b: _Build, x: float, y: float, w: float, h: float) -> None:
+    b.add(
+        "calendar", "calendar", x=round(x), y=round(y), w=round(w), h=round(h),
+        font=b.style["text_font"], font_size=round(min(h / 7 * 0.6, w / 7 * 0.45)),
+        color=b.c("text2"), color2=b.tint("accent"), muted=b.c("text3"),
+    )  # fmt: skip
+
+
+def _sheet(b: _Build, x: float, y: float, w: float, h: float) -> None:
+    accent = b.tint("accent")
+    if w / max(1, h) >= 1.6:  # day on the left, names on the right
+        size = min(h * 0.78, w * 0.3)
+        b.clock("day", "%d", x, y + (h - CAP * size) / 2, size, color=accent,
+                glow=round(0.5 * b.glow, 2), glow_radius=max(2, round(size / 14)))  # fmt: skip
+        nx = x + size * 1.3
+        name = min(h * 0.2, (w - size * 1.3) * 0.16)
+        b.clock("weekday", "%A", nx, y + h / 2 - CAP * name - name * 0.25, name,
+                width=x + w - nx, font="text_font", tabular=False)  # fmt: skip
+        b.clock("month", "%B %Y", nx, y + h / 2 + name * 0.25, name * 0.8, color=b.c("text3"),
+                width=x + w - nx, font="text_font", tabular=False)  # fmt: skip
+        return
+    size = min(h * 0.46, w * 0.5)
+    name = max(8, min(size * 0.26, w * 0.14))
+    block = CAP * size + name * 0.9 + CAP * name + name * 0.6 + CAP * name * 0.8
+    top = y + (h - block) / 2
+    b.clock("day", "%d", x, top, size, color=accent, glow=round(0.5 * b.glow, 2),
+            glow_radius=max(2, round(size / 14)))  # fmt: skip
+    top += CAP * size + name * 0.9
+    b.clock("weekday", "%A", x, top, name, width=w, font="text_font", tabular=False)
+    top += CAP * name + name * 0.6
+    b.clock("month", "%B %Y", x, top, name * 0.8, color=b.c("text3"), width=w,
+            font="text_font", tabular=False)  # fmt: skip
+
+
+def build_weather(b: _Build, _src: Source) -> None:
+    """The weather of the configured place, with a forecast when there is room.
+
+    A calendar sheet stands in while there is no weather; with ``fallback`` "none" (a
+    companion, beside a screen that shows the date) it says that none is set up. The
+    forecast shows days or hours (``forecast``): as columns beside or under the weather now,
+    as rows in a tall module.
+    """
+    b.card()
+    start = len(b.out)
+    if b.module["fallback"] == "none":
+        b.label("setup", t("No weather set up"), b.ix + b.iw / 2,
+                b.iy + b.ih / 2 - CAP * b.ts / 2, b.ts, align="center", width=b.iw)  # fmt: skip
+    else:
+        _date_layout(b)
+    for widget in b.out[start:]:
+        widget["needs"] = "!weather.temperature"
+    start = len(b.out)
+    chosen = b.module["forecast"]
+    mode = {"auto": "days", "both": "days"}.get(chosen, chosen)
+    a = b.aspect
+    if mode != "off" and a >= 3.0:  # long: now | forecast
+        width = min(b.iw * 0.4, b.ih * 2.0)
+        _weather_now(b, b.ix, b.iy, width, b.ih, details=False)
+        _forecast(b, b.ix + width + b.pad, b.iy, b.iw - width - b.pad, b.ih, mode)
+    elif mode != "off" and b.large and a >= 1.6:  # big and wide: now with details | forecast
+        width = b.iw * 0.4
+        _weather_now(b, b.ix, b.iy, width, b.ih, details=True)
+        x, w = b.ix + width + b.pad, b.iw - width - b.pad
+        both = chosen == "both" or (chosen == "auto" and b.ih >= b.ts * 14)
+        if both:  # days above, hours below
+            half = (b.ih - b.pad) / 2
+            _forecast(b, x, b.iy, w, half, "days")
+            _forecast(b, x, b.iy + half + b.pad, w, half, "hours", prefix="h")
+        else:
+            _forecast(b, x, b.iy, w, b.ih, mode)
+    elif mode != "off" and a <= 0.72 and b.ih >= b.iw * 1.8:  # tall: the forecast as rows
+        both = chosen == "both" or (chosen == "auto" and b.ih >= b.ts * 44)
+        top = b.ih * (0.24 if both else 0.42)  # (a panel on end: the hours, then the days)
+        _weather_now(b, b.ix, b.iy, b.iw, top, details=b.large)
+        y, h = b.iy + top + b.pad * 0.5, b.ih - top - b.pad * 0.5
+        if both:
+            half = (h - b.pad) / 2
+            _forecast(b, b.ix, y, b.iw, half, "hours", rows=True, prefix="h")
+            _forecast(b, b.ix, y + half + b.pad, b.iw, half, "days", rows=True)
+        else:
+            _forecast(b, b.ix, y, b.iw, h, mode, rows=True)
+    elif mode != "off" and b.large:  # big: now above the forecast
+        top = b.ih * 0.5
+        _weather_now(b, b.ix, b.iy, b.iw, top, details=False)
+        _forecast(b, b.ix, b.iy + top + b.pad * 0.5, b.iw, b.ih - top - b.pad * 0.5, mode)
+    else:
+        _weather_now(b, b.ix, b.iy, b.iw, b.ih, details=b.large or a >= 2.3)
+    for widget in b.out[start:]:
+        own = widget.get("needs", "")
+        widget["needs"] = f"weather.temperature,{own}" if own else "weather.temperature"
+
+
+def _weather_now(b: _Build, x: float, y: float, w: float, h: float, details: bool) -> None:
+    """Symbol, temperature and sky in a box; feels-like, humidity and wind if asked."""
+    icon_color = b.tint("text")
+    desc = b.ts * 1.25
+    a = w / max(1, h)
+    if a <= 0.72:  # tall: icon, temperature, sky, then the details as rows
+        size = min(w * 0.42, h * 0.18)
+        b.icon("icon", "weather", x, y, size, icon_color)
+        temp_top = y + size * 1.25
+        b.add("weather", "temp", field="temperature", format="{value:.0f}°",
+              **_temp_fields(b, x, temp_top, size * 1.1, w))  # fmt: skip
+        desc_top = temp_top + CAP * size * 1.1 + b.ts * 1.1
+        _weather_desc(b, x, desc_top, w, desc)
+        room = y + h - (desc_top + CAP * desc + b.ts * 1.4)
+        rows = min(3, int(room // (b.ts * 2.4))) if details or room > b.ts * 3 else 0
+        for i, (field, icon, fmt) in enumerate(_WEATHER_DETAILS[:rows]):
+            row_y = y + h - (rows - i) * b.ts * 2.4 + b.ts * 0.6
+            b.icon(f"{field}-icon", icon, x, row_y - b.ts * 0.25, b.ts * 1.3, b.c("text3"))
+            b.add("weather", field, field=field, format=fmt,
+                  **b._text_fields(b.ts * 1.15, row_y, "text_font", x=round(x + b.ts * 1.8),
+                                   color=b.c("text2"), max_width=round(w - b.ts * 1.8),
+                                   tabular=True))  # fmt: skip
+        return
+    details = details and h > b.ts * 7
+    main_h = h * (0.62 if details else 1.0)
+    if a >= 1.45:
+        size = min(main_h * 0.62, w * 0.22)
+        b.icon("icon", "weather", x, y + (main_h * 0.7 - size) / 2, size, icon_color)
+        b.add("weather", "temp", field="temperature", format="{value:.0f}°",
+              **_temp_fields(b, x + size * 1.2, y + (main_h * 0.7 - CAP * size) / 2, size,
+                             w - size * 1.2))  # fmt: skip
+        desc_top = y + main_h * 0.7 + b.ts * 0.2
+    else:
+        size = min(h * 0.34, w * 0.36)
+        b.icon("icon", "weather", x, y, size, icon_color)
+        b.add("weather", "temp", field="temperature", format="{value:.0f}°",
+              **_temp_fields(b, x + w, y + size * 0.12, size, w * 0.6, "right"))  # fmt: skip
+        desc_top = y + size + b.ts * 1.2
+    _weather_desc(b, x, desc_top, w, desc)
+    if details:
+        row_y = y + h - CAP * b.ts * 1.1
+        b.add("rect", "rule", x=round(x), y=round(row_y - b.ts * 1.6), w=round(w), h=1,
+              color=b.c("line"))  # fmt: skip
+        count = 3 if w / 3 >= b.ts * 6.5 else 2
+        step = w / count
+        for i, (field, icon, fmt) in enumerate(_WEATHER_DETAILS[:count]):
+            col_x = x + i * step
+            b.icon(f"{field}-icon", icon, col_x, row_y - b.ts * 0.25, b.ts * 1.3, b.c("text3"))
+            b.add("weather", field, field=field, format=fmt,
+                  **b._text_fields(b.ts * 1.1, row_y, "text_font", x=round(col_x + b.ts * 1.7),
+                                   color=b.c("text2"), max_width=round(step - b.ts * 2),
+                                   tabular=True))  # fmt: skip
+
+
+def _forecast(b: _Build, x: float, y: float, w: float, h: float, mode: str,
+              rows: bool = False, prefix: str = "f") -> None:  # fmt: skip
+    """Days (today first) or hours (every ``step`` hours) as columns, or as rows."""
+    step = max(1, min(6, b.module["step"] or 3))
+    limit = 7 if mode == "days" else 24 // step
+    if rows:
+        count = int(_clamp(h // (b.ts * 2.6), 1, limit))
+    else:
+        count = int(_clamp(w // max(b.ts * 5.0, h * 0.7), 1, limit))  # readable columns
+    slots = [i for i in range(count)] if mode == "days" else [step * (i + 1) for i in range(count)]
+    base = "weather.day" if mode == "days" else "weather.hour"
+    label = "name" if mode == "days" else "time"
+    for i, n in enumerate(slots):
+        key = f"{base}.{n}"
+        tag = f"{prefix}{i}"
+        first = len(b.out)
+        if rows:
+            row = h / count
+            mid = y + i * row + row / 2
+            size = min(row * 0.42, b.ts * 1.4)
+            b.value(f"{tag}-label", f"{key}.{label}", "{value}", x, mid - CAP * b.ts / 2, b.ts,
+                    color=b.c("text3"), width=w * 0.34, font="text_font", tabular=False,
+                    fallback="")  # fmt: skip
+            icon = min(row * 0.7, b.ts * 2.2)
+            b.icon(f"{tag}-icon", "weather", x + w * 0.36, mid - icon / 2, icon, b.tint("text"))
+            b.out[-1]["sensor"] = f"{key}.code"
+            first_temp = "high" if mode == "days" else "temperature"
+            b.value(f"{tag}-temp", f"{key}.{first_temp}", "{value:.0f}°", x + w,
+                    mid - CAP * size / 2, size, align="right", width=w * 0.3)  # fmt: skip
+        else:
+            col = w / count
+            cx = x + col * i + col / 2
+            label_size = min(b.ts, col * 0.2)
+            b.value(f"{tag}-label", f"{key}.{label}", "{value}", cx, y + h * 0.04, label_size,
+                    color=b.c("text3"), align="center", width=col * 0.92, font="text_font",
+                    tabular=False, fallback="")  # fmt: skip
+            icon = min(col * 0.52, h * 0.3)
+            icon_y = y + h * 0.04 + CAP * label_size + h * 0.08
+            b.icon(f"{tag}-icon", "weather", cx - icon / 2, icon_y, icon, b.tint("text"))
+            b.out[-1]["sensor"] = f"{key}.code"
+            size = min(col * 0.26, h * 0.16)
+            temp_top = icon_y + icon + h * 0.07
+            if mode == "days":
+                b.value(f"{tag}-high", f"{key}.high", "{value:.0f}°", cx - col * 0.04, temp_top,
+                        size, align="right", width=col * 0.46)  # fmt: skip
+                b.value(f"{tag}-low", f"{key}.low", "{value:.0f}°", cx + col * 0.04, temp_top, size,
+                        color=b.c("text3"), width=col * 0.46)  # fmt: skip
+            else:
+                b.value(f"{tag}-temp", f"{key}.temperature", "{value:.0f}°", cx, temp_top, size,
+                        align="center", width=col * 0.9)  # fmt: skip
+            rain_top = temp_top + CAP * size + h * 0.08
+            if rain_top + CAP * label_size <= y + h:  # room for the chance of rain
+                b.value(f"{tag}-rain", f"{key}.rain", "{value:.0f}%", cx, rain_top, label_size,
+                        color=b.tint("net"), align="center", width=col * 0.9, font="text_font",
+                        hide_if_missing=True)  # fmt: skip
+        for widget in b.out[first:]:
+            widget["needs"] = f"{key}.code"
+
+
+def build_outlook(b: _Build, _src: Source) -> None:
+    """The next days, today first, at most a week: each with its name, a symbol that moves,
+    the high and the low, and the chance of rain. Side by side in a long module, one under
+    the other in a tall or big one. While there is no weather a hint says where it is set."""
+    b.card()
+    icon = min(b.iw, b.ih) * 0.24
+    b.needs = "!weather.day.0.code"
+    b.icon("idle-icon", "partly", b.ix + (b.iw - icon) / 2, b.iy + b.ih / 2 - icon * 0.9, icon,
+           b.c("text3"))  # fmt: skip
+    hint = t("The days ahead show here once the weather is on: Settings, Weather and place")
+    first, colon, where = hint.partition(": ")  # where it is set on a line of its own
+    for n, line in enumerate((first + colon.strip(), where) if colon else (hint,)):
+        b.add("text", f"idle-{n}", x=round(b.ix + b.iw / 2), text=line, color=b.c("text3"),
+              align="center", max_width=round(b.iw * 0.92), fit="shrink", tabular=False,
+              **b._text_fields(b.ts, b.iy + b.ih / 2 + icon * 0.35 + n * b.ts * 1.6,
+                               "text_font"))  # fmt: skip
+    b.needs = ""
+    clouds = b.module.get("color") or b.c("text2")
+    rain = b.c("gpu")
+    rows = b.aspect <= 0.72 or (b.large and b.ih >= b.ts * 16 and b.aspect < 2.2)
+    if rows:
+        count = int(_clamp(b.ih // (b.ts * 2.4), 1, 7))
+    else:
+        count = int(_clamp(b.iw // max(b.ts * 4.6, b.ih * 0.36), 1, 7))
+    for i in range(count):
+        key = f"weather.day.{i}"
+        first = len(b.out)
+        if rows:
+            _outlook_row(b, i, key, count, clouds, rain)
+        else:
+            _outlook_column(b, i, key, count, clouds, rain)
+        for widget in b.out[first:]:  # a day only while it is known
+            own = widget.get("needs", "")
+            widget["needs"] = f"{key}.code,{own}" if own else f"{key}.code"
+
+
+def _outlook_row(b: _Build, i: int, key: str, count: int, clouds: str, rain: str) -> None:
+    """A day as a row: its name, its symbol, the chance of rain, the low and the high."""
+    row = b.ih / count
+    mid = b.iy + row * (i + 0.5)
+    size = min(row * 0.42, b.ts * 1.5, b.iw * 0.08)
+    name = min(b.ts * 1.15, row * 0.4)
+    if i:
+        b.add("rect", f"d{i}-rule", x=round(b.ix), y=round(b.iy + row * i), w=round(b.iw), h=1,
+              color=faded(b.c("line"), 0.7))  # fmt: skip
+    b.value(f"d{i}-name", f"{key}.name", "{value}", b.ix, mid - CAP * name / 2, name,
+            color=b.c("text2"), width=b.iw * 0.26, font="text_font", tabular=False,
+            fallback="")  # fmt: skip
+    edge = min(row * 1.15, b.iw * 0.16)
+    b.add("symbol", f"d{i}-symbol", x=round(b.ix + b.iw * 0.3 - edge / 2), y=round(mid - edge / 2),
+          size=max(8, round(edge)), sensor=f"{key}.code", color=clouds,
+          moving=b.module["moving"], offset=round(i * 1.7, 2))  # fmt: skip
+    small = min(b.ts, row * 0.36)
+    b.value(f"d{i}-rain", f"{key}.rain", "{value:.0f}%", b.ix + b.iw * 0.42,
+            mid - CAP * small / 2, small, color=rain, width=b.iw * 0.1, font="text_font",
+            hide_if_missing=True)  # fmt: skip
+    thick = max(2, round(b.ts * 0.3))
+    b.add(
+        "bar", f"d{i}-rain-bar", x=round(b.ix + b.iw * 0.53), y=round(mid - thick / 2),
+        w=max(4, round(b.iw * 0.14)), h=thick, sensor=f"{key}.rain", min=0, max=100, color=rain,
+        color2=None, background=b.c("track"), radius=thick // 2, hide_if_missing=True,
+    )  # fmt: skip
+    b.value(f"d{i}-low", f"{key}.low", "{value:.0f}°", b.ix + b.iw * 0.8, mid - CAP * size / 2,
+            size * 0.9, color=b.c("text3"), align="right", width=b.iw * 0.18)  # fmt: skip
+    b.value(f"d{i}-high", f"{key}.high", "{value:.0f}°", b.ix + b.iw, mid - CAP * size / 2,
+            size, align="right", width=b.iw * 0.18)  # fmt: skip
+
+
+def _outlook_column(b: _Build, i: int, key: str, count: int, clouds: str, rain: str) -> None:
+    """A day as a column: its name, its symbol, the high, the low, the chance of rain."""
+    col = b.iw / count
+    cx = b.ix + col * (i + 0.5)
+    name = min(b.ts * 1.1, col * 0.2)
+    b.value(f"d{i}-name", f"{key}.name", "{value}", cx, b.iy, name, color=b.c("text2"),
+            align="center", width=col * 0.92, font="text_font", tabular=False,
+            fallback="")  # fmt: skip
+    edge = min(col * 0.7, b.ih * 0.34)
+    top = b.iy + CAP * name + b.ih * 0.06
+    b.add("symbol", f"d{i}-symbol", x=round(cx - edge / 2), y=round(top), size=max(8, round(edge)),
+          sensor=f"{key}.code", color=clouds, moving=b.module["moving"],
+          offset=round(i * 1.7, 2))  # fmt: skip
+    size = min(col * 0.26, b.ih * 0.13)
+    top += edge + b.ih * 0.05
+    b.value(f"d{i}-high", f"{key}.high", "{value:.0f}°", cx, top, size, align="center",
+            width=col * 0.9)  # fmt: skip
+    top += CAP * size + b.ih * 0.05
+    low = size * 0.72
+    b.value(f"d{i}-low", f"{key}.low", "{value:.0f}°", cx, top, low, color=b.c("text3"),
+            align="center", width=col * 0.9)  # fmt: skip
+    top += CAP * low + b.ih * 0.07
+    small = min(b.ts * 0.95, col * 0.17)
+    if top + CAP * small + b.ih * 0.05 > b.iy + b.ih:  # no room for the chance of rain
+        return
+    b.value(f"d{i}-rain", f"{key}.rain", "{value:.0f}%", cx, top, small, color=rain,
+            align="center", width=col * 0.9, font="text_font", hide_if_missing=True)  # fmt: skip
+    thick = max(2, round(b.ts * 0.3))
+    track = top + CAP * small + b.ih * 0.04
+    if track + thick <= b.iy + b.ih:
+        b.add(
+            "bar", f"d{i}-rain-bar", x=round(cx - col * 0.3), y=round(track),
+            w=max(4, round(col * 0.6)), h=thick, sensor=f"{key}.rain", min=0, max=100,
+            color=rain, color2=None, background=b.c("track"), radius=thick // 2,
+            hide_if_missing=True,
+        )  # fmt: skip
+
+
+_WEATHER_DETAILS = (
+    ("apparent_temperature", "temperature", "{value:.0f}°"),
+    ("humidity", "humidity", "{value:.0f}%"),
+    ("wind_speed", "wind", "{value:.0f} km/h"),
+)
+
+
+def _weather_desc(b: _Build, x: float, top: float, w: float, size: float) -> None:
+    b.add("weather", "desc", field="description", format="{value}", fallback="",
+          **b._text_fields(size, top, "text_font", x=round(x), color=b.c("text2"),
+                           max_width=round(w), fit="ellipsis", tabular=False))  # fmt: skip
+
+
+def _temp_fields(b: _Build, x: float, cap_top: float, size: float, width: float,
+                 align: str = "left") -> dict[str, Any]:  # fmt: skip
+    return b._text_fields(size, cap_top, "display_font", x=round(x), color=b.c("text"),
+                          align=align, max_width=round(width), tabular=True)  # fmt: skip
+
+
+def build_system(b: _Build, _src: Source) -> None:
+    """The names of the processor and graphics card, and the uptime; with room for a fourth
+    row the memory's name too."""
+    b.card()
+    rows = (
+        ("cpu.name", "{value}", "CPU", "cpu"),
+        ("gpu.name", "{value}", "GPU", "gpu"),
+        ("sys.uptime", "{value:duration}", t("Uptime"), "accent"),
+    )
+    row_min = b.ts * 3.4
+    count = int(_clamp(b.ih // row_min, 1, 4))
+    if count == 4:  # the names together, then the uptime
+        rows = (*rows[:2], ("mem.name", "{value}", t("RAM"), "mem"), rows[2])
+    row = b.ih / count
+    for i, (sensor, fmt, text, role) in enumerate(rows[:count]):
+        top = b.iy + i * row + (row - (CAP * b.ts + b.ts * 0.7 + CAP * b.ts * 1.3)) / 2
+        b.label(f"r{i}-label", text, b.ix, top, b.ts, color=b.c(role), width=b.iw)
+        b.value(f"r{i}", sensor, fmt, b.ix, top + CAP * b.ts + b.ts * 0.7, b.ts * 1.3,
+                color=b.c("text"), width=b.iw, font="text_font", hide_if_missing=True,
+                fallback="", tabular=False, fit="ellipsis")  # fmt: skip
+
+
+# -- time and the sky ----------------------------------------------------------
+
+
+def build_sun(b: _Build, _src: Source) -> None:
+    """Sunrise and sunset under the day's arc; the moon's phase beside or below.
+
+    Without a place (``[weather]`` latitude and longitude) only the moon shows.
+    """
+    b.card()
+    a = b.aspect
+    start = len(b.out)
+    b.needs = "sun.rise"
+    if b.large and a < 1.6:
+        top = b.ih * 0.58
+        _sun(b, b.ix, b.iy, b.iw, top, details=True)
+        _moon(b, b.ix, b.iy + top + b.pad, b.iw, b.ih - top - b.pad, details=True)
+    elif a >= 1.45:
+        width = (b.iw - b.pad * 2) * 0.5
+        _sun(b, b.ix, b.iy, width, b.ih, details=b.large)
+        _moon(b, b.ix + width + b.pad * 2, b.iy, b.iw - width - b.pad * 2, b.ih,
+              details=b.large)  # fmt: skip
+    elif a <= 0.72 and b.ih > b.iw * 1.5:
+        top = b.ih * 0.55
+        _sun(b, b.ix, b.iy, b.iw, top)
+        _moon(b, b.ix, b.iy + top + b.pad, b.iw, b.ih - top - b.pad)
+    else:
+        _sun(b, b.ix, b.iy, b.iw, b.ih)
+    first = len(b.out)
+    b.needs = "!sun.rise"
+    _moon(b, b.ix, b.iy, b.iw, b.ih, details=b.large or a >= 1.45)
+    for widget in b.out[first:]:
+        widget["id"] = "only-" + widget["id"]
+    b.needs = ""
+    del start
+
+
+ARC_MIN = 16  # px: the sun's arc, at the least
+
+
+def _sun(b: _Build, x: float, y: float, w: float, h: float, details: bool = False) -> None:
+    color = b.tint("warn")
+    text_h = b.ts * (4.6 if details else 2.4)
+    d = max(0.0, min(w, (h - text_h) * 2))
+    if d < ARC_MIN:  # a box too low for the arc keeps the times
+        d = 0.0
+    cx = x + w / 2
+    base = y + d / 2  # the horizon: the arc's ends
+    if d:
+        b.add(
+            "gauge", "arc", x=round(cx - d / 2), y=round(y), w=round(d), h=round(d),
+            sensor="sun.progress", min=0, max=1, start_angle=180, end_angle=360,
+            thickness=max(3, round(d * 0.055)), color=b.deep(color), color2=color,
+            background=b.c("track"), cap="round", glow=round(0.45 * b.glow, 2),
+            glow_radius=max(2, round(d * 0.04)), smooth=True,
+        )  # fmt: skip
+        icon = d * 0.26
+        b.icon("sun-icon", "sun", cx - icon / 2, base - icon - d * 0.04, icon, color)
+        b.out[-1]["needs"] = "sun.progress"
+        b.icon("night-icon", "moon", cx - icon / 2, base - icon - d * 0.04, icon, b.c("text2"))
+        b.out[-1]["needs"] = "sun.rise,!sun.progress"  # night where the sun's times are known
+    size = b.ts * 1.3
+    cap = base + b.ts * 0.7
+    mark = b.ts * 1.5
+    # the times under the arc's ends (not further out than a little)
+    left = max(x, cx - d / 2 - mark * 0.6)
+    right = min(x + w, cx + d / 2 + mark * 0.6)
+    needed = 2 * (mark * 1.2 + size * 2.7) + b.ts
+    if right - left < needed:  # a small arc: the times use the whole width
+        left, right = x, x + w
+        size = min(size, max(7.0, (w - b.ts - 2 * mark * 1.2) / 5.4))
+    half = (right - left) / 2
+    b.icon("rise-icon", "sunrise", left, cap + CAP * size / 2 - mark / 2, mark, b.c("text3"))
+    b.value("rise", "sun.rise", "{value}", left + mark * 1.2, cap, size, width=half - mark * 1.2)
+    b.icon("set-icon", "sunset", right - mark, cap + CAP * size / 2 - mark / 2, mark,
+           b.c("text3"))  # fmt: skip
+    b.value("set", "sun.set", "{value}", right - mark * 1.2, cap, size, align="right",
+            width=half - mark * 1.2)  # fmt: skip
+    if details:
+        line = cap + CAP * size + b.ts * 1.3
+        b.label("daylight-label", t("Daylight"), left, line, b.ts * 0.9, width=half)
+        b.value("daylight", "sun.daylight", "{value:duration}", right, line - b.ts * 0.05,
+                b.ts * 1.05, align="right", width=half, font="text_font",
+                color=b.c("text2"))  # fmt: skip
+
+
+def build_moon(b: _Build, _src: Source) -> None:
+    """The moon as it is lit tonight, large: its phase, how much of it is lit, and the days
+    until the next full moon and new moon. It needs no place."""
+    b.card()
+    _moon(b, b.ix, b.iy, b.iw, b.ih, details=True, more=True)
+
+
+def _moon(b: _Build, x: float, y: float, w: float, h: float, details: bool = False,
+          more: bool = False) -> None:  # fmt: skip
+    beside = w / max(1, h) >= 1.2 and w >= b.ts * 14
+    lines = [("name", "moon.name", "{value}", 1.25, "text"),
+             ("lit", "moon.illumination", t("{value:.0f}% lit"), 1.0, "text2")]  # fmt: skip
+    if details:
+        lines.append(("full", "moon.full_in", t("Full moon in {value:.0f} days"), 0.95, "text3"))
+    if more:
+        lines.append(("new", "moon.new_in", t("New moon in {value:.0f} days"), 0.95, "text3"))
+    block = sum(CAP * b.ts * scale for *_rest, scale, _c in lines) + b.ts * 0.9 * (len(lines) - 1)
+    if beside:
+        disc = min(h * 0.82, w * 0.38)
+        dx, dy = x, y + (h - disc) / 2
+        tx, align, width = x + disc + b.pad * 1.2, "left", w - disc - b.pad * 1.2
+        top = y + (h - block) / 2
+    else:
+        disc = min(w * 0.5, h * 0.55, h - block - b.ts * 1.2)
+        dx, dy = x + (w - disc) / 2, y + (h - disc - block - b.ts * 1.2) / 2
+        tx, align, width = x + w / 2, "center", w
+        top = dy + disc + b.ts * 1.2
+    if disc < 8:
+        return
+    b.add("moon", "moon", x=round(dx), y=round(dy), size=round(disc), sensor="moon.phase",
+          color=b.c("text"), color2=mix(b.c("track"), b.c("text3"), 0.22),
+          glow=round(0.25 * b.glow, 2),
+          glow_radius=max(2, round(disc * 0.08)))  # fmt: skip
+    for name, key, fmt, scale, role in lines:
+        size = b.ts * scale
+        b.value(name, key, fmt, tx, top, size, color=b.c(role), align=align, width=width,
+                font="text_font", tabular=False, fallback="", fit="ellipsis",
+                hide_if_missing=True)  # fmt: skip
+        top += CAP * size + b.ts * 0.9
+
+
+EARTH_SPIN_S = 180  # seconds for a turn of a module's globe, where it moves
+
+
+def build_earth(b: _Build, _src: Source) -> None:
+    """The earth as it is now: a globe lit by the sun where it stands, the cities' lights on
+    its night side, your place marked; beside or under it whether it is day or night there,
+    the sunrise and sunset and how long the day is. It turns slowly where the panel moves
+    (``moving``), and faces your place where it does not. Without a place (``[weather]``
+    latitude and longitude) the globe faces your time zone and stands alone."""
+    b.card()
+    start = len(b.out)
+    b.needs = "sun.up"  # (the sun's readings: there is a place)
+    _earth(b, b.ix, b.iy, b.iw, b.ih, details=True)
+    lone = len(b.out)
+    b.needs = "!sun.up"
+    _earth(b, b.ix, b.iy, b.iw, b.ih, details=False)
+    for widget in b.out[lone:]:
+        widget["id"] = "only-" + widget["id"]
+    b.needs = ""
+    del start
+
+
+def _earth(b: _Build, x: float, y: float, w: float, h: float, details: bool) -> None:
+    lines: list[tuple[str, str, str, float, str]] = []
+    if details:
+        lines = [
+            ("rise", "sun.rise", t("Sunrise {value}"), 1.0, "text2"),
+            ("set", "sun.set", t("Sunset {value}"), 1.0, "text2"),
+            ("daylight", "sun.daylight", t("Day length {value:duration}"), 0.95, "text3"),
+        ]
+    head = b.ts * 1.6 if details else 0.0
+    block = head + sum(CAP * b.ts * scale + b.ts * 0.9 for *_rest, scale, _c in lines)
+    beside = details and w / max(1, h) >= 1.2 and w >= b.ts * 14
+    if not details:
+        size = min(w, h)
+        gx, gy = x + (w - size) / 2, y + (h - size) / 2
+    elif beside:  # the globe as large as the lines beside it leave room for
+        size = min(h, w - b.ts * 12, w * 0.7)
+        gx, gy = x, y + (h - size) / 2
+        tx, align, width = x + size + b.pad * 0.6, "left", w - size - b.pad * 0.6
+        top = y + (h - block) / 2
+    else:
+        size = min(w, h - block - b.ts)
+        gx, gy = x + (w - size) / 2, y + (h - size - block - b.ts) / 2
+        tx, align, width = x + w / 2, "center", w
+        top = gy + size + b.ts
+    if size < 16:
+        return
+    b.add("earth", "earth", x=round(gx), y=round(gy), size=round(size),
+          spin=EARTH_SPIN_S if b.module["moving"] else 0, color2=b.tint("accent"))  # fmt: skip
+    if not details:
+        return
+    big = b.ts * 1.6
+    words = (("day", t("Daytime"), "sun.up=1"), ("night", t("Night-time"), "sun.up=0"))
+    for name, word, need in words:
+        fields = b._text_fields(big, top, "display_font")
+        b.add("text", name, x=round(tx), text=word, color=b.c("text"), align=align,
+              max_width=round(width), tabular=False, needs=need, **fields)  # fmt: skip
+    top += CAP * big + b.ts * 1.0
+    for name, key, fmt, scale, role in lines:
+        size_ = b.ts * scale
+        b.value(name, key, fmt, tx, top, size_, color=b.c(role), align=align, width=width,
+                font="text_font", tabular=False, fallback="", fit="ellipsis",
+                hide_if_missing=True)  # fmt: skip
+        top += CAP * size_ + b.ts * 0.9
+
+
+def _face(b: _Build, name: str, x: float, y: float, d: float, zone: str = "") -> None:
+    b.add(
+        "analog", name, x=round(x), y=round(y), w=round(d), h=round(d), timezone=zone,
+        color=b.c("text"), color2=b.c("accent") if not b.module.get("color") else b.tint("accent"),
+        face=mix(b.c("surface"), b.c("track"), 0.7) if b.card_on else b.c("surface"),
+        marks=b.c("text3"), seconds=d >= 90, hand="glide",
+        glow=round(0.15 * b.glow, 2), glow_radius=max(2, round(d * 0.03)),
+    )  # fmt: skip
+
+
+def build_analog(b: _Build, _src: Source) -> None:
+    """A clock face; the time and the date beside or under it when there is room."""
+    b.card()
+    zone = b.module["timezone"]
+    a = b.aspect
+    if a >= 1.6:  # face | time and date
+        d = b.ih
+        _face(b, "face", b.ix, b.iy, d, zone)
+        x = b.ix + d + b.pad * 1.6
+        w = b.ix + b.iw - x
+        size = min(b.ih * 0.3, w / 3.0)
+        date_size = max(8, size * 0.32)
+        block = CAP * size + date_size * 1.2 + CAP * date_size
+        top = b.iy + (b.ih - block) / 2
+        b.clock("time", "%H:%M", x, top, size, width=w, timezone=zone)
+        fmt = "%A · %d %B" if w > size * 4.2 else "%a %d %b"
+        b.clock("date", fmt, x, top + CAP * size + date_size * 1.2, date_size,
+                color=b.c("text2"), width=w, font="text_font", tabular=False,
+                timezone=zone)  # fmt: skip
+        if b.module["title"]:
+            b.label("title", b.module["title"], x, top - b.ts * 1.6, b.ts, width=w)
+        return
+    tall = a <= 0.72 and b.ih > b.iw * 1.3
+    label = b.module["title"]
+    room = b.ts * 2.4 if (tall or label) else 0
+    d = min(b.iw, b.ih - room)
+    x, y = b.ix + (b.iw - d) / 2, b.iy + (b.ih - d - room) / 2
+    _face(b, "face", x, y, d, zone)
+    if tall and not label:
+        b.clock("date", "%a %d %b", b.ix + b.iw / 2, y + d + b.ts * 1.0, b.ts * 1.2,
+                color=b.c("text2"), align="center", width=b.iw, font="text_font",
+                tabular=False, timezone=zone)  # fmt: skip
+    elif label:
+        b.label("title", label, b.ix + b.iw / 2, y + d + b.ts * 1.0, b.ts, align="center",
+                width=b.iw)  # fmt: skip
+
+
+def _cities(b: _Build) -> list[tuple[str, str]]:
+    found = []
+    for line in (b.module["items"] or default_items("world")).splitlines():
+        zone, _, name = line.partition("=")
+        zone = zone.strip()
+        if not zone or zone.startswith("#") or timezones.zone(zone) is None:
+            continue
+        found.append((zone, name.strip() or zone.rsplit("/", 1)[-1].replace("_", " ")))
+    return found
+
+
+def build_world(b: _Build, _src: Source) -> None:
+    """The time in other places: rows of cities, clock faces when big."""
+    b.card()
+    cities = _cities(b)
+    if not cities:
+        b.label("none", t("Add places in the settings"), b.ix + b.iw / 2,
+                b.iy + b.ih / 2 - CAP * b.ts / 2, b.ts, align="center", width=b.iw)  # fmt: skip
+        return
+    top = 0.0
+    if b.module["title"]:
+        top = b.head("globe", b.module["title"], b.tint("accent"))
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    if b.large and h > b.ts * 9:  # faces in a grid
+        n = len(cities)
+        best = (0.0, 1)
+        for columns in range(1, n + 1):
+            lines = -(-n // columns)
+            cell_w = (w - (columns - 1) * b.pad) / columns
+            cell_h = (h - (lines - 1) * b.pad) / lines
+            size = min(cell_w, cell_h - b.ts * 3.2)
+            if size > best[0]:
+                best = (size, columns)
+        d, columns = best
+        d *= 0.92
+        lines = -(-n // columns)
+        cell_w = (w - (columns - 1) * b.pad) / columns
+        cell_h = (h - (lines - 1) * b.pad) / lines
+        for i, (zone, name) in enumerate(cities):
+            row, col = divmod(i, columns)
+            cx = x + col * (cell_w + b.pad) + cell_w / 2
+            cy = y + row * (cell_h + b.pad) + (cell_h - d - b.ts * 3.2) / 2
+            _face(b, f"c{i}-face", cx - d / 2, cy, d, zone)
+            b.label(f"c{i}-name", name, cx, cy + d + b.ts * 0.8, b.ts * 0.95, align="center",
+                    width=cell_w)  # fmt: skip
+            b.clock(f"c{i}-time", "%a %H:%M", cx, cy + d + b.ts * 2.2, b.ts, color=b.c("text3"),
+                    align="center", width=cell_w, font="text_font", timezone=zone)  # fmt: skip
+        return
+    n = len(cities)
+    best: tuple[float, int] = (1e9, 1)
+    for columns in range(1, n + 1):  # cells close to 3.5:1, the shape of a row
+        lines = -(-n // columns)
+        cell_w, cell_h = w / columns, h / lines
+        if cell_h < b.ts * 2.2 and columns < n:
+            continue
+        score = abs(math.log(max(1e-3, cell_w / max(1.0, cell_h)) / 3.5))
+        if score < best[0]:
+            best = (score, columns)
+    columns = best[1]
+    lines = -(-n // columns)
+    gap = b.pad * 1.5
+    cell_w = (w - (columns - 1) * gap) / columns
+    cell_h = h / lines
+    stacked = cell_h >= b.ts * 4.6 and cell_w < b.ts * 16
+    for i, (zone, name) in enumerate(cities):
+        line, col = divmod(i, columns)
+        cx = x + col * (cell_w + gap)
+        cy = y + line * cell_h
+        if stacked:  # name, time, weekday, centred
+            size = min(cell_h * 0.32, cell_w * 0.3)
+            block = CAP * b.ts + b.ts * 0.9 + CAP * size + b.ts * 0.8 + CAP * b.ts * 0.9
+            top = cy + (cell_h - block) / 2
+            mid = cx + cell_w / 2
+            b.label(f"c{i}-name", name, mid, top, b.ts, color=b.c("text2"), align="center",
+                    width=cell_w)  # fmt: skip
+            top += CAP * b.ts + b.ts * 0.9
+            b.clock(f"c{i}-time", "%H:%M", mid, top, size, align="center", width=cell_w,
+                    timezone=zone)  # fmt: skip
+            b.clock(f"c{i}-day", "%a", mid, top + CAP * size + b.ts * 0.8, b.ts * 0.9,
+                    color=b.c("text3"), align="center", width=cell_w, font="text_font",
+                    tabular=False, timezone=zone)  # fmt: skip
+            continue
+        mid = cy + cell_h / 2
+        size = min(cell_h * 0.5, b.ts * 2.2, cell_w * 0.16)
+        day = cell_h >= b.ts * 3.4
+        name_top = mid - (CAP * b.ts + (b.ts * 0.8 + CAP * b.ts * 0.9 if day else 0)) / 2
+        b.label(f"c{i}-name", name, cx, name_top, b.ts, color=b.c("text2"),
+                width=cell_w * 0.55)  # fmt: skip
+        if day:
+            b.clock(f"c{i}-day", "%a", cx, name_top + CAP * b.ts + b.ts * 0.8, b.ts * 0.9,
+                    color=b.c("text3"), width=cell_w * 0.5, font="text_font",
+                    tabular=False, timezone=zone)  # fmt: skip
+        b.clock(f"c{i}-time", "%H:%M", cx + cell_w, mid - CAP * size / 2, size, align="right",
+                width=cell_w * 0.45, timezone=zone)  # fmt: skip
+
+
+def build_countdown(b: _Build, _src: Source) -> None:
+    """The days (or hours) left until a day you choose; every year with "12-24"."""
+    from libre_panel.render.countdown import parse_target
+
+    b.card()
+    target = b.module["target"] or "01-01"
+    parsed = parse_target(target)
+    timed = parsed is not None and parsed[3] is not None
+    color = b.tint("accent")
+    title = b.module["title"] or (t("New Year") if not b.module["target"] else t("Countdown"))
+    top = b.head("hourglass", title, color)
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    fields = {"target": target}
+    wide = w / max(1, h) >= 2.2
+    number_w = w * (0.45 if wide else 1.0)
+    size = min(h * (0.5 if not b.large else 0.42), number_w * 0.42)
+    unit = b.ts * 1.1
+    block = CAP * size + b.ts * 0.9 + CAP * unit
+    cap = y + (h - block) / 2 if wide or not b.large else y + h * 0.08
+    b.add("countdown", "number", part="number", **fields,
+          **b._text_fields(size, cap, "display_font", x=round(x), color=b.c("text"),
+                           max_width=round(number_w), tabular=True, glow=round(0.3 * b.glow, 2),
+                           glow_radius=max(2, round(size / 14))))  # fmt: skip
+    b.add("countdown", "unit", part="unit", **fields,
+          **b._text_fields(unit, cap + CAP * size + b.ts * 0.9, "text_font", x=round(x),
+                           color=color, max_width=round(number_w), tabular=False))  # fmt: skip
+    rest_x, rest_y, rest_w = x, cap + block + b.ts * 1.6, w
+    if wide:
+        rest_x, rest_w = x + w * 0.5, w * 0.5
+        rest_y = y + (h - (CAP * b.ts * 1.3 + (b.ts * 1.8 if timed else 0))) / 2
+    lines = []
+    if timed:
+        lines.append(("clock", b.ts * 1.3, b.c("text2"), "display_font"))
+    if wide or b.large:
+        lines.append(("date", b.ts, b.c("text3"), "text_font"))
+    for part, line_size, line_color, font in lines:
+        if rest_y + CAP * line_size > b.iy + b.ih:
+            break
+        b.add("countdown", part, part=part, **fields,
+              **b._text_fields(line_size, rest_y, font, x=round(rest_x), color=line_color,
+                               max_width=round(rest_w), tabular=part == "clock",
+                               fit="ellipsis"))  # fmt: skip
+        rest_y += CAP * line_size + b.ts * 1.0
+
+
+def build_image(b: _Build, _src: Source) -> None:
+    """A picture, or several in turn (``items``: one per line, "photos/*.jpg" a folder)."""
+    b.card()
+    pictures = [line.strip() for line in b.module["items"].splitlines() if line.strip()]
+    radius = round(b.style["radius"] * b.frame_u / 200) if b.style["card"] != "none" else 0
+    if not pictures:
+        see = float(b.style.get("card_opacity", 1.0))
+        b.add("rect", "frame", x=b.x, y=b.y, w=b.w, h=b.h, color=faded(b.c("surface"), see),
+              outline=b.c("line"), radius=radius)  # fmt: skip
+        icon = min(b.w, b.h) * 0.28
+        b.icon("icon", "image", b.x + (b.w - icon) / 2, b.y + b.h / 2 - icon * 0.75, icon,
+               b.c("text3"))  # fmt: skip
+        b.label("hint", t("Add pictures in the settings"), b.x + b.w / 2,
+                b.y + b.h / 2 + icon * 0.45, b.ts * 0.9, align="center",
+                width=b.w * 0.9)  # fmt: skip
+        return
+    b.add("image", "picture", x=b.x, y=b.y, w=b.w, h=b.h, src="", slides="\n".join(pictures),
+          seconds=max(1, b.module["seconds"]), speed=b.module["speed"], fit="cover",
+          radius=radius)  # fmt: skip
+    if b.module["title"]:
+        shade = round(b.h * 0.4)
+        b.add("rect", "shade", x=b.x, y=b.y + b.h - shade, w=b.w, h=shade, color="#00000000",
+              color2=faded(b.c("bg2"), 0.8), radius=radius)  # fmt: skip
+        b.label("title", b.module["title"], b.x + b.pad * 2, b.y + b.h - b.pad * 2 - CAP * b.ts,
+                b.ts * 1.05, color=b.c("text"), width=b.w - b.pad * 4)  # fmt: skip
+
+
+# -- music and the calendar ----------------------------------------------------
+
+
+def build_music(b: _Build, _src: Source) -> None:
+    """What is playing: the cover, title, artist and how far it is."""
+    b.card()
+    color = b.tint("accent")
+    a = b.aspect
+    b.needs = "media.title"
+    if a >= 1.45:  # cover | words
+        d = b.ih
+        _cover(b, b.ix, b.iy, d)
+        _song(b, b.ix + d + b.pad * 1.4, b.iy, b.iw - d - b.pad * 1.4, b.ih, color)
+    elif (a <= 0.72 or b.large) and b.ih > b.ts * 12:  # cover over words
+        d = min(b.iw, b.ih * 0.55)
+        _cover(b, b.ix + (b.iw - d) / 2, b.iy, d)
+        _song(b, b.ix, b.iy + d + b.pad, b.iw, b.ih - d - b.pad, color)
+    else:
+        b.icon("icon", "music", b.ix, b.iy - b.ts * 0.1, b.ts * 1.5, color)
+        _song(b, b.ix, b.iy + b.ts * 2.2, b.iw, b.ih - b.ts * 2.2, color, state=False)
+    b.needs = "!media.title"
+    icon = min(b.iw, b.ih) * 0.3
+    b.icon("idle-icon", "music", b.ix + (b.iw - icon) / 2, b.iy + b.ih / 2 - icon * 0.8, icon,
+           b.c("text3"))  # fmt: skip
+    b.label("idle", t("Nothing playing"), b.ix + b.iw / 2, b.iy + b.ih / 2 + icon * 0.45, b.ts,
+            align="center", width=b.iw)  # fmt: skip
+    b.needs = ""
+
+
+def build_volume(b: _Build, _src: Source) -> None:
+    """The volume: a speaker, the level in percent, and levels that rise as on a mixer (as
+    the volume's message shows them); muted, a crossed speaker and the word. Upright in a
+    tall module."""
+    b.card()
+    color = b.tint("accent")
+    tall = b.aspect <= 0.72
+    if tall:
+        size = min(b.iw * 0.34, b.ih * 0.12)
+        icon = size * 0.9
+        cx = b.ix + b.iw / 2
+        b.icon("icon", "volume", cx - icon / 2, b.iy, icon, b.c("text2"))
+        b.out[-1]["needs"] = "audio.muted!=1"
+        b.icon("muted-icon", "mute", cx - icon / 2, b.iy, icon, b.c("crit"))
+        b.out[-1]["needs"] = "audio.muted=1"
+        top = b.iy + icon + b.ts * 0.9
+        b.value("value", "audio.volume", "{value:.0f}%", cx, top, size, align="center",
+                width=b.iw, needs="audio.muted!=1")  # fmt: skip
+        b.label("muted", t("Muted"), cx, top + CAP * (size - b.ts) / 2, b.ts, color=b.c("crit"),
+                align="center", width=b.iw)  # fmt: skip
+        b.out[-1]["needs"] = "audio.muted=1"
+        top += CAP * size + b.ts * 1.2
+        _levels(b, b.ix + b.iw * 0.2, top, b.iw * 0.6, b.iy + b.ih - top, color, upright=True)
+        return
+    size = min(b.ih * 0.26, b.iw * 0.09)
+    label = max(8, min(size * 0.42, b.ts * 1.4))
+    icon = size * 0.86
+    cap = b.iy
+    b.icon("icon", "volume", b.ix, cap + CAP * size / 2 - icon / 2, icon, b.c("text2"))
+    b.out[-1]["needs"] = "audio.muted!=1"
+    b.icon("muted-icon", "mute", b.ix, cap + CAP * size / 2 - icon / 2, icon, b.c("crit"))
+    b.out[-1]["needs"] = "audio.muted=1"
+    title = b.module["title"] or t("Volume")
+    unit = label * 1.15
+    unit_w = _width_per_size(b.style["text_font"], "%") * unit
+    room = b.iw - icon * 1.4 - _width_per_size(b.style["display_font"], "100") * size - unit_w
+    b.label("title", title, b.ix + icon * 1.4, cap + CAP * (size - label) / 2, label,
+            width=max(8, room - b.ts))  # fmt: skip
+    right = b.ix + b.iw
+    b.value("value", "audio.volume", "{value:.0f}", right - unit_w - size * 0.08, cap, size,
+            align="right", needs="audio.muted!=1")  # fmt: skip
+    b.add("text", "unit", x=round(right), text="%", color=b.c("text3"), align="right",
+          tabular=False, needs="audio.muted!=1",
+          **b._text_fields(unit, cap + CAP * (size - unit), "text_font"))  # fmt: skip
+    b.label("muted", t("Muted"), right, cap + CAP * (size - label) / 2, label, color=b.c("crit"),
+            align="right", width=max(8, room))  # fmt: skip
+    b.out[-1]["needs"] = "audio.muted=1"
+    top = cap + CAP * size + max(b.ts * 0.9, b.ih * 0.12)
+    _levels(b, b.ix, top, b.iw, b.iy + b.ih - top, color)
+
+
+def _levels(b: _Build, x: float, y: float, w: float, h: float, color: str,
+            upright: bool = False) -> None:  # fmt: skip
+    """The volume as levels: segments rising from a fifth to all of the bar's thickness
+    (upright: plain segments up a column)."""
+    if w < 8 or h < 4:
+        return
+    length = h if upright else w
+    across = w if upright else h
+    count = int(_clamp(length / max(5.0, across * 0.3 if not upright else across * 0.16), 8, 40))
+    gap = max(1, round(length / count * 0.3))
+    b.add(
+        "bar", "levels", x=round(x), y=round(y), w=max(4, round(w)), h=max(4, round(h)),
+        sensor="audio.volume", min=0, max=100, color=b.deep(color), color2=color,
+        background=b.c("track"), radius=max(1, round(min(length / count, across) * 0.12)),
+        direction="up" if upright else "right", segments=count, segment_gap=gap,
+        rising=0 if upright else 0.2, glow=round(0.5 * b.glow, 2),
+        glow_radius=max(2, round(across * 0.12)), finish="flat", needs="audio.volume",
+    )  # fmt: skip
+
+
+def _cover(b: _Build, x: float, y: float, d: float) -> None:
+    radius = round(b.style["radius"] * d / 200)
+    b.add("rect", "cover-frame", x=round(x), y=round(y), w=round(d), h=round(d),
+          color=mix(b.c("track"), b.c("surface"), 0.3), radius=radius)  # fmt: skip
+    icon = d * 0.36
+    b.icon("cover-icon", "music", x + (d - icon) / 2, y + (d - icon) / 2, icon, b.c("text3"))
+    b.add("image", "cover", x=round(x), y=round(y), w=round(d), h=round(d), src="@media.cover",
+          fit="cover", radius=radius)  # fmt: skip
+
+
+def end_time(b: _Build) -> tuple[str, str]:
+    """What the time at the right of a track's progress shows: its length, or (``time``
+    ``remaining``) what is left of it with a minus in front, as a player counts down."""
+    if b.module.get("time") == "remaining":
+        return "media.remaining", "-{value:clock}"
+    return "media.duration", "{value:clock}"
+
+
+def _song(b: _Build, x: float, y: float, w: float, h: float, color: str,
+          state: bool = True) -> None:  # fmt: skip
+    """Title, artist (album) and the progress, filling the height."""
+    title = min(b.ts * 1.9, h * 0.2, w * 0.12)
+    small = b.ts * 1.05
+    lines = [("title", "media.title", title, "text", "display_font"),
+             ("artist", "media.artist", small * 1.15, "text2", "text_font")]  # fmt: skip
+    if h > b.ts * 11:
+        lines.append(("album", "media.album", small, "text3", "text_font"))
+    bar_block = b.ts * 3.2 if h > b.ts * 6 else 0
+
+    def needed() -> float:
+        words = sum(CAP * size + b.ts * 0.9 for *_n, size, _c, _f in lines)
+        return words + bar_block + (CAP * b.ts + b.ts * 1.0 if state else 0)
+
+    if needed() > h and len(lines) > 2:
+        lines.pop()  # the album goes first
+    if needed() > h:
+        state = False
+    block = needed()
+    top = y + max(0.0, (h - block) / 2)
+    if state:
+        b.value("state", "media.state", "{value}", x, top, b.ts, color=color, width=w,
+                font="text_font", tabular=False, fallback="", hide_if_missing=True)  # fmt: skip
+        top += CAP * b.ts + b.ts * 1.0
+    for name, key, size, role, font in lines:
+        b.value(name, key, "{value}", x, top, size, color=b.c(role), width=w, font=font,
+                tabular=False, fallback="", fit="ellipsis", hide_if_missing=True)  # fmt: skip
+        top += CAP * size + b.ts * 0.9
+    if bar_block:
+        top += b.ts * 0.4
+        b.bar("progress", "media.progress", x, top, w, max(3, b.ts * 0.32), color, 0, 1)
+        b.out[-1]["hide_if_missing"] = True
+        times = top + b.ts * 0.9
+        b.value("position", "media.position", "{value:clock}", x, times, b.ts * 0.95,
+                color=b.c("text3"), width=w / 2, hide_if_missing=True)  # fmt: skip
+        sensor, fmt = end_time(b)
+        b.value("length", sensor, fmt, x + w, times, b.ts * 0.95, color=b.c("text3"),
+                align="right", width=w / 2, hide_if_missing=True)  # fmt: skip
+
+
+def build_agenda(b: _Build, _src: Source) -> None:
+    """The next events of your calendars (``[sensors.calendar]``)."""
+    b.card()
+    color = b.tint("accent")
+    top = b.head("calendar", b.module["title"] or t("Agenda"), color)
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    stacked = w < b.ts * 24  # the time above the title, else beside it
+    columns = 2 if not stacked and w > b.ts * 50 else 1
+    gap = b.pad * 2
+    column_w = (w - (columns - 1) * gap) / columns
+    row = b.ts * (3.4 if stacked else 2.3)
+    per_column = int(_clamp(h // row, 1, 12))
+    when_w = 0 if stacked else min(column_w * 0.36, b.ts * 11)
+    for i in range(per_column * columns):
+        key = f"calendar.{i + 1}"
+        col, line = divmod(i, per_column)
+        cx, cy = x + col * (column_w + gap), y + line * row
+        first = len(b.out)
+        mark = {"y": round(cy + b.ts * 0.15), "w": max(2, round(b.ts * 0.2)),
+                "h": round(row - b.ts * 0.9), "radius": max(1, round(b.ts * 0.1))}  # fmt: skip
+        b.add("rect", f"e{i}-mark", x=round(cx), color=b.c("line"), **mark)
+        b.add("rect", f"e{i}-now", x=round(cx), color=color, **mark)
+        b.out[-1]["needs"] = f"{key}.now"  # the one going on is marked
+        inset = b.ts * 0.8
+        if stacked:
+            b.value(f"e{i}-when", f"{key}.when", "{value}", cx + inset, cy + b.ts * 0.2,
+                    b.ts * 0.95, color=b.c("text3"), width=column_w - inset, font="text_font",
+                    tabular=False, fallback="", fit="ellipsis")  # fmt: skip
+            b.value(f"e{i}-title", f"{key}.title", "{value}", cx + inset, cy + b.ts * 1.55,
+                    b.ts * 1.25, color=b.c("text"), width=column_w - inset, font="text_font",
+                    tabular=False, fallback="", fit="ellipsis")  # fmt: skip
+        else:
+            mid = cy + row / 2 - b.ts * 0.45
+            b.value(f"e{i}-when", f"{key}.when", "{value}", cx + inset,
+                    mid - CAP * b.ts * 0.5 / 2, b.ts * 0.95, color=b.c("text3"),
+                    width=when_w - inset, font="text_font", tabular=False, fallback="",
+                    fit="ellipsis")  # fmt: skip
+            b.value(f"e{i}-title", f"{key}.title", "{value}", cx + when_w,
+                    mid - CAP * b.ts * 0.1, b.ts * 1.2, color=b.c("text"),
+                    width=column_w - when_w, font="text_font", tabular=False, fallback="",
+                    fit="ellipsis")  # fmt: skip
+        for widget in b.out[first:]:
+            own = widget.get("needs", "")
+            widget["needs"] = f"{key}.title,{own}" if own else f"{key}.title"
+    mid_y = y + h / 2 - CAP * b.ts / 2
+    b.label("none", t("No upcoming events"), x + w / 2, mid_y, b.ts, align="center", width=w)
+    b.out[-1]["needs"] = "calendar.events,!calendar.1.title"
+    b.label("setup", t("No calendar set up"), x + w / 2, mid_y, b.ts, align="center", width=w)
+    b.out[-1]["needs"] = "!calendar.events"
+
+
+def _played(b: _Build, right: float) -> float:
+    """How long the game has been played (the game service's ``game.time``: 1:07:32), its name
+    before it, on the line of the clock and as small, ending at ``right``; where the line has
+    room for it beside the game's name or logo. How much of the line it takes (0: none: then
+    it is one of the readings beside the number)."""
+    said = t("Played")
+    label = b.ts * 0.8
+    spacing = max(1, round(label * 0.14))
+    label_w = _width_per_size(b.style["text_font"], said.upper()) * label + spacing * len(said)
+    slot = _width_per_size(b.style["text_font"], "0:00:00") * b.ts * 1.05  # (a long round's)
+    taken = label_w + b.ts * 0.45 + slot + b.ts * 1.2
+    clock_w = _width_per_size(b.style["text_font"], "00:00") * b.ts * 1.05
+    if b.iw - b.ts * 3.1 - clock_w - taken < b.ts * 8:  # (the game's name, or logo, keeps room)
+        return 0.0
+    kept, b.needs = b.needs, "game.time"
+    x = right - slot
+    b.label("played-label", said, x - b.ts * 0.45, b.iy + b.ts * 0.15 + CAP * b.ts * 0.25, label,
+            align="right", width=label_w + b.ts)  # fmt: skip
+    b.value("played", "game.time", "{value:clock}", x, b.iy + b.ts * 0.15, b.ts * 1.05,
+            color=b.c("text2"), width=slot * 1.1, font="text_font", hide_if_missing=True,
+            smooth=False)  # fmt: skip
+    b.needs = kept
+    return taken
+
+
+def build_game(b: _Build, _src: Source) -> None:
+    """Frames per second of the game being played (``[sensors.presentmon]``)."""
+    b.card()
+    color = b.tint("gpu")
+    a = b.aspect
+    # the time, small and dim in the corner: a glance between rounds, not a second screen
+    # (where the card has room for it beside the game's name)
+    clock_w = _width_per_size(b.style["text_font"], "00:00") * b.ts * 1.05
+    played = 0.0  # (how much of the line the time played takes)
+    if b.iw >= b.ts * 14:
+        b.clock("clock", "%H:%M", b.ix + b.iw, b.iy + b.ts * 0.15, b.ts * 1.05,
+                color=b.c("text3"), align="right", width=clock_w, font="text_font")  # fmt: skip
+        played = _played(b, b.ix + b.iw - clock_w - b.ts * 1.2)
+        clock_w += played
+    else:
+        clock_w = -b.ts  # the name has the whole line
+    title = b.module["title"]
+    title_w = b.iw - b.ts * 2.1 - clock_w - b.ts
+    top = b.ts * 2.4
+    # the game's logo (game mode's, from Steam's cache) in place of its name where the line has
+    # room for one; the name where there is none
+    logo = not title and title_w >= b.ts * 8
+    b.needs = "game.fps,!@game.logo" if logo else "game.fps"
+    b.icon("icon", "gamepad", b.ix, b.iy - b.ts * 0.1, b.ts * 1.5, color)
+    if title:
+        b.label("title", title, b.ix + b.ts * 2.1, b.iy + b.ts * 0.15, b.ts * 1.05, color=color,
+                width=title_w)  # fmt: skip
+    else:
+        b.value("title", "game.app", "{value}", b.ix + b.ts * 2.1, b.iy + b.ts * 0.15,
+                b.ts * 1.05, color=color, width=title_w, font="text_font",
+                tabular=False, fallback="", fit="ellipsis")  # fmt: skip
+    b.needs = "game.fps"
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    graph = b.large or a >= 3.0 or (a <= 0.72 and h > b.ts * 12)
+    stacked = b.large or a <= 0.72  # the history under the number
+    number_h = h * 0.55 if graph and stacked else h
+    number_w = w if not (graph and not stacked) else w * 0.45
+    size = min(number_h * 0.62, number_w * 0.34)
+    cap = y + (number_h - CAP * size) / 2 - (b.ts * 0.6 if number_h > b.ts * 6 else 0)
+    b.value("fps", "game.fps", "{value:.0f}", x, cap, size, width=number_w * 0.62,
+            glow=round(0.3 * b.glow, 2), glow_radius=max(2, round(size / 14)))  # fmt: skip
+    if logo:
+        # on the name's line, as large as the room above the number lets it be (the 12.3"
+        # has a lot), and then no wider than the number: the readings beside it stay clear
+        b.needs = "game.fps,@game.logo"
+        highest = max(b.iy - b.ts * 0.6, b.y + b.ts * 0.8)  # (clear of the card's edge)
+        logo_h = max(b.ts * 2.2, min(b.ts * 4.5, b.ih * 0.16, cap - b.ts - highest))
+        logo_y = max(highest, b.iy + b.ts * 0.6 - logo_h / 2)
+        logo_w = b.ts * 2.1 + title_w
+        if logo_h > b.ts * 2.4:
+            logo_w = min(logo_w, number_w * 0.62)
+        b.add("image", "logo", x=round(b.ix), y=round(logo_y), src="@game.logo",
+              w=round(logo_w), h=round(logo_h), fit="contain", align="left")  # fmt: skip
+        b.needs = "game.fps"
+    unit_x = x + number_w * 0.64
+    b.label("unit", "FPS", unit_x, cap + CAP * size - CAP * b.ts, b.ts, color=color,
+            width=number_w * 0.36)  # fmt: skip
+    if number_h > b.ts * 6.5:
+        # what holds the frame rate down (the GPU, the CPU or the game's cap), and the longest
+        # frame since the last reading: a stutter shows. As large as the room beside the
+        # number lets them be, two by two where it is wide (on the 12.3" they stood small in
+        # a lot of room)
+        rows = (("low", "game.low", "{value:.0f}", t("1% low")),
+                ("frametime", "game.frametime", "{value:.1f} ms", t("Frame time")),
+                ("limiter", "game.limiter", "", t("Limited by")),
+                ("peak", "game.frametime_peak", "{value:.0f} ms", t("Longest frame")))  # fmt: skip
+        if not played:  # (not on the clock's line: the last of the readings, where there is room)
+            rows += (("played", "game.time", "{value:clock}", t("Played")),)
+        room_w = number_w * 0.36
+        # The names are lettered with 14 % of their size between the letters; the widest
+        # sets one size for all four, so none shrinks alone and none touches the next
+        # (German's "Begrenzt durch" ran into "Längstes Bild" on the 12.3"). Two columns
+        # where the names stay readable at that size, else one (French and Polish names
+        # are long)
+        per_size = max(
+            _width_per_size(b.style["text_font"], text.upper()) + 0.14 * (len(text) - 1)
+            for _, _, _, text in rows
+        )
+        for cols in (2, 1) if room_w >= b.ts * 12 else (1,):
+            lines, col_w = math.ceil(len(rows) / cols), room_w / cols
+            step = max(b.ts * 2.4, min(number_h * 0.9 / lines, col_w * 0.6))
+            value_size = max(b.ts * 1.05, step * 0.4)
+            width = col_w - b.ts  # a gutter between the columns, and before the edge
+            label_size = min(max(b.ts * 0.85, min(step * 0.17, b.ts * 1.2)), width / per_size)
+            if label_size >= b.ts * 0.6:
+                break
+        compact = step <= b.ts * 2.4  # (a small card: the rows from the number's top, as ever)
+        block = step * (lines - 1) + label_size * 1.3 + CAP * value_size
+        first = cap if compact else y + (number_h - block) / 2
+        for i, (name, key, fmt, text) in enumerate(rows):
+            line = first + (i // cols) * step
+            at = unit_x + (i % cols) * col_w
+            below = line + label_size * 1.3  # the value's cap line, under its name
+            end = line + CAP * b.ts * 1.2 if compact else below + CAP * value_size
+            if end > y + number_h:
+                break
+            if name != "limiter":
+                b.needs = "game.fps,game.time" if name == "played" else "game.fps"
+                b.label(f"{name}-label", text, at, line, label_size, width=width)
+                b.value(
+                    name,
+                    key,
+                    fmt,
+                    at,
+                    below,
+                    value_size,
+                    color=b.c("text2"),
+                    width=width,
+                    hide_if_missing=True,
+                    **({"smooth": False} if name == "played" else {}),
+                )
+                b.needs = "game.fps"
+                continue
+            b.needs = "game.fps,game.limiter"
+            b.label(f"{name}-label", text, at, line, label_size, width=width)
+            for what, said in (("gpu", "GPU"), ("cpu", "CPU"), ("cap", t("Frame cap"))):
+                b.needs = f"game.fps,game.limiter={what}"
+                b.add("text", f"limiter-{what}", x=round(at), text=said, color=b.c("text2"),
+                      max_width=round(width), tabular=False,
+                      **b._text_fields(value_size, below, "display_font"))  # fmt: skip
+            b.needs = "game.fps"
+        b.out = [w_ for w_ in b.out if w_["id"] != "unit"]  # the rows say what it is
+        b.label("unit", "FPS", x, cap + CAP * size + b.ts * 0.8, b.ts, color=color,
+                width=number_w * 0.6)  # fmt: skip
+    if graph:
+        clip = False
+        if stacked:  # under the numbers from one edge of the card to the other, inside its line
+            edge = max(1, round(b.frame_u / 160)) if b.card_on else 0
+            radius = round(b.style["radius"] * b.frame_u / 200) if b.card_on else 0
+            gx, gy, gw = b.x + edge, y + number_h + b.pad, b.w - 2 * edge
+            gh = b.y + b.h - edge - radius / 2 - gy  # (its fill fades out above the corners)
+            clip = True
+        else:
+            gx = x + number_w + b.pad
+            gy, gw, gh = y, x + w - gx, h
+        # from 0 to the module's top (175 fps): a dip shows as deep as it was, and the curve
+        # stays where it is, drawn once (an own top moved it, and its strips were drawn anew,
+        # when the game's rate changed); with a top of 0 its own, in steps of 30 fps that
+        # change seldom. Its line and glow as the CPU's and GPU's graphs have them: as a card
+        # of twenty labels, so the big card's curve is not drawn heavier (6 px on the 12.3")
+        top = b.module["top"] if b.module["top"] > 0 else None
+        b.graph("history", "game.fps", gx, gy, gw, gh, color, 0, top, unit=min(b.u, 20 * b.ts))
+        # every frame's rate as measured (25 points a second, where the source has them)
+        b.out[-1].update(clip=clip, trace="game.fps_trace", range_step=0 if top else 30)
+    icon = min(b.iw, b.ih) * 0.3
+    # a game found, its frame rate not yet there: its logo where it has one (the logo of the
+    # game before stays for the round report, so not without a game)
+    for name, needs in (("idle-icon", "!game.fps,!game.name"),
+                        ("idle-icon-game", "!game.fps,game.name,!@game.logo")):  # fmt: skip
+        b.needs = needs
+        b.icon(name, "gamepad", b.ix + (b.iw - icon) / 2, b.iy + b.ih / 2 - icon * 0.8, icon,
+               b.c("text3"))  # fmt: skip
+    b.needs = "!game.fps,game.name,@game.logo"
+    b.add("image", "idle-logo", x=round(b.ix), y=round(b.iy + b.ih / 2 - icon * 0.8),
+          w=round(b.iw), h=round(icon), src="@game.logo", fit="contain")  # fmt: skip
+    line = b.iy + b.ih / 2 + icon * 0.45
+    b.needs = "!game.fps,!game.name"
+    b.label("idle", t("No game running"), b.ix + b.iw / 2, line, b.ts, align="center",
+            width=b.iw)  # fmt: skip
+    # game mode found a game whose frame rate has not come (yet): its name, not "no game"
+    b.needs = "!game.fps,game.name"
+    b.value("idle-game", "game.name", "{value}", b.ix + b.iw / 2, line, b.ts * 1.05,
+            color=b.c("text2"), align="center", width=b.iw, font="text_font", tabular=False,
+            fallback="", fit="ellipsis")  # fmt: skip
+    b.label("idle-wait", t("No frame rate yet"), b.ix + b.iw / 2, line + b.ts * 1.9, b.ts * 0.85,
+            align="center", width=b.iw)  # fmt: skip
+    b.needs = ""
+
+
+def build_text(b: _Build, _src: Source) -> None:
+    """A title with the accent line under it."""
+    b.card()
+    text = b.module["text"] or "Libre Panel"
+    size = min(b.ih * 0.5, b.iw / max(2, len(text) * 0.55))
+    line = max(2, round(size * 0.07))
+    block = CAP * size + size * 0.25 + line
+    top = b.iy + (b.ih - block) / 2
+    b.add("text", "text", x=round(b.ix), text=text, color=b.c("text"),
+          max_width=round(b.iw), **b._text_fields(size, top, "display_font"))  # fmt: skip
+    b.add("rect", "line", x=round(b.ix + size * 0.04), y=round(top + CAP * size + size * 0.25),
+          w=round(min(b.iw, size * 1.6)), h=line, color=b.tint("accent"), radius=line // 2,
+          glow=round(0.7 * b.glow, 2), glow_radius=max(2, line * 3))  # fmt: skip
+
+
+# -- lists of readings ---------------------------------------------------------
+
+
+# the style's note of what cards are framed by at most (half the panel's height, expand)
+FRAME_U = "\0frame_u"
+
+
+def default_items(kind: str) -> str:
+    """What a list module shows while its ``items`` are empty."""
+    return {
+        "temps": "cpu.temp = CPU\ngpu.temp = GPU\ntemp.*",
+        "fans": f"gpu.fan = {t('GPU fan')}\nfan.*",  # the temperature module's
+        "drives": "disk.*.load",
+        "cards": DEFAULT_CARDS,
+        "world": "America/New_York = New York\nEurope/London = London\nAsia/Tokyo = Tokyo\n"
+        "Australia/Sydney = Sydney",
+        "values": f"cpu.load = CPU\ngpu.load = GPU\nmem.load = {t('RAM')}\n"
+        f"cpu.temp = {t('CPU temp')}\ngpu.temp = {t('GPU temp')}\nnet.down = {t('Download')}",
+    }.get(kind, "")
+
+
+def _heat_rules(b: _Build, warn: float = 75, crit: float = 88) -> list[dict[str, Any]]:
+    return [{"above": warn, "color": b.c("warn")}, {"above": crit, "color": b.c("crit")}]
+
+
+def build_temps(b: _Build, _src: Source) -> None:
+    """Every temperature as a bar, CPU and GPU first; the fans too when there is room, in a
+    big box each one turning with its speed (as Lumen's)."""
+    b.card()
+    color = b.tint("accent")
+    top = b.head("temperature", b.module["title"] or t("Temperatures"), color)
+    items = b.module["items"] or default_items("temps")
+    fans, count = b.module["fan_items"] or default_items("fans"), max(0, b.module["fans"])
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    temps = {"min": 20, "max": 100, "color_rules": _heat_rules(b), "format": "{value:.0f}°C",
+             "empty": t("No temperature readings")}  # fmt: skip
+    fan_list = {"format": "{value:.0f} RPM", "empty": t("No fan readings"), "uppercase": True,
+                "max_items": count, "hide_unused": True}  # fmt: skip
+    if not count:
+        b.listing("temps", items, x, y, w, h, color, "bars" if h > b.ts * 4.5 else "rows", **temps)
+    elif (b.aspect >= 3.0 and b.iw > b.ts * 40) or (b.aspect >= 1.8 and h > b.ts * 5.5):
+        # long or wide: the temperatures | the fans turning
+        width = (w - b.pad) * (0.6 if b.aspect >= 3.0 else 0.5)
+        style = "bars" if h > b.ts * 6.5 * (2 if b.aspect >= 3.0 else 1) else "rows"
+        b.listing("temps", items, x, y, width, h, color, style, **temps)
+        room = w - width - b.pad  # as many as are readable: three lines, one beside another
+        size = max(7, round(_clamp(min(room / 6.3, h / 7.5), 7, b.ts * 1.15)))  # where it fits
+        b.listing("fans", fans, x + width + b.pad, y, room, h, color, "fans", size, min=0,
+                  max=3000, **{**fan_list, "format": "{value:.0f}"})  # fmt: skip
+    elif (b.large or b.aspect <= 0.72) and h > b.ts * 11:  # big: the fans turning below
+        # their numbers, as Lumen's where two fit side by side (the fans 1.9 times as big)
+        size = max(7, round(_clamp(w / 12.5, 7, b.ts * 1.15)))
+        line = round(size * 1.9) + size
+        side_by_side = max(1, int(w // (round(size * 1.9) + size * 4.2)))
+        wanted = -(-count // side_by_side)  # the lines that hold them
+        lines = int(_clamp(min(wanted, (h * 0.5 + size * 0.6) // line), 1, 4))
+        fan_h = lines * line - size * 0.6 + 1
+        b.listing("temps", items, x, y, w, h - fan_h - b.pad * 1.5, color, **temps)
+        b.listing("fans", fans, x, y + h - fan_h, w, fan_h, color, "fans", size, min=0,
+                  max=3000, **{**fan_list, "format": "{value:.0f}"})  # fmt: skip
+    else:
+        b.listing("temps", items, x, y, w, h, color, "bars" if h > b.ts * 4.5 else "rows", **temps)
+
+
+def build_cores(b: _Build, _src: Source) -> None:
+    """The load of every core: columns side by side, or tiles; the whole processor's beside
+    the title and its history when big, unless ``total`` is off."""
+    b.card()
+    color = b.tint("cpu")
+    total = b.module["total"]
+    top = b.head("cpu", b.module["title"] or t("CPU cores"), color, b.ts * 3.6)
+    if total:
+        b.value("value", "cpu.load", "{value:.0f}%", b.ix + b.iw, b.iy, b.ts * 1.6,
+                align="right", width=b.iw * 0.3)  # fmt: skip
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    # the physical cores where the processor says which threads are one (load source), else
+    # the threads; every thread where the module asks for them
+    shown = [("cores", "cpu.core.*.load", "")]
+    if not b.module["threads"]:
+        shown = [("cores", "cpu.pcore.*.load", "cpu.pcore.1.load"),
+                 ("threads", "cpu.core.*.load", "!cpu.pcore.1.load")]  # fmt: skip
+    big = b.large and h > b.ts * 12
+    if total and big:
+        cores_h = h * 0.6
+        for name, items, needs in shown:
+            b.listing(name, items, x, y, w, cores_h, color, "columns", b.ts * 1.1, needs=needs)
+        gy = y + cores_h + b.pad
+        b.graph("history", "cpu.load", x, gy, w, b.iy + b.ih - gy, color)
+    else:  # (a big one without the history: its columns the whole height)
+        style, size = ("columns", 1.1) if b.aspect >= 1.45 or big else ("cells", 1.4)
+        for name, items, needs in shown:
+            b.listing(name, items, x, y, w, h, color, style, b.ts * size, needs=needs)
+
+
+def build_drives(b: _Build, _src: Source) -> None:
+    """Every drive: how full, how much is free; reading and writing when big."""
+    b.card()
+    color = b.tint("disk")
+    top = b.head("disk", b.module["title"] or t("Drives"), color)
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    rates = b.large and h > b.ts * 12
+    if rates:
+        h -= b.ts * 3.4
+    b.listing("drives", b.module["items"] or default_items("drives"), x, y, w, h, color,
+              detail="free", detail_format=t("{value:.0f} GB free"), format="{value:.0f}%",
+              color_rules=_heat_rules(b, 85, 95), uppercase=False)  # fmt: skip
+    if rates:
+        cap = b.iy + b.ih - CAP * b.ts * 1.3
+        half = w / 2
+        for i, (key, icon, name) in enumerate((("disk.read", "download", "read"),
+                                               ("disk.write", "upload", "write"))):  # fmt: skip
+            cx = x + i * half
+            b.icon(f"{name}-icon", icon, cx, cap + CAP * b.ts * 0.65 - b.ts * 0.7, b.ts * 1.4,
+                   b.c("text3"))  # fmt: skip
+            b.value(name, key, "{value:bytes}/s", cx + b.ts * 1.9, cap, b.ts * 1.3,
+                    width=half - b.ts * 2.2, hide_if_missing=True)  # fmt: skip
+
+
+def build_processes(b: _Build, _src: Source) -> None:
+    """The programs that use the most processor time (or memory)."""
+    b.card()
+    memory = b.module["sort"] == "memory"
+    color = b.tint("mem" if memory else "cpu")
+    top = b.head("list", b.module["title"] or t("Processes"), color, b.ts * 3.4)
+    b.label("sort", "RAM" if memory else "CPU", b.ix + b.iw, b.iy + b.ts * 0.15, b.ts,
+            color=b.c("text3"), align="right")  # fmt: skip
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    bars = (b.large or b.aspect <= 0.72) and h > b.ts * 10
+    # rows a little smaller than the bars, so four fit a short card; a narrow card keeps
+    # them in one column, the few that matter large enough to read
+    b.listing("processes", "proc.mem.*.value" if memory else "proc.cpu.*.value", x, y, w, h,
+              color, "bars" if bars else "rows", b.ts * (1.3 if bars else 1.15),
+              columns=1 if not bars and b.iw < b.ts * 30 else 0, format="{value:.1f}%",
+              min=0, max=0, uppercase=False, empty=t("Waiting for the first count …"))  # fmt: skip
+
+
+def build_values(b: _Build, _src: Source) -> None:
+    """Readings of your choice as tiles: a small dashboard."""
+    b.card()
+    color = b.tint("accent")
+    y, h = b.iy, b.ih
+    if b.module["title"]:
+        top = b.head("grid", b.module["title"], color)
+        y, h = y + top, h - top
+    items = b.module["items"] or default_items("values")
+    tiles = "cells" if b.aspect < 3.0 or b.ih > b.ts * 6 else "rows"
+    b.listing("values", items, b.ix, y, b.iw, h, color, tiles, b.ts * 2.4, levels=False,
+              background=mix(b.c("track"), b.c("surface"), 0.35), format="auto",
+              empty=t("Add readings in the settings"))  # fmt: skip
+
+
+def build_netinfo(b: _Build, _src: Source) -> None:
+    """Address, ping and today's traffic; the ping's history when big."""
+    b.card()
+    color = b.tint("net")
+    top = b.head("network", b.module["title"] or t("Network"), color)
+    # the names in full where the rows are wide; short where they would be cut
+    narrow = b.iw < b.ts * 30
+    names = (
+        ("net.ip", "IP" if narrow else t("IP address")), ("net.ping", t("Ping")),
+        ("net.down", t("Down") if narrow else t("Download")),
+        ("net.up", t("Up") if narrow else t("Upload")),
+        ("net.today.down", t("Received") if narrow else t("Received today")),
+        ("net.today.up", t("Sent") if narrow else t("Sent today")),
+    )  # fmt: skip
+    items = "\n".join(f"{key} = {name}" for key, name in names)
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    graph = (b.large or b.aspect <= 0.72) and h > b.ts * 14
+    rows_h = h * 0.62 if graph else h
+    b.listing("details", items, x, y, w, rows_h, color, "rows", b.ts * 1.25, format="auto")
+    if graph:
+        gy = y + rows_h + b.pad
+        b.label("ping-title", t("Ping"), x, gy, b.ts * 0.9, width=w * 0.5)
+        gy += b.ts * 1.6
+        b.graph("ping-history", "net.ping", x, gy, w, b.iy + b.ih - gy, color, 0, None)
+        b.out[-1]["needs"] = "net.ping"
+
+
+def _pairs(b: _Build, pairs: list[tuple[str, str, str]], x: float, y: float, w: float,
+           h: float) -> None:  # fmt: skip
+    """Readings as rows of a name and a value (sensor, format, name), as many as fit."""
+    count = min(len(pairs), int(h // (b.ts * 1.9)))
+    if count < 1 or w < b.ts * 5:
+        return
+    row = min(h / count, b.ts * 3.0)
+    size = min(row * 0.55, b.ts * 1.5, w * 0.11)
+    top = y + (h - row * count) / 2
+    for i, (sensor, fmt, name) in enumerate(pairs[:count]):
+        base = top + i * row + (row - CAP * size) / 2
+        b.label(f"r{i}-label", name, x, base + CAP * (size - b.ts) / 2, b.ts, width=w * 0.45)
+        b.value(f"r{i}", sensor, fmt, x + w, base, size, align="right", width=w * 0.53,
+                fallback="--", fit="ellipsis")  # fmt: skip
+
+
+def _number_rows_history(b: _Build, sensor: str, fmt: str, pairs: list[tuple[str, str, str]],
+                         color: str, top: float, history: bool = True) -> None:  # fmt: skip
+    """A big number under the head; beside or under it the ``pairs`` where there is room, and
+    the number's history (ping, power)."""
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    tall, wide = b.aspect <= 0.72, b.aspect >= 2.0
+    stacked = (b.large and not wide) or tall
+    rows_h = len(pairs) * b.ts * 2.2
+
+    def number(nx: float, ny: float, nw: float, nh: float) -> None:
+        size = min(nh * 0.62, nw * 0.3)
+        b.value("value", sensor, fmt, nx, ny + (nh - CAP * size) / 2, size, width=nw,
+                fallback="--")  # fmt: skip
+
+    def graph(gx: float, gy: float, gw: float, gh: float) -> None:
+        b.graph("history", sensor, gx, gy, gw, gh, color, 0, None)
+        b.out[-1]["needs"] = sensor
+
+    if stacked:
+        number_h = min(h * 0.36, b.iw * 0.4)
+        number(x, y, w, number_h)
+        rest_y = y + number_h + b.pad * 0.5
+        rest = b.iy + b.ih - rest_y
+        rows = min(rows_h, rest if not history else rest * 0.5)
+        _pairs(b, pairs, x, rest_y, w, rows)
+        if history and rest - rows > b.ts * 3:
+            graph(x, rest_y + rows + b.pad * 0.5, w, rest - rows - b.pad * 0.5)
+    elif wide:
+        big = b.large or b.aspect >= 3.2
+        number_w = w * (0.3 if big and pairs and history else 0.42)
+        number(x, y, number_w, h)
+        rest_x = x + number_w + b.pad
+        rest_w = b.ix + b.iw - rest_x
+        if pairs and history and big:
+            rows_w = rest_w * 0.55
+            _pairs(b, pairs, rest_x, y, rows_w, h)
+            graph(rest_x + rows_w + b.pad * 1.5, y, rest_w - rows_w - b.pad * 1.5, h)
+        elif pairs:
+            _pairs(b, pairs, rest_x + b.pad, y, rest_w - b.pad, h)
+        elif history:
+            graph(rest_x, y, rest_w, h)
+    else:
+        number(x, y, w, h)
+
+
+def ping_key(target: str) -> str:
+    """The reading of the ping a module shows: its ``target`` is which of the hosts of
+    ``[sensors.psutil] ping`` (1, the first, to 4)."""
+    n = target.strip()
+    return f"net.ping.{n}" if n in ("2", "3", "4") else "net.ping"
+
+
+def build_ping(b: _Build, _src: Source) -> None:
+    """How long the internet (or a host of ``[sensors.psutil] ping``, the module's ``target``)
+    takes to answer, with its history and the share of tries without an answer."""
+    b.card()
+    color = b.tint("net")
+    key = ping_key(b.module["target"])
+    top = b.head("signal", b.module["title"] or t("Ping"), color)
+    pairs = [(f"{key}.lost", "{value:.0f}%", t("Lost")), (f"{key}.host", "{value}", t("Host"))]
+    _number_rows_history(b, key, "{value:.0f} ms", pairs, color, top)
+
+
+HUGE_LIMITS = {"°": (80, 90), "%": (85, 95)}  # warn and crit, by the unit in the format
+
+
+def build_huge(b: _Build, src: Source) -> None:
+    """One reading as large as the card allows, its name small above it, in the warning and
+    the critical colour from 80 and 90 °C (a share: 85 and 95 %): a screen to read from
+    across the room (High Contrast)."""
+    b.card()
+    sensor, fmt, title = src.load, src.fmt, b.module["title"] or src.label
+    if b.module["source"] == "sensor":
+        sensor = b.module["sensor"] or "cpu.temp"
+        fmt = b.module["format"] or "{value:.0f}°"
+        title = b.module["title"] or sensor
+    label = max(7.0, min(b.ih * 0.13, b.ts * 1.8))
+    b.label("title", title, b.ix + b.iw / 2, b.iy, label, color=b.c("text2"), width=b.iw,
+            align="center")  # fmt: skip
+    top = b.iy + label * (CAP + 0.7)
+    h = b.iy + b.ih - top
+    size = min(h * 0.86 / CAP, b.iw / 2.3)  # four characters: "100%", "72°C"
+    rules = []
+    for mark, (warn, crit) in HUGE_LIMITS.items():
+        if mark in fmt:
+            rules = [{"above": warn, "color": b.c("warn")}, {"above": crit, "color": b.c("crit")}]
+    b.value("value", sensor, fmt, b.ix + b.iw / 2, top + (h - CAP * size) / 2, size,
+            align="center", width=b.iw, fallback="--", color_rules=rules)  # fmt: skip
+
+
+def build_power(b: _Build, _src: Source) -> None:
+    """The watts the PC draws now, and the energy of today and of the month with what it costs
+    (the ``power`` service)."""
+    b.card()
+    color = b.tint("gpu")
+    top = b.head("power", b.module["title"] or t("Power use"), color)
+    pairs = [
+        ("power.today", "{value:.2f} kWh", t("Today")),
+        ("power.today.cost", "{value:.2f} {unit}", t("Cost today")),
+        ("power.month", "{value:.1f} kWh", t("This month")),
+        ("power.month.cost", "{value:.2f} {unit}", t("Cost this month")),
+    ]
+    _number_rows_history(b, "power.watts", "{value:.0f} W", pairs, color, top,
+                         history=b.aspect >= 3.2 or (b.large and b.aspect >= 2.0))  # fmt: skip
+
+
+def build_timer(b: _Build, _src: Source) -> None:
+    """The time left of the timer (the ``timer`` service) in a ring that fills as it runs, and
+    whether it is focus or break."""
+    b.card()
+    color = b.tint("accent")
+    top = b.head("hourglass", b.module["title"] or t("Timer"), color)
+    x, y, w, h = b.ix, b.iy + top, b.iw, b.ih - top
+    wide = w / max(1, h) >= 1.8
+    d = max(8, min(h, w * (0.5 if wide else 1.0)))
+    rx = x if wide else x + (w - d) / 2
+    ry = y + (h - d) / 2
+    b.ring("ring", "timer.share", rx, ry, d, color, 0, 1)
+    size, small = d * 0.22, max(7, d * 0.08)
+    gap = d * 0.05
+    cap = ry + (d - (CAP * size + gap + CAP * small)) / 2
+    b.value("left", "timer.text", "{value}", rx + d / 2, cap, size, align="center",
+            width=d * 0.72, fallback="--:--")  # fmt: skip
+    if d > b.ts * 5:
+        b.value("phase", "timer.phase", "{value}", rx + d / 2, cap + CAP * size + gap, small,
+                color=color, align="center", width=d * 0.6, font="text_font", tabular=False,
+                fallback="", hide_if_missing=True)  # fmt: skip
+    if wide and w - d - b.pad * 1.5 > b.ts * 5:
+        tx = rx + d + b.pad * 1.5
+        _pairs(b, [("timer.rounds", "{value:.0f}", t("Rounds"))], tx, y, b.ix + b.iw - tx, h)
+
+
+def build_ups(b: _Build, _src: Source) -> None:
+    """The UPS (the ``nut`` source): its battery, how long it lasts, its load and power, and
+    whether the PC runs on it."""
+    b.card()
+    color = b.tint("net")
+    top = b.head("battery", b.module["title"] or t("UPS"), color)
+    pairs = [
+        ("ups.runtime", "{value:.0f} min", t("Runtime")),
+        ("ups.load", "{value:.0f} %", t("Load")),
+        ("ups.power", "{value:.0f} W", t("Power")),
+        ("ups.status", "{value}", t("State")),
+    ]
+    _number_rows_history(b, "ups.charge", "{value:.0f} %", pairs, color, top,
+                         history=b.aspect >= 3.2 or (b.large and b.aspect >= 2.0))  # fmt: skip
+
+
+MIC = "audio.mic.muted"
+
+
+def build_mic(b: _Build, _src: Source) -> None:
+    """Whether the microphone is muted: the crossed symbol and the word large in the critical
+    colour while it is, calm while it is on, and said where there is no microphone (the audio
+    source: Windows, Linux with wpctl or pactl)."""
+    b.card()
+    calm, alarm = b.c("text3"), b.module.get("color") or b.c("crit")
+    a = b.aspect
+    wide = a >= 1.5
+    title = (b.module["title"] or t("Microphone")).upper()
+    if wide:
+        d = min(b.ih * 0.72, b.iw * 0.34)
+        ix, iy = b.ix + (b.ih - d) / 2 * 0.4, b.iy + (b.ih - d) / 2
+        tx, tw = ix + d + b.pad, b.ix + b.iw - (ix + d + b.pad)
+        size = min(b.ih * 0.34, tw / 4.2)
+        cap = b.iy + (b.ih - (CAP * size + b.ts * 1.9)) / 2 + b.ts * 1.9
+        label_y, align, x = cap - b.ts * 1.9, "left", tx
+    else:
+        d = min(b.iw * 0.55, b.ih * 0.5)
+        tw = b.iw
+        size = min(b.ih * 0.17, tw / 4.2)
+        block = d + b.ts * 1.2 + CAP * size + b.ts * 0.9 + CAP * b.ts  # centred in the box
+        ix, iy = b.ix + (b.iw - d) / 2, b.iy + max(0.0, (b.ih - block) / 2)
+        cap = iy + d + b.ts * 1.2
+        label_y, align, x = cap + CAP * size + b.ts * 0.9, "center", b.ix + b.iw / 2
+    for name, icon, color, need in (
+        ("muted-icon", "mic_off", alarm, f"{MIC}=1"),
+        ("on-icon", "mic", calm, f"{MIC}=0"),
+        ("none-icon", "mic", faded(calm, 0.5), f"!{MIC}"),
+    ):
+        b.icon(name, icon, ix, iy, d, color)
+        b.out[-1]["needs"] = need
+        if name == "muted-icon":
+            b.out[-1].update(glow=round(0.6 * b.glow, 2), glow_radius=max(2, round(d / 10)))
+    for name, text, color, need in (
+        ("muted", t("Muted"), alarm, f"{MIC}=1"),
+        ("on", t("On"), b.c("text"), f"{MIC}=0"),
+        ("none", t("No microphone"), calm, f"!{MIC}"),
+    ):
+        small = name == "none"
+        text_size = size * (0.6 if small else 1.0)
+        b.add("text", name, x=round(x), text=text, color=color, align=align, needs=need,
+              max_width=round(tw), fit="shrink",
+              **b._text_fields(text_size, cap + (CAP * size - CAP * text_size) / 2,
+                               "display_font"))  # fmt: skip
+    b.label("title", title, x, label_y, b.ts, color=calm, align=align, width=tw)
+
+
+def build_battery(b: _Build, _src: Source) -> None:
+    """The battery's charge, whether it charges and the time left; its history when big."""
+    b.card()
+    start = len(b.out)
+    color = b.tint("net")
+    a = b.aspect
+    below = (b.large or a <= 0.72) and b.ih > b.ts * 14  # the history under the battery
+    beside = not below and a >= 3.4  # the history on the right
+    main_h = b.ih * 0.55 if below else b.ih
+    main_w = b.iw * 0.45 if beside else b.iw
+    if (main_w / main_h >= 1.45 and not (below and a <= 0.72)) or beside:  # numbers beside
+        bh = min(main_h * 0.5, main_w * 0.2)
+        bw = bh * 1.9
+        _battery_shape(b, b.ix, b.iy + (main_h - bh) / 2, bw, bh, color)
+        tx = b.ix + bw + b.pad * 1.6
+        size = min(main_h * 0.36, (main_w - bw - b.pad * 1.6) * 0.3)
+        cap = b.iy + (main_h - (CAP * size + b.ts * 1.0 + CAP * b.ts * 1.1)) / 2
+        b.value("value", "battery.load", "{value:.0f}%", tx, cap, size, width=b.ix + main_w - tx)
+        _battery_state(b, tx, cap + CAP * size + b.ts * 1.0, b.ix + main_w - tx)
+    else:  # the battery above the numbers
+        bw = min(main_w * 0.62, main_h * 0.7)
+        bh = bw / 1.9
+        size = min(main_h * 0.26, main_w * 0.3)
+        block = bh + b.ts * 0.9 + CAP * size + b.ts * 0.9 + CAP * b.ts * 1.1
+        y = b.iy + (main_h - block) / 2
+        cx = b.ix + main_w / 2
+        _battery_shape(b, cx - bw / 2, y, bw, bh, color)
+        y += bh + b.ts * 0.9
+        b.value("value", "battery.load", "{value:.0f}%", cx, y, size, align="center", width=main_w)
+        _battery_state(b, cx, y + CAP * size + b.ts * 0.9, main_w, "center")
+    if below:
+        gy = b.iy + main_h + b.pad
+        b.graph("history", "battery.load", b.ix, gy, b.iw, b.iy + b.ih - gy, color)
+    elif beside:
+        gx = b.ix + main_w + b.pad
+        b.graph("history", "battery.load", gx, b.iy + b.ih * 0.12, b.ix + b.iw - gx, b.ih * 0.76,
+                color)  # fmt: skip
+    for widget in b.out[start:]:
+        widget["needs"] = "battery.load"
+    b.label("none", t("No battery"), b.ix + b.iw / 2, b.iy + b.ih / 2 - CAP * b.ts / 2, b.ts,
+            align="center", width=b.iw)  # fmt: skip
+    b.out[-1]["needs"] = "!battery.load"
+
+
+def _battery_shape(b: _Build, x: float, y: float, w: float, h: float, color: str) -> None:
+    line = max(2, round(h * 0.07))
+    nub = max(3, round(w * 0.06))
+    body = w - nub - line
+    b.add("rect", "battery", x=round(x), y=round(y), w=round(body), h=round(h), color=None,
+          outline=b.c("text2"), outline_width=line, radius=round(h * 0.18))  # fmt: skip
+    b.add("rect", "battery-nub", x=round(x + body + line * 0.6), y=round(y + h * 0.32),
+          w=nub, h=round(h * 0.36), color=b.c("text2"), radius=max(1, nub // 2))  # fmt: skip
+    inset = line * 2.2
+    rules = [{"above": 20, "color": b.c("warn")}, {"above": 40, "color": color}]
+    b.add(
+        "bar", "charge", x=round(x + inset), y=round(y + inset), w=round(body - 2 * inset),
+        h=round(h - 2 * inset), sensor="battery.load", min=0, max=100, color=b.c("crit"),
+        color2=None, background=None, radius=round(h * 0.08), color_rules=rules,
+        glow=round(0.3 * b.glow, 2), glow_radius=max(2, round(h * 0.1)),
+    )  # fmt: skip
+
+
+def _battery_state(b: _Build, x: float, cap: float, width: float, align: str = "left") -> None:
+    b.value("state", "battery.state", "{value}", x, cap, b.ts * 1.1, color=b.c("text2"),
+            align=align, width=width, font="text_font", tabular=False, fallback="",
+            hide_if_missing=True)  # fmt: skip
+    b.value("left", "battery.left", "{value:duration}", x, cap + b.ts * 2.0, b.ts * 1.1,
+            color=b.c("text3"), align=align, width=width, font="text_font",
+            hide_if_missing=True)  # fmt: skip
+
+
+AI_LISTED = 3  # the sessions the agents service lists one by one (agents.LISTED)
+AI_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def build_ai(b: _Build, _src: Source) -> None:
+    """What Claude Code and Codex do (the agents service): their sign, moving while they work
+    or wait for you, the state in words, the tool at work, what the session is called, and how
+    much of the plan's 5-hour and weekly limits is used, with the time until each begins anew.
+    Both side by side, or one over the other, or the one the module's ``agent`` names; of both,
+    while one of them is not running, the other alone across the module."""
+    b.card()
+    which = b.module.get("agent") or "both"
+    if which != "both":
+        _ai_agent(b, which, b.ix, b.iy, b.iw, b.ih, alone=True)
+        return
+    if b.aspect >= 1.6:  # side by side
+        w = (b.iw - b.pad) / 2
+        boxes = [(b.ix, b.iy, w, b.ih), (b.ix + w + b.pad, b.iy, w, b.ih)]
+    else:  # one over the other
+        h = (b.ih - b.pad) / 2
+        boxes = [(b.ix, b.iy, b.iw, h), (b.ix, b.iy + h + b.pad, b.iw, h)]
+    own = b.needs
+    off = {name: f"ai.{name}.state=off" for name in AI_NAMES}
+    # both while both run (or nothing is known yet: AI activity not set up) and while neither
+    # does; while one is off, the one that runs alone, with room for its session and its context
+    parts = [("", f"!{off['claude']},!{off['codex']}", None),
+             ("none-", f"{off['claude']},{off['codex']}", None),
+             ("only-", f"!{off['claude']},{off['codex']}", "claude"),
+             ("only-", f"{off['claude']},!{off['codex']}", "codex")]  # fmt: skip
+    for tag, needs, alone in parts:
+        b.needs = f"{needs},{own}" if own else needs
+        if alone is None:
+            for name, box in zip(AI_NAMES, boxes, strict=True):
+                _ai_agent(b, name, *box, tag=tag)
+        else:
+            _ai_agent(b, alone, b.ix, b.iy, b.iw, b.ih, alone=True, tag=tag)
+    b.needs = own
+
+
+def _ai_agent(b: _Build, name: str, x: float, y: float, w: float, h: float,
+              alone: bool = False, tag: str = "") -> None:  # fmt: skip
+    """One agent's part: its name, sign and state, and below the state what the session is
+    called and the rows of the plan's limits that fit; alone (Claude Code's own screen) also
+    how full its context is. ``tag`` sets its parts apart from another of the same agent."""
+    key, part = f"ai.{name}", f"{tag}{name}"  # (part: the start of its parts' names)
+    color, wait, calm = b.tint("accent"), b.c("warn"), b.c("text3")
+    title = max(7.0, min(b.ts * 1.05, h * 0.11))
+    b.label(f"{part}-name", AI_NAMES[name], x, y, title, color=calm, width=w)
+    if name == "claude" and w >= title * 18:  # what its sessions cost today, by its status line
+        b.value(f"{part}-cost", f"{key}.cost_today", t("Today") + " ${value:.2f}", x + w, y,
+                title, color=calm, align="right", width=w * 0.4, font="text_font",
+                tabular=False, fallback="", hide_if_missing=True)  # fmt: skip
+    top = y + title * 1.9
+    room = max(8.0, y + h - top)
+    wide = w / room >= 1.5
+    if wide:
+        d = min(room * 0.9, w * 0.32)
+        sign_x, sign_y = x, top + (room - d) / 2
+        tx, tw, align = x + d + b.pad, max(8.0, x + w - (x + d + b.pad)), "left"
+        text_top, text_room = top, room
+    else:
+        d = min(room * 0.32, w * 0.5)
+        sign_x, sign_y = x + (w - d) / 2, top
+        tx, tw, align = x, w, "center"
+        text_top, text_room = top + d + b.pad * 0.6, max(8.0, y + h - (top + d + b.pad * 0.6))
+    ax = tx if align == "left" else tx + tw / 2
+    words = (
+        ("working", t("Working"), b.c("text")),
+        ("waiting", t("Waiting for you"), wait),
+        ("idle", t("Idle"), b.c("text2")),
+        ("off", t("Not running"), calm),
+    )
+    small = max(7.0, min(b.ts * 1.0, text_room * 0.12))
+    size = max(8.0, min(text_room * (0.26 if wide else 0.2), tw / 6.5))
+    meters = [("five_hour", t("5 hours")), ("week", t("7 days"))]
+    if alone and name == "claude":  # (its status line tells it)
+        meters.append(("context", t("Context")))
+    # what the session is called has a line of its own: alone always, before the meters take
+    # what is left (a long name is cut, not shrunk); beside the other only where every meter
+    # fits too, as the plan's limits are the better use of a short part
+
+    def fit(above: float) -> int:
+        return int((text_room - size * CAP - small * 2.0 - above) // (small * 2.4 + 6))
+
+    task_h = small * 1.8
+    task = alone or fit(task_h) >= len(meters)
+    task_h = task_h if task else 0.0
+    rows = max(0, min(len(meters), fit(task_h)))
+    rows = 0 if rows == 1 and not alone else rows  # (side by side: both rows or none)
+    block = (CAP * size + small * 2.0 + task_h
+             + rows * (small * 1.5 + max(4, small * 0.5) + small * 0.6))  # fmt: skip
+    # alone, where there is room under the meters: its other sessions, a line each
+    step = small * 1.9
+    others = 0
+    if alone and rows == len(meters):
+        others = max(0, min(AI_LISTED - 1, int((text_room - block - small) // step)))
+    block += others * step + (small if others else 0.0)
+    free = max(0.0, text_room - block)
+    if wide:
+        cap = text_top + free / 2
+    else:  # the sign and the words together, a little above the middle
+        sign_y += free * 0.4
+        cap = text_top + free * 0.4
+    b.add("agent", f"{part}-sign", x=round(sign_x), y=round(sign_y), size=max(8, round(d)),
+          sensor=f"{key}.state", color=color, color2=wait, muted=calm)  # fmt: skip
+    for state, word, tone in words:
+        b.add("text", f"{part}-{state}", x=round(ax), text=word, color=tone, align=align,
+              needs=f"{key}.state={state}", max_width=round(tw), fit="shrink",
+              **b._text_fields(size, cap, "display_font"))  # fmt: skip
+    line = cap + CAP * size + small * 1.0
+    # since when it is so, at the right of the line, where the line is wide enough for both
+    since = align == "left" and tw >= small * 14
+    words_w = tw * 0.62 if since else tw
+    b.value(f"{part}-tool", f"{key}.tool", "{value}", ax, line, small, color=calm, align=align,
+            width=words_w, font="text_font", tabular=False, needs=f"{key}.state=working",
+            fallback="", hide_if_missing=True)  # fmt: skip
+    b.value(f"{part}-model", f"{key}.model", "{value}", ax, line, small, color=calm,
+            align=align, width=words_w, font="text_font", tabular=False,
+            needs=f"{key}.state!=working,{key}.state!=off", fallback="",
+            hide_if_missing=True)  # fmt: skip
+    if since:
+        b.value(f"{part}-since", f"{key}.since", "{value:duration}", tx + tw, line, small,
+                color=calm, align="right", width=tw * 0.34, font="text_font", tabular=False,
+                needs=f"{key}.state!=off", fallback="", hide_if_missing=True)  # fmt: skip
+    row = line + small * 2.0
+    if task:
+        b.value(f"{part}-task", f"{key}.task", "{value}", ax, row, small, color=b.c("text2"),
+                align=align, width=tw, font="text_font", tabular=False, fit="ellipsis",
+                fallback="", hide_if_missing=True)  # fmt: skip
+        row += task_h
+    bar_h = max(4, round(small * 0.5))
+    # when a window begins anew, where it fits between the window's name and its share
+    reset = tw >= small * 15
+    for window, label in meters[:rows]:
+        b.label(f"{part}-{window}-label", label, tx, row, small * 0.9, width=tw * 0.5)
+        if window != "context" and reset:
+            b.value(f"{part}-{window}-reset", f"{key}.{window}_reset", "{value:duration}",
+                    tx + tw - small * 4.2, row, small * 0.9, color=calm, align="right",
+                    width=tw * 0.3, font="text_font", tabular=False, fallback="",
+                    hide_if_missing=True)  # fmt: skip
+        b.value(f"{part}-{window}", f"{key}.{window}", "{value:.0f} %", tx + tw, row,
+                small * 0.9, align="right", width=tw * 0.25, fallback="--")  # fmt: skip
+        b.bar(f"{part}-{window}-bar", f"{key}.{window}", tx, row + small * 1.3, tw, bar_h, color)
+        b.out[-1]["color_rules"] = _heat_rules(b, 80, 95)
+        row += small * 1.5 + bar_h + small * 0.6
+    row += small if others else 0.0
+    for n in range(2, 2 + others):  # its sign, what it is called, its state and since when
+        one, dot = f"{key}.s{n}", small * 1.2
+        b.add("agent", f"{part}-s{n}-sign", x=round(tx), y=round(row - small * 0.1),
+              size=max(8, round(dot)), sensor=f"{one}.state", color=color, color2=wait,
+              muted=calm, needs=f"{one}.state")  # fmt: skip
+        b.value(f"{part}-s{n}-task", f"{one}.task", "{value}", tx + dot + small * 0.6, row,
+                small, color=b.c("text2"), width=tw * 0.55 - dot, font="text_font",
+                tabular=False, fit="ellipsis", fallback="", hide_if_missing=True)  # fmt: skip
+        for state, word, tone in words[:3]:
+            b.add("text", f"{part}-s{n}-{state}", x=round(tx + tw * 0.6), text=word, color=tone,
+                  max_width=round(tw * 0.26), fit="shrink", needs=f"{one}.state={state}",
+                  **b._text_fields(small * 0.9, row, "text_font"))  # fmt: skip
+        b.value(f"{part}-s{n}-since", f"{one}.since", "{value:duration}", tx + tw, row,
+                small * 0.9, color=calm, align="right", width=tw * 0.13, font="text_font",
+                tabular=False, fallback="", hide_if_missing=True)  # fmt: skip
+        row += step
+
+
+@dataclass(frozen=True)
+class Kind:
+    name: str
+    build: Callable[[_Build, Source], None]
+    sources: tuple[str, ...] = ()  # which "source" values it takes (empty: none)
+    span: tuple[int, int] = (1, 1)  # the size it starts with
+    finish: str = "flat"  # what a module's finish "auto" is: a card is lit by itself
+
+
+def kinds() -> dict[str, Kind]:
+    from libre_panel.theme import cards  # the cards build on this module
+
+    readings = ("cpu", "gpu", "mem", "disk", "net", "sensor")
+    return {
+        "clock": Kind(t("Time"), build_clock, span=(2, 1)),
+        "date": Kind(t("Calendar"), build_date),
+        "weather": Kind(t("Weather"), build_weather, span=(2, 1)),
+        "ring": Kind(t("Ring"), build_ring, ("cpu", "gpu", "mem", "disk")),
+        "stat": Kind(t("Big number"), build_stat, readings),
+        "huge": Kind(t("Very large number"), build_huge, readings),
+        "graph": Kind(t("History"), build_graph, readings, span=(2, 1)),
+        "bars": Kind(t("Bars"), build_bars, span=(1, 2)),
+        "network": Kind(t("Network"), build_network, span=(2, 1)),
+        "system": Kind(t("System"), build_system),
+        "text": Kind(t("Title"), build_text, span=(2, 1)),
+        "temps": Kind(t("Temperatures"), build_temps, span=(1, 2)),
+        "cores": Kind(t("CPU cores"), build_cores, span=(2, 1)),
+        "drives": Kind(t("Drives"), build_drives, span=(2, 1)),
+        "processes": Kind(t("Processes"), build_processes, span=(1, 2)),
+        "netinfo": Kind(t("Network details"), build_netinfo, span=(2, 1)),
+        "battery": Kind(t("Battery"), build_battery),
+        "values": Kind(t("Dashboard"), build_values, span=(2, 1)),
+        "sun": Kind(t("Sun & moon"), build_sun, span=(2, 1)),
+        "analog": Kind(t("Analog clock"), build_analog),
+        "world": Kind(t("World clock"), build_world, span=(2, 1)),
+        "countdown": Kind(t("Countdown"), build_countdown, span=(2, 1)),
+        "image": Kind(t("Picture"), build_image, span=(2, 2)),
+        "music": Kind(t("Music"), build_music, span=(2, 1)),
+        "volume": Kind(t("Volume"), build_volume, span=(2, 1)),
+        "moon": Kind(t("Moon"), build_moon),
+        "earth": Kind(t("Earth"), build_earth, span=(2, 1)),
+        "outlook": Kind(t("Next days"), build_outlook, span=(3, 1), finish="lit"),
+        "agenda": Kind(t("Agenda"), build_agenda, span=(2, 2)),
+        "game": Kind(t("Game FPS"), build_game, span=(2, 1)),
+        "ping": Kind(t("Ping"), build_ping, span=(2, 1)),
+        "timer": Kind(t("Timer"), build_timer, span=(2, 1)),
+        "power": Kind(t("Power use"), build_power, span=(2, 1)),
+        "mic": Kind(t("Microphone"), build_mic),
+        "ups": Kind(t("UPS"), build_ups, span=(2, 1)),
+        "ai": Kind(t("AI activity"), build_ai, span=(2, 1)),
+        # the cards after SPUR II's Studio screen: lit by themselves (theme.cards)
+        "playback": Kind(t("Playback card"), cards.build_playback, span=(3, 2), finish="lit"),
+        "forecast": Kind(t("Weather card"), cards.build_forecast, span=(3, 2), finish="lit"),
+        "download": Kind(t("Download card"), cards.build_download, span=(2, 1), finish="lit"),
+        "instrument": Kind(
+            t("Ring instrument"),
+            cards.build_instrument,
+            ("cpu", "gpu", "mem", "disk", "fan"),
+            span=(1, 2),
+            finish="lit",
+        ),
+        "cards": Kind(t("Card slot"), cards.build_cards, span=(3, 2), finish="lit"),
+        "netcard": Kind(t("Network card"), cards.build_netcard, span=(2, 1), finish="lit"),
+    }
+
+
+MODULE_KINDS = (
+    "clock", "date", "weather", "ring", "stat", "graph", "bars", "network", "system", "text",
+    "temps", "cores", "drives", "processes", "netinfo", "battery", "values",
+    "sun", "analog", "world", "countdown", "image", "music", "agenda", "game",
+    "playback", "forecast", "download", "instrument", "cards", "netcard", "volume", "moon",
+    "outlook", "ping", "timer", "power", "mic", "ups", "huge", "ai", "earth",
+)  # fmt: skip
+# Kinds that hold several cards and show one (render.slot); "netcard" is two: a download
+# while one runs, else the network
+SLOT_KINDS = ("cards", "netcard")
+MODULE_SOURCES = ("cpu", "gpu", "mem", "disk", "net", "sensor", "fan")
+MODULE_FALLBACKS = ("auto", "none", "cpu", "gpu", "mem", "disk")
+
+
+# -- card slots ----------------------------------------------------------------
+
+DEFAULT_CARDS = "playback\nai\nforecast\ndate"  # (config.DEFAULT_CARDS: the person's)
+CARD_NAMES = tuple(k for k in MODULE_KINDS if k not in SLOT_KINDS) + ("net",)  # "net": the
+# network as the Studio's NET section has it (UP and DOWN with the speed beside them)
+# Which card a slot shows (its ``order``): the first that has something to show, or each in
+# turn for its time, those with nothing to show passed over (render.slot)
+CARD_ORDERS = ("first", "turns")
+# How a slot goes from one card to the next (its ``transition``, render.slot): the old card
+# rolls up into a line of light and the new one rolls down out of it (SPUR II's Studio), they
+# fade, the new one pushes the old one out to the left or up, wipes it away from the left, or
+# is there at once; "random" takes one of the moving ones, another each time
+CARD_TRANSITIONS = ("light", "fade", "slide", "rise", "wipe", "cut", "random")
+TURN_S = (5, 24 * 3600)  # a card's turn: the shortest and the longest, in seconds
+_UNITS = {"s": 1, "sec": 1, "m": 60, "min": 60, "h": 3600}
+
+
+@dataclass(frozen=True)
+class SlotCard:
+    """A card of a slot: its name, its rule (the conditions after ``if``, as a ``needs`` has
+    them; "": the card's own) and how long its turn lasts in seconds (None: the slot's
+    ``turn``)."""
+
+    name: str
+    rule: str = ""
+    seconds: float | None = None
+
+
+def card_time(text: str) -> float | None:
+    """The time of a card's turn in seconds, as a line has it after ``for``: ``5m``, ``90s``,
+    ``1h``, ``2.5 min`` (a bare number: minutes); None for what is no time, or out of
+    :data:`TURN_S`."""
+    text = text.strip().lower()
+    number = text.rstrip("abcdefghijklmnopqrstuvwxyz").strip()
+    unit = text[len(number) :].strip() or "min"
+    try:
+        seconds = float(number) * _UNITS[unit]
+    except (KeyError, ValueError):
+        return None
+    if not math.isfinite(seconds) or not TURN_S[0] <= seconds <= TURN_S[1]:
+        return None
+    return seconds
+
+
+def time_text(seconds: float) -> str:
+    """A turn's time as a line writes it: ``5m``, ``90s``, ``1h`` (card_time reads it back)."""
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return f"{int(seconds // size)}{unit}"
+    return f"{seconds:g}s"
+
+
+def card_line(line: str) -> SlotCard | None:
+    """A line of a slot's ``items``: ``name``, then ``for <time>`` if it has a turn of its own,
+    then ``if <conditions>`` if it has a rule of its own (``forecast for 5m if
+    weather.temperature``); a ``#`` begins a comment. None for a line that names no card."""
+    head, _, rule = line.partition("#")[0].strip().partition(" if ")
+    name, _, time = head.strip().partition(" for ")
+    name = name.strip()
+    if name not in CARD_NAMES:
+        return None
+    return SlotCard(name, rule.strip(), card_time(time) if time.strip() else None)
+
+
+def slot_cards(module: dict[str, Any]) -> list[SlotCard]:
+    """The cards a slot module holds, in the order they are asked (render.slot). A line that
+    names no card is left out. ``netcard`` holds a download card and the network."""
+    if module["module"] == "netcard":
+        return [SlotCard("download"), SlotCard("net")]
+    found = [card_line(line) for line in (module["items"] or DEFAULT_CARDS).splitlines()]
+    return [card for card in found if card is not None] or [
+        SlotCard(name) for name in DEFAULT_CARDS.splitlines()
+    ]
+
+
+def slot_items(module: dict[str, Any]) -> list[tuple[str, str]]:
+    """The cards a slot module holds, each with its rule: the conditions (as a ``needs`` has
+    them) after ``if`` on its line of ``items``, else ``""`` for the card's own (slot_cards)."""
+    return [(card.name, card.rule) for card in slot_cards(module)]
+
+
+def with_cards(
+    theme: Any, cards: list[str] | tuple[str, ...], order: str = "first", transition: str = "light"
+) -> Any:
+    """``theme`` with the person's cards (config.toml ``cards``: lines as a slot's ``items``
+    has them, ``forecast for 5m``), their order and their transition (``card_order``,
+    ``card_transition``) in each card slot that leaves them to the person, its ``items``
+    empty: Lumen's, in each of its versions, so one choice holds for all of them; a slot that
+    names its own keeps them."""
+    lines = [line.strip() for line in cards if card_line(line) is not None]
+    if not lines:
+        return theme
+    chosen = {"items": "\n".join(lines)}
+    if order in CARD_ORDERS:
+        chosen["order"] = order
+    if transition in CARD_TRANSITIONS:
+        chosen["transition"] = transition
+    widgets, changed = [], False
+    for widget in theme.widgets:
+        if widget.get("type") == "module" and widget.get("module") == "cards":
+            if not (widget.get("items") or "").strip():
+                widget, changed = {**widget, **chosen}, True
+        widgets.append(widget)
+    return replace(theme, widgets=widgets) if changed else theme
+
+
+def follows_cards(theme: Any) -> bool:
+    """Whether ``theme`` has a card slot that leaves its cards to the person (with_cards)."""
+    return any(
+        widget.get("type") == "module" and widget.get("module") == "cards"
+        and not (widget.get("items") or "").strip()
+        for widget in theme.widgets
+    )  # fmt: skip
+
+
+# -- expanding a theme -------------------------------------------------------
+
+
+def colors_of(palette: dict[str, str]) -> dict[str, str]:
+    """The palette roles, from the theme where it has them, else from the default look."""
+    default = LOOKS[DEFAULT_LOOK]["palette"]
+    return {role: _hex(palette.get(role, default[role])) for role in ROLES}
+
+
+def _fallback(module: dict[str, Any]) -> str | None:
+    chosen = module["fallback"]
+    if chosen == "auto":
+        return "disk" if module["source"] == "gpu" else None
+    return None if chosen in ("none", module["source"]) else chosen
+
+
+def build_module(
+    module: dict[str, Any], box: list[int], colors: dict[str, str], style: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The plain widgets of one module in ``box`` (raw, not yet checked)."""
+    kind = kinds()[module["module"]]
+    if module.get("finish") == "auto":  # the module's own look: a card is lit
+        module = {**module, "finish": kind.finish}
+
+    sources = _sources()
+    source = module["source"] if kind.sources else "cpu"
+    if source not in kind.sources and kind.sources:
+        source = kind.sources[0]
+    src = sources.get(source, sources["cpu"])
+    b = _Build(module, box, colors, style)
+    fallback = _fallback(module) if kind.sources and source in sources else None
+    if fallback is None:
+        if kind.sources:  # without its readings the module stays empty
+            own = source == "sensor" or (source == "fan" and b.module["sensor"])
+            b.needs = b.module["sensor"] if own else src.load
+        kind.build(b, src)
+    else:  # e.g. no GPU readings: the disk instead
+        b.needs = src.load
+        kind.build(b, src)
+        first = len(b.out)
+        b.needs = "!" + src.load
+        kind.build(b, sources[fallback])
+        for widget in b.out[first:]:
+            widget["id"] = "alt-" + widget["id"]
+    return b.out
+
+
+def expand(theme: Any) -> tuple[list[dict[str, Any]], dict[str, list[int]]]:
+    """The widgets to draw, with every module replaced by its parts.
+
+    Returns them and the box of every module (its cells), by module id. Parts
+    have the id ``"<module id>/<part>"`` and carry ``"_module"``: the
+    module's id, so the renderer can follow the module's visibility.
+    """
+    from libre_panel.theme.model import ThemeError, normalize_widget
+
+    modules = [w for w in theme.widgets if w["type"] == "module"]
+    if not modules and not theme.grid:
+        return list(theme.widgets), {}
+    grid = make_grid(theme.width, theme.height, theme.grid, theme.model)
+    colors = colors_of(theme.palette)
+    style = {**STYLE_DEFAULTS, **(theme.style or {}), FRAME_U: min(theme.width, theme.height) / 2}
+    widgets: list[dict[str, Any]] = []
+    boxes: dict[str, list[int]] = {}
+    if style["backdrop"] == "gradient":
+        widgets.append(
+            normalize_widget(
+                {"type": "rect", "id": "\0backdrop", "x": 0, "y": 0, "w": theme.width,
+                 "h": theme.height, "color": colors["bg"], "color2": colors["bg2"]},
+                0,
+            )[0]
+        )  # fmt: skip
+    for widget in theme.widgets:
+        if widget["type"] != "module":
+            widgets.append(widget)
+            continue
+        col = min(max(0, widget["col"]), grid.columns - 1)
+        row = min(max(0, widget["row"]), grid.rows - 1)
+        cols = min(max(1, widget["cols"]), grid.columns - col)
+        rows = min(max(1, widget["rows"]), grid.rows - row)
+        placed = {**widget, "col": col, "row": row, "cols": cols, "rows": rows}
+        color = placed["color"] or ""
+        if color.startswith("@"):  # a palette entry
+            color = theme.palette.get(color[1:], "")
+        placed["color"] = _hex(color) if color else None
+        box = grid.box(col, row, cols, rows)
+        boxes[widget["id"]] = box
+        for i, raw in enumerate(build_module(placed, box, colors, style)):
+            raw["id"] = f"{widget['id']}/{raw['id']}"
+            card = raw.pop("_card", None)  # a slot's part: the card it belongs to
+            try:
+                part, _warnings = normalize_widget(raw, i)
+            except ThemeError as exc:  # a bug in a module must not break the theme
+                theme.warnings.append(f"module {widget['id']!r}: {exc}")
+                continue
+            part["_module"] = widget["id"]
+            if card is not None:
+                part["_card"] = card
+            widgets.append(part)
+    return widgets, boxes
+
+
+def module_info() -> dict[str, Any]:
+    """What the editor needs: the kinds, their sources and sizes, the looks."""
+    return {
+        "kinds": {
+            key: {
+                "name": kind.name,
+                "sources": list(kind.sources),
+                "span": list(kind.span),
+                "items": default_items(key),
+                "fan_items": default_items("fans") if key == "temps" else "",
+            }
+            for key, kind in kinds().items()
+        },
+        "looks": {
+            key: {
+                "name": look["name"],
+                "palette": look_theme_parts(key)[0],
+                "style": look_theme_parts(key)[1],
+            }
+            for key, look in LOOKS.items()
+        },  # fmt: skip
+        "grid": dict(GRID_DEFAULTS),
+        "style": dict(STYLE_DEFAULTS),
+    }
+
+
+# -- starting layouts and detaching ------------------------------------------
+
+
+def _m(kind: str, col: int, row: int, cols: int = 1, rows: int = 1, **options: Any) -> dict:
+    return {"module": kind, "col": col, "row": row, "cols": cols, "rows": rows, **options}
+
+
+_TEMPLATES: dict[tuple[int, int], list[tuple[str, list[dict[str, Any]]]]] = {
+    (8, 2): [
+        ("overview", [_m("clock", 0, 0, 3), _m("network", 0, 1, 3), _m("weather", 3, 0, 2, 2),
+                      _m("ring", 5, 0, 3, source="cpu"), _m("ring", 5, 1, 3, source="gpu")]),
+        ("performance", [_m("stat", 0, 0, 2, 2, source="cpu"), _m("ring", 2, 0, 2, source="gpu"),
+                         _m("ring", 2, 1, 2, source="mem"), _m("bars", 4, 0, 1, 2),
+                         _m("clock", 5, 0, 3), _m("graph", 5, 1, 3, source="net")]),
+        ("calm", [_m("clock", 0, 0, 4, 2), _m("weather", 4, 0, 4), _m("date", 4, 1, 2),
+                  _m("system", 6, 1, 2)]),
+    ],
+    (3, 2): [
+        ("overview", [_m("clock", 0, 0, 2), _m("weather", 2, 0), _m("ring", 0, 1, source="cpu"),
+                      _m("ring", 1, 1, source="mem"), _m("network", 2, 1)]),
+        ("performance", [_m("ring", 0, 0, 1, 2, source="cpu"), _m("stat", 1, 0, 2, source="gpu"),
+                         _m("bars", 1, 1), _m("date", 2, 1)]),
+        ("calm", [_m("clock", 0, 0, 3), _m("weather", 0, 1, 2), _m("date", 2, 1)]),
+    ],
+    (2, 2): [
+        ("overview", [_m("clock", 0, 0, 2), _m("ring", 0, 1, source="cpu"),
+                      _m("ring", 1, 1, source="mem")]),
+        ("performance", [_m("ring", 0, 0, source="cpu"), _m("ring", 1, 0, source="gpu"),
+                         _m("ring", 0, 1, source="mem"), _m("ring", 1, 1, source="disk")]),
+        ("calm", [_m("clock", 0, 0, 2), _m("weather", 0, 1, 2)]),
+    ],
+    (2, 1): [
+        ("overview", [_m("stat", 0, 0, source="cpu"), _m("stat", 1, 0, source="mem")]),
+        ("performance", [_m("ring", 0, 0, source="cpu"), _m("ring", 1, 0, source="gpu")]),
+        ("calm", [_m("clock", 0, 0, 2)]),
+    ],
+    (2, 3): [
+        ("overview", [_m("clock", 0, 0, 2), _m("stat", 0, 1, source="cpu"),
+                      _m("stat", 1, 1, source="mem"), _m("graph", 0, 2, 2, source="cpu")]),
+        ("performance", [_m("ring", 0, 0, source="cpu"), _m("ring", 1, 0, source="gpu"),
+                         _m("ring", 0, 1, source="mem"), _m("ring", 1, 1, source="disk"),
+                         _m("network", 0, 2, 2)]),
+        ("calm", [_m("clock", 0, 0, 2), _m("weather", 0, 1, 2), _m("date", 0, 2, 2)]),
+    ],
+}  # fmt: skip
+
+# Wishes for other grids: (kind, options, cols, rows), placed where they fit.
+_WISHES: dict[str, list[tuple[str, dict[str, Any], int, int]]] = {
+    "overview": [("clock", {}, 3, 1), ("weather", {}, 2, 2), ("ring", {"source": "cpu"}, 3, 1),
+                 ("ring", {"source": "gpu"}, 3, 1), ("network", {}, 3, 1),
+                 ("ring", {"source": "mem"}, 1, 1), ("bars", {}, 1, 1)],
+    "performance": [("stat", {"source": "cpu"}, 2, 2), ("ring", {"source": "gpu"}, 2, 1),
+                    ("ring", {"source": "mem"}, 2, 1), ("bars", {}, 1, 2),
+                    ("clock", {}, 3, 1), ("graph", {"source": "net"}, 3, 1),
+                    ("ring", {"source": "disk"}, 1, 1)],
+    "calm": [("clock", {}, 4, 2), ("weather", {}, 4, 1), ("date", {}, 2, 1),
+             ("system", {}, 2, 1)],
+}  # fmt: skip
+
+
+def _pack(columns: int, rows: int, wishes: list[tuple[str, dict[str, Any], int, int]]) -> list:
+    """Place each wish at the first free spot, smaller if it must be."""
+    free = [[True] * columns for _ in range(rows)]
+    placed = []
+
+    def fits(col: int, row: int, cols: int, rows_: int) -> bool:
+        return all(
+            free[r][c] for r in range(row, row + rows_) for c in range(col, col + cols)
+        )  # fmt: skip
+
+    for kind, options, want_cols, want_rows in wishes:
+        spot = None
+        sizes = sorted(
+            {(min(c, columns), min(r, rows)) for c in range(want_cols, 0, -1)
+             for r in range(want_rows, 0, -1)},
+            key=lambda s: -s[0] * s[1],
+        )  # fmt: skip
+        for cols, rows_ in sizes:
+            for row in range(rows - rows_ + 1):
+                for col in range(columns - cols + 1):
+                    if fits(col, row, cols, rows_):
+                        spot = (col, row, cols, rows_)
+                        break
+                if spot:
+                    break
+            if spot:
+                break
+        if spot is None:
+            continue
+        col, row, cols, rows_ = spot
+        for r in range(row, row + rows_):
+            for c in range(col, col + cols):
+                free[r][c] = False
+        placed.append(_m(kind, col, row, cols, rows_, **options))
+    return placed
+
+
+def templates(columns: int, rows: int) -> list[dict[str, Any]]:
+    """Starting layouts for a grid of ``columns`` x ``rows`` cells."""
+    names = {"overview": t("Overview"), "performance": t("Performance"), "calm": t("Calm")}
+    chosen = _TEMPLATES.get((columns, rows))
+    if chosen is None:
+        chosen = [(key, _pack(columns, rows, wishes)) for key, wishes in _WISHES.items()]
+    return [
+        {"id": key, "name": names[key], "modules": [dict(m) for m in modules]}
+        for key, modules in chosen
+    ]
+
+
+def detach(theme: Any, module_id: str) -> list[dict[str, Any]]:
+    """The parts of one module as plain widgets, to edit them one by one."""
+    widgets, _boxes = expand(theme)
+    parts = []
+    for widget in widgets:
+        if widget.get("_module") != module_id or widget.get("_card", 0) != 0:
+            continue  # (the other cards of a slot are not there: it is its first card)
+        part = {k: v for k, v in widget.items() if k not in ("_module", "_card")}
+        part["id"] = part["id"].replace("/", "-")
+        part["group"] = module_id  # (to be put back together: Theme.detached)
+        parts.append(part)
+    return parts

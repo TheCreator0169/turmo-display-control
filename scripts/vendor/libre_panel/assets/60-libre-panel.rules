@@ -1,0 +1,49 @@
+# Libre Panel: let logged-in users access USB system-monitor panels.
+# Install:
+#   libre-panel udev-rules | sudo tee /etc/udev/rules.d/60-libre-panel.rules
+#   sudo udevadm control --reload-rules
+# then unplug and replug the panel.
+
+# Turing / TURZX V1.x USB panels (1.6" to 12.3", the pump of JONSBO's TF3-360SC), and Lian Li's
+# Universal Screen and HydroShift II, which speak a protocol close to theirs
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1cbe", MODE="0660", TAG+="uaccess"
+
+# JONSBO ZC-360: the three screens under its fans (3.38", "TURZX-338inch-r")
+SUBSYSTEM=="usb", ATTRS{idVendor}=="43a8", ATTRS{idProduct}=="0e61", MODE="0660", TAG+="uaccess"
+
+# JONSBO DS339: its USB display chip (MacroSilicon MS9132)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="345f", ATTRS{idProduct}=="9132", MODE="0660", TAG+="uaccess"
+
+# Thermalright's Trofeo Vision: the 6.86" (a HID device) and the 9.16" and 11.3" bars
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5302", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5408", MODE="0660", TAG+="uaccess"
+
+# BeadaPanel (NXElec), every size
+SUBSYSTEM=="usb", ATTRS{idVendor}=="4e58", ATTRS{idProduct}=="1001", MODE="0660", TAG+="uaccess"
+
+# NZXT Krakens with an LCD (Z53/Z63/Z73, 2023, Elite RGB and Plus 2024): the pictures go over
+# USB, the screen's commands through the HID interface's hidraw node, which the kernel keeps
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="3008", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="3008", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="300e", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="300e", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="3012", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="3012", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="3014", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="3014", MODE="0660", TAG+="uaccess"
+
+# Thermaltake's 6" LCD (a HID device)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="2347", MODE="0660", TAG+="uaccess"
+
+# udisp USB displays (Waveshare's USB monitors with their USB display card image, ESP32 displays)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="2986", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="2987", MODE="0660", TAG+="uaccess"
+
+# Waveshare's USB monitors (a serial port over USB; Libre Panel sends them the readings): the
+# person at the computer may use the port. Units with the placeholder ids 1234:5678 are taken by
+# the kernel's usbtouchscreen driver, which knows a touchscreen by those ids: once it has the
+# display's data interface (CDC data, class 0a, which no touchscreen has), both of the display's
+# interfaces go to cdc_acm instead. It holds from the next time the display is plugged in.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1234", ATTRS{idProduct}=="5678", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ATTRS{product}=="Virtual Serial Port", MODE="0660", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="usbtouchscreen", ATTRS{idVendor}=="1234", ATTRS{idProduct}=="5678", ATTR{bInterfaceClass}=="0a", RUN+="/bin/sh -c 'd=%k; p=$${d%%.*}; u=/sys/bus/usb/drivers/usbtouchscreen; [ -e $$u/$$p.0 ] && echo -n $$p.0 > $$u/unbind; echo -n $$d > $$u/unbind; echo -n $$p.0 > /sys/bus/usb/drivers/cdc_acm/bind'"

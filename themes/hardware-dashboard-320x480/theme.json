@@ -1,0 +1,164 @@
+{
+  "format": "libre-panel-theme/1",
+  "name": "Hardware Dashboard",
+  "author": "TURMO-OpenSource",
+  "license": "CC0-1.0",
+  "description": "Dense multi-module dashboard: temperatures, per-core load, drives, network, system, battery and power in one grid.",
+  "display": {
+    "model": "turing-3.5",
+    "orientation": "portrait",
+    "width": 320,
+    "height": 480
+  },
+  "palette": {
+    "bg": "#0b0d12",
+    "bg2": "#10131a",
+    "card": "#171b24",
+    "card2": "#20242f",
+    "edge": "#2c3140",
+    "text": "#eef1f6",
+    "muted": "#9298a8",
+    "dim": "#5c5c68",
+    "accent": "#4da3ff",
+    "accent_deep": "#0091b8",
+    "violet": "#a78bfa",
+    "violet_deep": "#5e2fd0",
+    "green": "#34d399",
+    "pink": "#f472b6",
+    "warn": "#ffb020",
+    "crit": "#ff3b5c",
+    "line": "#2a2a35",
+    "track": "#1d1d26",
+    "text2": "#dcdce4",
+    "text3": "#b8b8c2"
+  },
+  "font": "builtin:Barlow-Medium",
+  "background": {
+    "color": "@bg2",
+    "image": null
+  },
+  "refresh_ms": 1000,
+  "animation": {
+    "smoothing_ms": 450
+  },
+  "grid": {
+    "columns": 12,
+    "rows": 8,
+    "gap": 8,
+    "margin": 10
+  },
+  "style": {
+    "card": "flat",
+    "radius": 10,
+    "glow": 0.3,
+    "backdrop": "flat",
+    "display_font": "builtin:Barlow-SemiBold",
+    "text_font": "builtin:Barlow-Medium"
+  },
+  "widgets": [
+    {
+      "type": "rect",
+      "id": "backdrop",
+      "x": 0,
+      "y": 0,
+      "w": 320,
+      "h": 480,
+      "color": "@bg2",
+      "color2": "@bg",
+      "locked": true
+    },
+    {
+      "type": "clock",
+      "id": "clock",
+      "x": 14,
+      "y": 6,
+      "format": "%H:%M",
+      "font_size": 36,
+      "color": "@text",
+      "font": "builtin:Barlow-Bold",
+      "finish": "lit"
+    },
+    {
+      "type": "clock",
+      "id": "date",
+      "x": 14,
+      "y": 44,
+      "format": "%a %d %b",
+      "font_size": 13,
+      "color": "@muted",
+      "finish": "lit"
+    },
+    {
+      "type": "module",
+      "id": "temps",
+      "module": "temps",
+      "card": "on",
+      "source": "cpu",
+      "col": 0,
+      "row": 1,
+      "cols": 6,
+      "rows": 2
+    },
+    {
+      "type": "module",
+      "id": "cores",
+      "module": "cores",
+      "card": "on",
+      "sensor": "cpu.load",
+      "col": 6,
+      "row": 1,
+      "cols": 6,
+      "rows": 2
+    },
+    {
+      "type": "module",
+      "id": "system",
+      "module": "system",
+      "card": "on",
+      "col": 0,
+      "row": 5,
+      "cols": 6,
+      "rows": 2
+    },
+    {
+      "type": "module",
+      "id": "drives",
+      "module": "drives",
+      "card": "on",
+      "col": 0,
+      "row": 3,
+      "cols": 6,
+      "rows": 2
+    },
+    {
+      "type": "module",
+      "id": "network",
+      "module": "network",
+      "card": "on",
+      "col": 6,
+      "row": 3,
+      "cols": 6,
+      "rows": 2
+    },
+    {
+      "type": "module",
+      "id": "battery",
+      "module": "battery",
+      "card": "on",
+      "col": 6,
+      "row": 5,
+      "cols": 6,
+      "rows": 2
+    },
+    {
+      "type": "module",
+      "id": "power",
+      "module": "power",
+      "card": "on",
+      "col": 0,
+      "row": 7,
+      "cols": 12,
+      "rows": 1
+    }
+  ]
+}

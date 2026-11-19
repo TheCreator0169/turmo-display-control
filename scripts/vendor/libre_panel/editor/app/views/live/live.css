@@ -1,0 +1,459 @@
+/* Live: how the panel runs in words, the picture on the panel, its numbers and the log on the
+   left; smooth motion, the sensors, the services and test notices on the right (Live.dc.html) */
+
+.live {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 400px;
+  min-height: 0;
+}
+
+.live-main {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+  min-height: 0;
+  padding: 24px 28px;
+  overflow-y: auto;
+}
+
+.live-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.live-head h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.live-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* how it runs, in a calm sentence; the numbers below are the detail */
+.live-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  flex-shrink: 0;
+}
+
+.live-status > .dot {
+  width: 10px;
+  height: 10px;
+  margin-top: 6px;
+}
+
+.live-status.warn {
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+
+.live-status-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.live-status-text strong {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.live-status-text span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.live-numbers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.live-main > .section-title {
+  margin-bottom: -12px; /* the log belongs to its heading */
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.dot.showing,
+.dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+}
+
+.dot.waiting,
+.dot.starting,
+.dot.warn {
+  background: var(--warn);
+}
+
+.dot.error {
+  background: var(--danger);
+}
+
+.live-tiles {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.live-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+}
+
+.live-tile-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-tile b {
+  margin-top: 4px;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.live-tile small {
+  min-height: 15px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+}
+
+.live-tile-part {
+  white-space: nowrap; /* a narrow window wraps the note between its parts, it does not cut it off */
+}
+
+.live-tile.ok b {
+  color: #6ee7a0;
+}
+
+.live-tile.warn b {
+  color: var(--warn);
+}
+
+.live-tile.bad b {
+  color: var(--danger-text);
+}
+
+.live-log {
+  flex: 1;
+  min-height: 120px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #080b0f;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.live-log .warn {
+  color: var(--warn);
+}
+
+.live-log .bad {
+  color: var(--danger-text);
+}
+
+.live-log p {
+  margin: 0;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* -- the side ---------------------------------------------------------------------------------- */
+
+.live-side {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 24px 22px;
+  overflow-y: auto;
+  border-left: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.live-side section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.live-side .section-title {
+  margin-bottom: 4px;
+}
+
+.live-video {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.live-video > .dot {
+  align-self: flex-start;
+  margin-top: 6px; /* beside the first line of a text that wraps */
+}
+
+.live-video-text {
+  flex: 1 1 0; /* the text wraps in its place; it does not drop below the dot */
+  min-width: 0;
+}
+
+.live-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.live-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.live-row-name {
+  flex: 0 0 auto;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-row-note {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-row-note.warn {
+  color: var(--warn);
+}
+
+/* a service: its name, and under it what it does or how it runs, both whole (side by side, a
+   long name or note was cut off: "Rundenbericht und Verlauf", "Waveshare-USB-Monitor") */
+.live-row-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.live-row-text .live-row-name,
+.live-row-text .live-row-note {
+  max-width: none;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.live-row-note.bad {
+  color: var(--danger-text);
+}
+
+.dot.idle {
+  background: var(--dim);
+}
+
+.live-source details > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.live-source details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.live-source details > summary .icon {
+  color: var(--dim);
+  transition: transform 0.12s;
+}
+
+.live-source details[open] > summary .icon {
+  transform: rotate(180deg);
+}
+
+.live-source details > summary:hover {
+  background: var(--surface-2);
+}
+
+.live-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.live-details div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.live-details dt {
+  color: var(--muted);
+}
+
+.live-details dd {
+  margin: 0;
+  text-align: right;
+}
+
+.live-hint {
+  margin: 6px 0 0;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.live-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.live-note.bad {
+  color: var(--danger-text);
+}
+
+.live-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.live-chip {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line-4);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  transition: border-color 0.12s;
+}
+
+.live-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.live-chip:disabled {
+  color: var(--dim);
+}
+
+.live-result {
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.live-result.ok {
+  color: #6ee7a0;
+}
+
+.live-result.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* Now or History (index.js), at the top of both */
+.live-switch {
+  display: flex;
+  gap: 4px;
+  align-self: flex-start;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+}
+
+.live-switch a {
+  padding: 5px 14px;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.live-switch a:hover {
+  color: var(--text);
+}
+
+.live-switch a[aria-current="page"] {
+  background: var(--surface-3);
+  color: var(--text);
+}

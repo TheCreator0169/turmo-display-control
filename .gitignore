@@ -1,0 +1,48 @@
+git/
+*.egg-info/
+__pycache__/
+*.pyc
+venv/
+.venv/
+build/
+dist/
+.pre-commit-config.yaml
+.DS_Store
+Thumbs.db
+
+# WSL-side tooling artifacts
+previews/live*.png
+!.gitignore
+
+# Keep these checked in; ignore generated preview PNGs per-theme only
+themes/cyberpunk-neon/previews/
+themes/custom-blank-canvas/previews/
+themes/futuristic-hud/previews/
+themes/hardware-dashboard/previews/
+themes/matrix-terminal/previews/
+themes/minimal-dark/previews/
+themes/rgb-gaming/previews/
+themes/clean-white/previews/
+
+# Build outputs, archives and local-only artifacts (added with git init 2026-11-16)
+archives/
+dist_rollback_*/
+*.buggy
+*.log
+.venv-win/
+$extractDir/
+TURMO-Display-Control
+node_modules/
+
+# Debug leftovers from earlier sessions (not source)
+pyi_log.txt
+stdout.txt
+stderr.txt
+query
+portable.flag
+*.spec.tmp
+
+# # old/ was emptied (Recycle Bin) 2026-11-18; the next move-to-old keeps this line
+old/TURMO-Display-Control.bin-nov13
+
+sandbox/out/

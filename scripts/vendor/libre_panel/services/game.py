@@ -1,0 +1,387 @@
+"""Game mode: the panel changes by itself when you play.
+
+The service looks every few seconds for a game: a program from the list in the
+settings, or any program of a game installed through Steam, another launcher
+(services/launchers.py) or in a folder named in the settings whose window has
+been in front once (where Libre Panel cannot tell which window is in front,
+any program of such a game that runs). Once it finds one, it publishes the
+game's name (``game.name``), its logo from Steam's cache (``game.logo``) and
+how long it has been played (``game.time``, in seconds, each second: since its
+program started, where that can be told), and switches to the mode ``game``
+(``[modes.game]``: its own frame rate and theme) with an entrance that shows the
+logo. A few seconds after the game ends
+it switches back, with the entrance for the end.
+
+The logo stays after the game, until the next one comes: the round report that
+follows shows it beside the game's name.
+
+Without the entrance a message ("Game mode") says that the panel changed.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from PIL import Image
+
+from libre_panel.i18n import t
+from libre_panel.plugins import Service
+from libre_panel.sensors import presentmon
+from libre_panel.sensors.base import Snapshot
+from libre_panel.services import machine as computer
+from libre_panel.services.launchers import Catalog
+from libre_panel.services.steam import Library
+
+NAME = "game.name"
+LOGO = "game.logo"
+TIME = "game.time"
+MODE = "game"
+SAMPLE_WAIT_S = 1.0  # at most so long the switch waits for a sample that has the logo
+TICK_S = 0.2  # how often the worker looks at that deadline while it waits
+POLL_RANGE_S = (0.25, 60.0)  # how often it looks for a game
+
+
+@dataclass(frozen=True)
+class Found:
+    """A game that runs."""
+
+    key: str  # the same key, the same game: its program, "steam:<number>", "epic:<app>" and
+    #           so on for another launcher's, "folder:<its folder>", "" for ``force``
+    name: str
+    pid: int = 0
+    path: str = ""
+    appid: str = ""  # Steam's number for it, if it is a Steam game
+
+
+def program_of(found: Found) -> str | None:
+    """The file name of the game's program in lower case, which is how PresentMon names the
+    program whose frames it counts. None where there is no program (a forced game mode)."""
+    if found.path:
+        return os.path.basename(found.path).lower() or None
+    return found.key if found.key and ":" not in found.key else None
+
+
+def parse_programs(raw: list[Any], report: Callable[[str], None]) -> dict[str, str]:
+    """The ``programs`` option: ``"game.exe"`` or ``"game.exe = A Better Name"``,
+    as {program in lower case: name to show}."""
+    programs = {}
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.partition("=")[0].strip():
+            report(f"programs: {entry!r} is no program name")
+            continue
+        program, _, label = entry.partition("=")
+        program = program.strip().lower()
+        programs[program] = label.strip() or program.removesuffix(".exe")
+    return programs
+
+
+class Detector:
+    """Tells whether a game runs. Stays on a game for ``linger_s`` after its
+    program ended (games start again while they are set up; launchers swap
+    their process)."""
+
+    def __init__(
+        self,
+        machine: Any,
+        library: Library,
+        programs: dict[str, str],
+        steam: bool = True,
+        linger_s: float = 6.0,
+        catalog: Catalog | None = None,
+    ) -> None:
+        self.machine, self.library, self.programs = machine, library, programs
+        self.steam, self.linger_s = steam, linger_s
+        self.catalog = catalog if catalog is not None and catalog.wanted else None
+        self.game: Found | None = None
+        self.seen = 0.0  # when its program was last seen
+        self.front: set[int] = set()  # programs whose window has been in front once
+
+    def look(self, now: float) -> Found | None:
+        """The game that runs at ``now``, or None."""
+        looking = self.programs or self.steam or self.catalog is not None
+        running = self.machine.programs() if looking else []
+        hit = (
+            self._listed(running)
+            or (self._steam(running) if self.steam else None)
+            or (self._launchers(running) if self.catalog is not None else None)
+        )
+        if hit is not None:
+            self.game, self.seen = hit, now
+        elif self.game is not None and now - self.seen > self.linger_s:
+            self.game = None
+            self.front &= {program.pid for program in running}
+        return self.game
+
+    def _listed(self, running: list[Any]) -> Found | None:
+        for program, label in self.programs.items():
+            for found in running:
+                if found.name == program:
+                    steam = self.library.match(found.path)
+                    return Found(
+                        program, label, found.pid, found.path, steam.appid if steam else ""
+                    )
+        return None
+
+    def _steam(self, running: list[Any]) -> Found | None:
+        """A program of a game installed through Steam."""
+        if not self.library.games():
+            return None
+
+        def match(path: str) -> tuple[str, str, str] | None:
+            game = self.library.match(path)
+            # one game, whatever the program of it that is in front
+            return (f"steam:{game.appid}", game.name, game.appid) if game else None
+
+        return self._installed(running, match)
+
+    def _launchers(self, running: list[Any]) -> Found | None:
+        """A program of a game of another launcher, or in a folder named in the settings."""
+        if self.catalog is None or not self.catalog.games():
+            return None
+
+        def match(path: str) -> tuple[str, str, str] | None:
+            game = self.catalog.match(path) if self.catalog else None
+            return (f"{game.source}:{game.key}", game.name, "") if game else None
+
+        return self._installed(running, match)
+
+    def _installed(
+        self, running: list[Any], match: Callable[[str], tuple[str, str, str] | None]
+    ) -> Found | None:
+        """The program of an installed game (``match`` tells its key, name and Steam number).
+        Where we know which window is in front, it must have been in front once: a library also
+        holds programs that run all day (a wallpaper, a launcher's helper)."""
+        front = self.machine.foreground_pid() if self.machine.has_foreground else None
+        current = self.game.pid if self.game else 0
+        # the game's program in front first (a launcher or an anti-cheat's starter that stays
+        # in the background is not the one that draws), then the one it is: keep the game
+        order = sorted(running, key=lambda p: (p.pid != front, p.pid != current))
+        for program in order:
+            game = match(program.path)
+            if game is None:
+                continue
+            if front is not None:
+                if program.pid == front:
+                    self.front.add(program.pid)
+                if program.pid not in self.front:
+                    continue
+            key, name, appid = game
+            return Found(key, name, program.pid, program.path, appid)
+        return None
+
+
+class Game(Service):
+    """Switches to game mode while a game runs."""
+
+    name = "game"
+    api = 1
+    options = {
+        "programs": ("list", []),
+        "steam": ("bool", True),
+        "steam_path": ("string", ""),
+        "launchers": ("bool", True),
+        "folders": ("list", []),
+        "ignore": ("list", []),
+        "automatic": ("bool", True),
+        "force": ("bool", False),
+        "entrance": ("bool", True),
+        "logo": ("bool", True),
+        "linger_s": ("number", 6.0),
+        "poll_s": ("number", 2.0),
+    }
+
+    def __init__(
+        self,
+        host: Any,
+        options: dict[str, Any],
+        *,
+        machine: Any = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(host, options)
+        self.clock = clock
+        self.machine = machine or computer.current()
+        self.library = Library(options["steam_path"], options["ignore"], clock)
+        programs = parse_programs(options["programs"], lambda text: host.log.warning("%s", text))
+        self.catalog = Catalog(options["folders"], options["ignore"], options["launchers"], clock)
+        self.detector = Detector(
+            self.machine, self.library, programs, options["steam"], options["linger_s"],
+            self.catalog,
+        )  # fmt: skip
+        self.poll_s = min(max(float(options["poll_s"]), POLL_RANGE_S[0]), POLL_RANGE_S[1])
+        self.found: Found | None = None  # the game the panel is set up for
+        self.logo: Image.Image | None = None
+        self.in_mode = False
+        self.waiting: float | None = None  # since when the switch waits for a sample with the logo
+        self.since: float | None = None  # on ``clock``: since when the game has been played
+        self._played = -1  # the seconds ``game.time`` said last
+        self._lock = threading.RLock()
+        self._ended = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failure: str | None = None
+
+    def start(self) -> None:
+        # The frame rates come from PresentMon, whose recording session must exist before
+        # the game starts (an anti-cheat refuses a new one): the service asks for them, so
+        # that the source runs for as long as the service does, whether a theme shows them or not.
+        self.host.want("game.*")
+        self.host.on("sample", self.on_sample)
+        self._thread = threading.Thread(target=self._run, name="game-mode", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._ended.set()
+        if self._thread is not None:
+            self._thread.join(3.0)
+            self._thread = None
+        presentmon.set_target(None)
+
+    # -- looking ---------------------------------------------------------------------
+
+    def _run(self) -> None:
+        due = self.clock() + self.poll_s  # not at once: the panel is still starting
+        while True:
+            wait = TICK_S if self.waiting is not None else max(0.01, due - self.clock())
+            if self.since is not None:  # the time played goes on second by second
+                wait = min(wait, max(0.01, 1.0 - (self.clock() - self.since) % 1.0))
+            if self._ended.wait(wait):
+                return
+            try:
+                self.advance()
+                self.tick()
+                if self.clock() >= due:
+                    due = self.clock() + self.poll_s
+                    self.detect()
+                self._report(None)
+            except Exception as exc:  # one failed round must not end the service
+                self._report(f"{type(exc).__name__}: {exc}")
+
+    def _report(self, failure: str | None) -> None:
+        """Say a new failure once, and when it is over."""
+        if failure != self._failure:
+            if failure:
+                self.host.log.warning("looking for games failed: %s", failure)
+            else:
+                self.host.log.info("looking for games works again")
+            self._failure = failure
+
+    def detect(self) -> None:
+        """Look for a game once and set the panel up for what is found."""
+        now = self.clock()
+        found = self.detector.look(now) if self.options["automatic"] else None
+        if found is None and self.options["force"]:
+            found = Found("", t("Game mode"))
+        with self._lock:
+            if not self._ended.is_set():  # a look that was under way when the service stopped
+                self._apply(found, now)
+
+    def _apply(self, found: Found | None, now: float) -> None:
+        if found is None:
+            if self.found is not None:
+                self._end()
+            return
+        if self.found is not None and self.found.key == found.key:
+            if program_of(found) != program_of(self.found):  # another program of the game
+                self.found = found
+                presentmon.set_target(program_of(found))
+            return  # still the same game
+        self.found, self.logo = found, self._logo_of(found)
+        running = self.machine.running_s(found.pid) if found.pid else None
+        self.since = now - (running if running is not None else 0.0)
+        self._played = -1
+        self.tick()
+        self.host.log.info("game: %s", found.name)
+        presentmon.set_target(program_of(found))  # its frames are the ones that count
+        self.host.publish(NAME, found.name, "", "Game")
+        self.host.publish_image(LOGO, self.logo)
+        if self.in_mode:
+            return  # one game after the other: the screens learn the new name and logo
+        if self.logo is None:
+            self._enter()
+        else:  # the first game screen should have the logo: wait for a sample that has it
+            self.waiting = now
+
+    def tick(self) -> None:
+        """Say how long the game has been played (``game.time``), once a second."""
+        with self._lock:
+            if self.since is None or self._ended.is_set():
+                return
+            played = int(max(0.0, self.clock() - self.since))
+            if played != self._played:
+                self._played = played
+                self.host.publish(TIME, played, "s", t("Played"))
+
+    def _logo_of(self, found: Found) -> Image.Image | None:
+        if not (self.options["logo"] and found.appid):
+            return None
+        return self.library.logo(found.appid)
+
+    # -- switching -----------------------------------------------------------------------
+
+    def on_sample(self, snapshot: Snapshot) -> None:
+        with self._lock:
+            there = self.waiting is not None and snapshot.images.get(LOGO) is not None
+            if there and not self._ended.is_set():
+                self._enter()
+
+    def advance(self) -> None:
+        """The switch no longer waits for a sample once a second has passed."""
+        with self._lock:
+            late = self.waiting is not None and self.clock() - self.waiting >= SAMPLE_WAIT_S
+            if late and not self._ended.is_set():
+                self._enter()
+
+    def _enter(self) -> None:
+        self.waiting = None
+        self.host.set_mode(MODE, transition=self._transition("start"))
+        self.in_mode = True
+        if not self.options["entrance"]:
+            self._announce(t("Game mode"))
+
+    def _end(self) -> None:
+        was_in_mode = self.in_mode
+        if was_in_mode:
+            self.host.set_mode(None, transition=self._transition("end"))
+            if not self.options["entrance"]:
+                self._announce(t("Game ended"))
+        self.host.log.info("game over" if was_in_mode else "game gone before the mode began")
+        self.waiting, self.in_mode, self.found, self.logo = None, False, None, None
+        self.since, self._played = None, -1
+        presentmon.set_target(None)
+        self.host.publish(NAME, None, "", "Game")
+        self.host.publish(TIME, None, "s", t("Played"))
+        if not was_in_mode:  # a game that was played leaves its logo for the round report
+            self.host.publish_image(LOGO, None)
+
+    def _transition(self, kind: str) -> tuple[str, dict[str, Any]] | None:
+        """The entrance with the game's name and logo (a picture, not its key: it
+        does not depend on a sample), or the theme's own transition."""
+        if not self.options["entrance"]:
+            return None
+        params: dict[str, Any] = {"kind": kind}
+        if self.found is not None and self.found.key:  # a forced mode has no game to name
+            params["title"] = self.found.name
+        if self.logo is not None:
+            params["logo"] = self.logo
+        return ("entrance", params)
+
+    def status(self) -> dict[str, Any]:
+        """What the service is doing, for a console page."""
+        return {
+            "game": self.found.name if self.found else None,
+            "steam_id": (self.found.appid or None) if self.found else None,
+            "mode": MODE if self.in_mode else None,
+            "waiting": self.waiting is not None,
+        }
+
+    def _announce(self, label: str) -> None:
+        if self.found is not None:
+            self.host.notify(
+                self.found.name, icon="gamepad", kind="game", key="game", rank=1, seconds=3.0,
+                payload={"label": label},
+            )  # fmt: skip

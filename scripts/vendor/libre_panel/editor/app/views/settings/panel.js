@@ -1,0 +1,1146 @@
+// Settings → Panel: the panel that was found, smooth motion (the video mode) and its frame
+// rate, the name of the standby clip while smooth motion lacks it, brightness and which way up
+// the panel is mounted, the start screen; under Advanced where the pictures go, the file they go
+// to without a panel, how a TURZX USB panel takes its stills, the standby clip's name once it is
+// set, the serial port and ffmpeg; and the panels beside this one, each with its model, theme,
+// brightness and port.
+
+import { normalTheme, themeName } from "../../core/actions.js";
+import { endpoints } from "../../core/api.js";
+import { control, usePolled } from "../../core/console.js";
+import { statTiles } from "../../core/stats.js";
+import { versionBase } from "../../core/orientation.js";
+import { formatNumber, t } from "../../core/i18n.js";
+import {
+  loadClipQuestion,
+  loadPanelInfo,
+  loadSettings,
+  saveSettings,
+  setting,
+  useCatalog,
+  useConfig,
+} from "../../core/settings.js";
+import { store, useStore } from "../../core/state.js";
+import { videoState } from "../../core/video.js";
+import { html, useEffect, useRef, useState } from "../../lib/preact.js";
+import { panelName, stateText } from "../../shell/panel-popover.js";
+import { Segmented, Select, Slider, Toggle } from "../../ui/controls.js";
+import { Popover } from "../../ui/layer.js";
+import { MountedChoice } from "../home/panel.js";
+import { fitsPanel } from "../home/themes.js";
+import { toastError } from "../../ui/toast.js";
+import { openDialog } from "../../ui/dialog.js";
+import { Arrangement, arranged, arrangementItem } from "./arrangement.js";
+import { ColourCard } from "./colours.js";
+import { FOLLOW, NewPanel, chooseTheme, themeChoice } from "./newpanel.js";
+import { Card, CommitField, Disclosure, SettingRow, Status, copyText, usePolling } from "./parts.js";
+import { StartScreenCard } from "./startscreen.js";
+import { TransitionsCard } from "./transitions.js";
+import { Zc360Row, joinZc360, splitZc360, zc360Places } from "./zc360.js";
+
+/** Write settings, and ask about the panel again: what they change shows there. */
+async function change(changes) {
+  if (await saveSettings(changes)) loadPanelInfo();
+}
+
+export const loadPanelSection = () => Promise.all([loadSettings(), loadPanelInfo()]);
+
+const connectionName = (model) =>
+  model.connection === "usb" ? "USB" : model.port ? t("USB serial ({port})", { port: model.port }) : t("USB serial");
+
+// -- the panel that was found ----------------------------------------------------------------
+
+/** The panel's shape, as mounted, in the card; round ones are round. */
+function Outline({ model, tone }) {
+  const [width, height] = model ? model.size : [16, 5];
+  const scale = Math.min(150 / width, 56 / height);
+  return html`<span
+    class=${`panel-outline ${tone}${model?.shape === "round" ? " round" : ""}${model ? "" : " none"}`}
+    style=${{ width: `${Math.max(28, Math.round(width * scale))}px`, height: `${Math.max(28, Math.round(height * scale))}px` }}
+  ></span>`;
+}
+
+function PanelPicker({ configured, onPick }) {
+  const models = useStore((s) => s.specs?.models || []);
+  const groups = [];
+  for (const model of models) {
+    let group = groups.find((item) => item.vendor === model.vendor);
+    if (!group) groups.push((group = { vendor: model.vendor, models: [] }));
+    group.models.push(model);
+  }
+  return html`<div class="pop-section">
+    <div class="pop-title">${t("Which panel is connected")}</div>
+    <div class="model-list" role="listbox" aria-label=${t("Panel model")}>
+      <button type="button" role="option" class="model-row" aria-selected=${String(configured === "auto")} onClick=${() => onPick("auto")}>
+        <span class="model-shape free"></span>
+        <span class="model-name">${t("Detect automatically")}</span>
+        <span class="model-size"></span>
+        <span class="model-proto"></span>
+      </button>
+      ${groups.map(
+        (group) => html`<div key=${group.vendor}>
+          <div class="model-vendor">${group.vendor}</div>
+          ${group.models.map(
+            (model) => html`<button
+              type="button"
+              role="option"
+              key=${model.id}
+              class="model-row"
+              title=${model.limits || null}
+              aria-selected=${String(model.id === configured)}
+              onClick=${() => onPick(model.id)}
+            >
+              <span class=${`model-shape${model.shape === "round" ? " round" : ""}`}></span>
+              <span class="model-name">${panelName(model)}</span>
+              <span class="model-size mono">${model.landscape[0]} × ${model.landscape[1]}</span>
+              <span class="model-proto" title=${model.protocol.startsWith("usb") ? null : t("USB serial: slower, without smooth motion")}>${model.protocol.startsWith("usb") ? "USB" : t("serial")}</span>
+            </button>`,
+          )}
+        </div>`,
+      )}
+    </div>
+  </div>`;
+}
+
+/**
+ * A port with the USB ids of an awake Turing panel (rev. C), which other USB devices have too:
+ * Libre Panel talks to it once the person says which panel it is (device.model).
+ */
+function MaybePanel({ maybe, onPick }) {
+  return html`<div class="panel-maybe" data-maybe-port=${maybe.port}>
+    <div class="settings-row-hint">${t("{port} may be a Turing panel (rev. C). Other USB devices have the same USB ids, so Libre Panel talks to it only once you say which panel it is:", { port: maybe.port })}</div>
+    <div class="panel-maybe-choice">
+      ${maybe.models.map((model) => html`<button type="button" class="btn" key=${model.id} onClick=${() => onPick(model.id)}>${panelName(model)}</button>`)}
+    </div>
+  </div>`;
+}
+
+function PanelFound() {
+  const info = useStore((s) => s.panelInfo);
+  const [open, setOpen] = useState(false);
+  const anchor = useRef(null);
+  usePolling(loadPanelInfo, 6000); // a panel plugged in while this is open
+  if (!info) return null;
+  const { found, model, configured, running } = info;
+  // the running app says why it waits for the panel (no permission, a missing library …)
+  const why = running && ["waiting", "error"].includes(running.state) && running.detail;
+  const same = Boolean(found && model && found.id === model.id);
+  const shown = same ? found : model;
+  let status = null; // without a panel there is nothing to say but how to get one
+  if (same) status = html`<${Status} tone="ok">${t("Connected")}<//>`;
+  else if (found && model)
+    status = html`<${Status} tone="warn">${t("Another panel is connected: {name}", { name: panelName(found) })}<//>`;
+  else if (model) status = html`<${Status} tone="warn">${t("Not connected")}<//>`;
+  const details = shown ? [connectionName(shown), `${shown.size[0]} × ${shown.size[1]}`] : [];
+  const pick = (id) => {
+    setOpen(false);
+    if (id !== configured) change({ "device.model": id });
+  };
+  return html`<${Card} id="panel-found" class="panel-found">
+    <${Outline} model=${shown} tone=${same ? "on" : "off"} />
+    <div class="panel-found-text">
+      <div class="panel-found-name">${model ? panelName(model) : t("No panel found")}</div>
+      <div class="panel-found-detail">
+        ${details.length
+          ? html`${details.join(" · ")} · ${status}`
+          : html`${t("Plug it in: Libre Panel looks for it every few seconds. Until then the picture goes to a file.")}`}
+      </div>
+      ${configured !== "auto" ? html`<div class="settings-row-hint">${t("Chosen by hand. “Detect automatically” goes back to finding it.")}</div>` : null}
+      ${shown?.limits ? html`<div class="settings-row-hint" data-limits-note>${shown.limits}</div>` : null}
+      ${shown && shown.connection !== "usb" && !shown.limits
+        ? html`<div class="settings-row-hint" data-serial-note>${t("An older USB serial panel: Libre Panel sends it only what changes, so numbers, bars and the clock keep up. It has no smooth motion, parts that move change less often than on a USB panel, and a new theme builds up for a moment.")}</div>`
+        : null}
+      ${why ? html`<div class="panel-found-why"><${Status} tone="warn">${stateText(running.state)}: ${running.detail}<//></div>` : null}
+      ${!found && configured === "auto" ? (info.maybe || []).map((maybe) => html`<${MaybePanel} key=${maybe.port} maybe=${maybe} onPick=${pick} />`) : null}
+    </div>
+    <button ref=${anchor} type="button" class="btn" aria-haspopup="dialog" aria-expanded=${String(open)} onClick=${() => setOpen(!open)}>
+      ${t("Another panel")}
+    </button>
+    <${Popover} anchor=${anchor} open=${open} onClose=${() => setOpen(false)} placement="bottom-end" label=${t("Panel")} width=${380}>
+      <${PanelPicker} configured=${configured} onPick=${pick} />
+    <//>
+  <//>`;
+}
+
+// -- smooth motion (the video mode) --------------------------------------------------------------
+
+/** What smooth motion is doing, in a mark and words. */
+function VideoStatus({ video, mode, fps }) {
+  const state = videoState(video, mode, fps);
+  return html`<${Status} tone=${state.tone}>${state.text}<//>`;
+}
+
+/** Whether the rate and the standby clip matter: smooth motion is not off, on a panel it is for. */
+const videoApplies = (config, info) => Boolean(info.video.usb) && config.video.mode !== "off";
+
+/** The name of the standby clip, written when it is typed (and so answers Start's question). */
+function ClipField({ value }) {
+  return html`<${CommitField}
+    label=${t("Name of the standby clip")}
+    value=${value}
+    placeholder="usr/data/standby.h264"
+    mono
+    onCommit=${(text) => change({ "video.local_clip": text, "video.clip_asked": true })}
+  />`;
+}
+
+/**
+ * The name of the standby clip while smooth motion lacks it: the panel's own app gives it a name,
+ * which a click takes; another can be typed. Nothing is written before either.
+ */
+function ClipRow({ value }) {
+  const name = useStore((s) => s.clipQuestion?.name);
+  useEffect(() => {
+    if (!name) loadClipQuestion();
+  }, []);
+  const use = () => change({ "video.local_clip": name, "video.clip_asked": true });
+  return html`<${SettingRow}
+    stacked
+    class="clip-row"
+    title=${t("Name of the standby clip")}
+    hint=${name
+      ? t("Smooth motion needs the name of the clip your panel plays by itself when the PC starts. Its own app calls it {name}. Nothing is written until you choose it.", { name })
+      : t("Smooth motion needs the name of the clip your panel plays by itself when the PC starts, as its own app calls it. Nothing is written until you type it.")}
+  >
+    <div class="clip-choice">
+      <${ClipField} value=${value} />
+      ${name ? html`<button type="button" class="btn btn-primary" onClick=${use}>${t("Use this name")}</button>` : null}
+    </div>
+  <//>`;
+}
+
+// The rates offered, and what each takes of the processor beside the default's 25 (Libre Panel and
+// ffmpeg's x264 together, measured with Lumen on the 12.3", where something moves in every frame;
+// a screen that rests between its readings takes less at any rate)
+const RATE_STEPS = [20, 25, 30, 50, 60];
+const RATE_COSTS = { 20: 0.88, 30: 1.1, 50: 1.63, 60: 1.8 };
+
+/** A rate's cost beside 25: measured for the steps, in proportion to the frames for one of
+ * the person's own. */
+const costOf = (fps) => RATE_COSTS[fps] ?? fps / 25;
+
+/** A small note under the rate: how much more (or less) of the processor it takes than 25. */
+function RateCost({ fps }) {
+  if (!fps || fps === 25) return null;
+  const share = costOf(fps);
+  const percent = Math.round(Math.abs(share - 1) * 100);
+  if (share >= 1.95) {
+    return html`<p class="setting-note">${t("{fps} frames a second take about {times} times the processor time of 25.", { fps, times: formatNumber(share, 1) })}</p>`;
+  }
+  return html`<p class="setting-note">${share > 1
+    ? t("{fps} frames a second take about {percent}% more processor time than 25.", { fps, percent })
+    : t("{fps} frames a second take about {percent}% less processor time than 25, and move a little less smoothly.", { fps, percent })}</p>`;
+}
+
+function VideoCard() {
+  const config = useConfig();
+  const info = useStore((s) => s.panelInfo);
+  if (!config || !info) return null;
+  const { mode, fps, local_clip: clip } = config.video;
+  const video = info.video;
+  const rates = [...RATE_STEPS, ...(fps && !RATE_STEPS.includes(fps) ? [fps] : [])].sort((a, b) => a - b);
+  const applies = videoApplies(config, info);
+  const streams = !applies && Boolean(video.streams); // (a udisp display: whole pictures, no video mode)
+  const quality = config.device.jpeg_quality ?? 90;
+  const qualities = [80, 90, 95, 100, ...(![80, 90, 95, 100].includes(quality) ? [quality] : [])].sort((a, b) => a - b);
+  return html`<${Card} id="panel-video">
+    <${SettingRow}
+      title=${t("Smooth motion")}
+      hint=${t("Up to 50 pictures a second, so clocks, graphs and moving parts glide instead of jumping. For TURZX USB panels.")}
+      status=${html`<${VideoStatus} video=${video} mode=${mode} fps=${fps} />`}
+    >
+      <${Segmented}
+        label=${t("Smooth motion")}
+        value=${mode}
+        onChange=${(value) => change({ "video.mode": value })}
+        options=${[
+          { value: "auto", label: t("Automatic") },
+          { value: "on", label: t("On") },
+          { value: "off", label: t("Off") },
+        ]}
+      />
+    <//>
+    ${applies || streams
+      ? html`<${SettingRow} title=${t("Frames per second")} hint=${streams
+          ? t("This display takes each picture whole, as a JPEG of a millisecond's work: 60 is the smoothest and costs little more. Libre Panel drives it no faster than it takes them.")
+          : t("25 looks smooth and is the default: a graph moves a pixel a frame. 60 is an experiment: the panel is told 70, so that its player stays ahead.")}>
+          <${Segmented}
+            label=${t("Frames per second")}
+            value=${fps}
+            onChange=${(value) => change({ "video.fps": value, "video.device_fps": value >= 60 ? value + 10 : 60 })}
+            options=${rates.map((rate) => ({ value: rate, label: String(rate) }))}
+          />
+        <//>
+        ${streams ? null : html`<${RateCost} fps=${fps} />`}`
+      : null}
+    ${streams
+      ? html`<${SettingRow} title=${t("Picture quality")} hint=${t("How much of each picture's detail its JPEG keeps. 90 is the default; 95 keeps finer detail at about a third more bytes a picture, 100 the most at two to three times as many. Libre Panel drives the display no faster than it takes them: where it comes to fewer pictures a second, 90 is the smoother.")}>
+          <${Segmented}
+            label=${t("Picture quality")}
+            value=${quality}
+            onChange=${(value) => change({ "device.jpeg_quality": value })}
+            options=${qualities.map((step) => ({ value: step, label: String(step) }))}
+          />
+        <//>`
+      : null}
+    ${applies && video.gaps.includes("clip") ? html`<${ClipRow} value=${clip} />` : null}
+    ${applies
+      ? html`<${SettingRow} title=${t("Videos straight to the panel")}
+          hint=${t("A theme that is one video across the panel goes to it from its file, not drawn picture by picture: less of the processor. Pictures again as soon as anything else shows, a notice or a transition. An experiment.")}>
+          <${Toggle} label=${t("Videos straight to the panel")} checked=${Boolean(config.video.direct)}
+            onChange=${(on) => change({ "video.direct": on })} />
+        <//>`
+      : null}
+    <${MotionRow} motion=${config.device.motion} serial=${info.model?.connection === "serial"} />
+  <//>
+  ${applies ? html`<${Tinkering} video=${config.video} />` : null}`;
+}
+
+/**
+ * The video's encoder, bit rate and quality to try out, and the check of the panel's colours:
+ * for experiments and for finding faults, not for setting a panel up, so folded away under one
+ * row. Open where the address names one of them (Start's question about black leads to the
+ * colour check), and where a setting of the experiment is not the default: what was changed
+ * shows.
+ */
+function Tinkering({ video }) {
+  const measured = Object.entries(MEASURED).every(([key, value]) => video[key.slice(6)] === value);
+  return html`<${Disclosure}
+    id="panel-tinkering"
+    title=${t("Fine-tuning for experiments")}
+    hint=${t("The video's encoder, bit rate and quality to try out, and a check of the panel's colours.")}
+    holds=${["panel-video-experiment", "panel-colour-check"]}
+    initially=${!measured}
+  >
+    <${ExperimentCard} video=${video} />
+    <${ColourCard} />
+  <//>`;
+}
+
+// The video mode's defaults (config.py); the experiment's "Back to the defaults" writes them.
+const MEASURED = { "video.maxrate": "auto", "video.crf": 20, "video.preset": "superfast", "video.profile": "auto",
+                   "video.encoder": "auto", "video.keyframe_s": 10, "video.fps": 25, "video.device_fps": 60,
+                   "video.engine_sends": true, "video.engine_layers": true, "video.engine_encoder": "auto" };  // fmt: skip
+const RATES = ["auto", "4M", "8M", "16M", "24M", "32M"];
+const QUALITIES = [16, 18, 20, 22, 25];
+const PRESETS = ["ultrafast", "superfast", "veryfast"];
+const KEYFRAMES = [2, 5, 10];
+const EXPERIMENT_LINE = /video|ffmpeg|engine|firmware|decoder/i; // (engine: which encoder it runs)
+
+/** The experiment's settings as they are, with a value of the person's own kept in the choices. */
+const withOwn = (choices, own) => (choices.includes(own) ? choices : [...choices, own]);
+
+// The run's steps by their id (experiment.py), in words.
+const STEP_LABELS = () => ({
+  auto: t("auto cap, four minutes"),
+  "crf-18": t("quality 18"),
+  ultrafast: t("preset ultrafast"),
+  main: t("profile main"),
+  high: t("profile high"),
+  "keyframe-2": t("keyframe every 2 s"),
+  h264_amf: t("AMD's encoder"),
+  h264_nvenc: t("NVIDIA's encoder"),
+  h264_qsv: t("Intel's encoder"),
+  "fps-50": t("50 frames a second"),
+  "fps-60": t("60 frames a second"),
+  flood: t("flood: 24 Mbit/s at quality 16"),
+});
+const VERDICTS = () => ({ ok: t("ok"), pc: t("the PC was slow"), stutter: t("stutters"), failed: t("failed"), "no video": t("no video") });
+const num = (value, digits = 0) => (value == null ? "–" : Number(value).toFixed(digits));
+
+/** The results as plain text, to paste into an issue. */
+function resultsText(results) {
+  const labels = STEP_LABELS();
+  const lines = ["step\tpanel\tfps\tKB/s\tcap\tencoder\twaited\tdropped\tfaults\tverdict"];
+  for (const result of results) {
+    for (const p of result.panels) {
+      lines.push([labels[result.id] || result.id, p.panel, num(p.fps), num(p.kbps), p.bit_rate ?? "–", p.encoder ?? "–", p.waits, p.drops, p.faults, p.verdict].join("\t"));
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The run of the experiment: a button starts it (every step in turn, each panel's numbers
+ * sampled, the settings from before back at the end), a line says where it stands, and the
+ * results stand in a table, a row per step and panel, with a copy for an issue.
+ */
+function ExperimentRun() {
+  const run = usePolled(endpoints.experiment, 1500);
+  const data = run.data || {};
+  const running = Boolean(data.running);
+  const labels = STEP_LABELS();
+  const verdicts = VERDICTS();
+  const act = async (action) => {
+    try {
+      await endpoints.experimentAction(action);
+      run.reload();
+    } catch (error) {
+      toastError(error);
+    }
+  };
+  const step = running && data.step >= 0 ? data.steps[data.step] : null;
+  return html`<div class="experiment-run">
+    <div class="experiment-run-bar">
+      ${running
+        ? html`<button type="button" class="btn" onClick=${() => act("stop")}>${t("Stop the run")}</button>
+            <span class="experiment-run-state">${t("Step {n} of {of}: {step} — {s} s to go", { n: data.step + 1, of: data.of, step: step ? labels[step.id] || step.id : "", s: data.left_s })}</span>`
+        : html`<button type="button" class="btn btn-primary" onClick=${() => act("start")}>${t("Run every step by itself")}</button>
+            <span class="experiment-run-state muted">${data.ended === "done" ? t("Done; the settings from before are back.") : data.ended === "stopped" ? t("Stopped; the settings from before are back.") : t("About ten minutes: each step in turn, the panels' numbers sampled, then the settings from before come back. Keep an eye on the panels: whether the picture is there is yours to judge.")}</span>`}
+    </div>
+    ${data.error ? html`<p class="experiment-run-error">${data.error}</p>` : null}
+    ${data.results?.length
+      ? html`<table class="experiment-results">
+          <thead><tr><th>${t("Step")}</th><th>${t("Panel")}</th><th>fps</th><th>KB/s</th><th>${t("Cap")}</th><th>${t("Waited")}</th><th>${t("Dropped")}</th><th>${t("Faults")}</th><th>${t("Verdict")}</th></tr></thead>
+          <tbody>
+            ${data.results.flatMap((result) =>
+              result.panels.length
+                ? result.panels.map((p) => html`<tr key=${`${result.id}-${p.panel}`} data-verdict=${p.verdict}>
+                    <td>${labels[result.id] || result.id}</td><td>${p.panel}</td><td class="mono">${num(p.fps)}</td><td class="mono">${num(p.kbps)}</td><td class="mono">${p.bit_rate ?? "–"}</td><td class="mono">${p.waits}</td><td class="mono">${p.drops}</td><td class="mono">${p.faults}</td><td class=${`verdict ${p.verdict.replace(" ", "-")}`}>${verdicts[p.verdict] || p.verdict}</td>
+                  </tr>`)
+                : [html`<tr key=${result.id} data-verdict="no video"><td>${labels[result.id] || result.id}</td><td colspan="8">${t("no panel")}</td></tr>`],
+            )}
+          </tbody>
+        </table>
+        <button type="button" class="link-btn" onClick=${() => copyText(resultsText(data.results))}>${t("Copy the table")}</button>`
+      : null}
+  </div>`;
+}
+
+/**
+ * Settings → Panel → Video experiment: what the panels take beyond what was measured on the 9.2"
+ * (the bit rate's cap, the quality, x264's speed, the profile, the encoder, the keyframes), each
+ * written at once (the panel's video starts anew), with how the panel is doing underneath (the
+ * tiles of Status, every second) and the log's lines about the video (every three seconds), so
+ * that a try and its outcome are on one page.
+ */
+function ExperimentCard({ video }) {
+  const catalog = useCatalog();
+  const panel = usePolled(control.panel, 1000);
+  const log = usePolled(() => control.log(200), 3000);
+  const stats = panel.data?.panel?.stats;
+  const lines = (log.data?.lines || []).filter((line) => EXPERIMENT_LINE.test(line)).slice(-8);
+  const measured = Object.entries(MEASURED).every(([key, value]) => video[key.slice(6)] === value);
+  // the engine encodes: chosen, or "auto" where the download carries it (h264.auto_engine)
+  const engine = video.encoder === "native" || (video.encoder === "auto" && Boolean(catalog?.engine));
+  const row = (title, hint, key, choices, label = String) => html`<${SettingRow} title=${title} hint=${hint}>
+    <${Segmented}
+      label=${title}
+      value=${video[key]}
+      onChange=${(value) => change({ [`video.${key}`]: value })}
+      options=${withOwn(choices, video[key]).map((value) => ({ value, label: label(value) }))}
+    />
+  <//>`;
+  return html`<${Card}
+    id="panel-video-experiment"
+    title=${t("Video experiment")}
+    text=${t("What your panel takes beyond the defaults. Each change starts the panel's video anew; the tiles say how it is doing, the log's lines what the video mode did. If the panel shows nothing, go back to the defaults.")}
+    action=${html`<button type="button" class="btn" disabled=${measured} onClick=${() => change(MEASURED)}>${t("Back to the defaults")}</button>`}
+  >
+    ${row(t("Cap on the bit rate"), t("auto starts at the measured rate and follows the panel: a step down while it takes less than it is sent, a step up after a calm minute. A fixed cap holds."), "maxrate", RATES, (value) => (value === "auto" ? t("auto") : value.replace("M", " Mbit/s")))}
+    ${row(t("Quality"), t("x264's crf: lower is sharper and needs more bits. 20 is the default, 18 near lossless to the eye, 25 the first measurement's. (NVIDIA's encoder takes it too; AMD's and Intel's take their quality from the cap.)"), "crf", QUALITIES)}
+    ${row(t("Encoder speed"), t("x264's preset: ultrafast asks the least of the processor, veryfast compresses best."), "preset", PRESETS)}
+    ${row(t("Profile"), t("auto is high on the 9.2\" and the 12.3\" (measured to show there; it compresses far better) and baseline elsewhere; main and high ask more of the panel's decoder."), "profile", ["auto", "baseline", "main", "high"], (value) => (value === "auto" ? t("auto") : value))}
+    <${SettingRow} title=${t("Encoder")} hint=${t("auto is Libre Panel's engine where the download carries it: x264 inside it, each picture sent on its time. Else the graphics card's encoder where it was measured to show and ffmpeg can start it (AMD's), else x264 on the processor. NVIDIA's and Intel's are an experiment. An encoder that cannot start says why in the log.")}>
+      <${Select}
+        label=${t("Encoder")}
+        value=${video.encoder}
+        onChange=${(value) => change({ "video.encoder": value })}
+        options=${[
+          { value: "auto", label: t("auto") },
+          { value: "libx264", label: t("x264 (processor)") },
+          { value: "native", label: t("Libre Panel's engine") },
+          { value: "h264_amf", label: t("AMD (h264_amf)") },
+          { value: "h264_nvenc", label: t("NVIDIA (h264_nvenc)") },
+          { value: "h264_qsv", label: t("Intel (h264_qsv)") },
+        ]}
+      />
+    <//>
+    ${engine && (catalog?.platform === "win32" || video.engine_encoder === "card")
+      ? row(t("The engine's encoder"), t("auto: with AMD's and NVIDIA's cards the graphics card's own encoder, else x264 on the processor. Or always x264, or always the graphics card's (AMD's, NVIDIA's or Intel's, through Windows' Media Foundation): the processor then only makes the frames' colours. Where the card's cannot start, x264 encodes, and the log says why."), "engine_encoder", ["auto", "x264", "card"], (value) => (value === "card" ? t("Graphics card (experiment)") : value === "auto" ? t("auto") : t("x264 (processor)")))
+      : null}
+    ${engine
+      ? html`<${SettingRow} title=${t("The engine sends the pictures")} hint=${t("On: Libre Panel's engine has the panel and sends it each picture on its time. Off: Libre Panel sends them, the engine only encodes.")}>
+          <${Toggle} label=${t("The engine sends the pictures")} checked=${video.engine_sends !== false} onChange=${(on) => change({ "video.engine_sends": on })} />
+        <//>
+        ${video.engine_sends !== false
+          ? html`<${SettingRow} title=${t("The engine composes the frames")} hint=${t("On: it composes each frame from the layers Libre Panel draws, and makes the lit gauges' rings. Off: Libre Panel composes every frame, to compare.")}>
+              <${Toggle} label=${t("The engine composes the frames")} checked=${video.engine_layers !== false} onChange=${(on) => change({ "video.engine_layers": on })} />
+            <//>`
+          : null}`
+      : null}
+    ${row(t("Keyframe every"), t("Seconds between keyframes. 10 was measured; at a high bit rate a short spacing no longer makes flat areas pulse, and a glitch heals sooner."), "keyframe_s", KEYFRAMES, (value) => t("{n} s", { n: value }))}
+    <${ExperimentRun} />
+    <div class="live-tiles experiment-tiles" role="list" aria-label=${t("How the panel is doing")}>
+      ${statTiles(stats).map(
+        (tile) => html`<div class=${`live-tile ${tile.level}`} role="listitem" key=${tile.id} data-tile=${tile.id} title=${tile.title}>
+          <span class="live-tile-label">${tile.label}</span>
+          <b class="mono">${tile.value}</b>
+          <small>${tile.note}</small>
+        </div>`,
+      )}
+    </div>
+    <div class="experiment-log mono" role="log" aria-label=${t("The log's lines about the video")}>
+      ${lines.length ? lines.map((line) => html`<div key=${line}>${line.replace(/^\S+ (\S+)[.,]\d+ \w+ [\w.]+: /, "$1  ")}</div>`) : html`<div class="muted">${t("Nothing about the video in the log yet.")}</div>`}
+    </div>
+  <//>`;
+}
+
+/**
+ * How much moves on the panel (device.motion): calm is a picture a second without gliding,
+ * moving symbols or fades, which the older USB serial panels keep up with; automatic is calm on
+ * them and full on the others.
+ */
+function MotionRow({ motion, serial }) {
+  return html`<${SettingRow}
+    class="motion-row"
+    title=${t("Motion on the panel")}
+    hint=${t("Calm: one picture a second, without gliding, moving symbols or fades, so a slow panel keeps up. Automatic is calm on the older USB serial panels and full on all others.")}
+    status=${motion === "auto" && serial ? html`<${Status}>${t("Calm, as it is a USB serial panel")}<//>` : null}
+  >
+    <${Segmented}
+      label=${t("Motion on the panel")}
+      value=${motion}
+      onChange=${(value) => value !== motion && change({ "device.motion": value })}
+      options=${[
+        { value: "auto", label: t("Automatic") },
+        { value: "full", label: t("Full motion") },
+        { value: "calm", label: t("Calm motion") },
+      ]}
+    />
+  <//>`;
+}
+
+// -- brightness and which way up ------------------------------------------------------------
+
+function DisplayCard() {
+  const config = useConfig();
+  const catalog = useCatalog();
+  const [chosen, setChosen] = useState(null); // the slider stays where it is let go until it is written
+  if (!config) return null;
+  const { brightness, rotate, dark_on_quit: dark, dark_on_sleep: sleep, night, dark_when_away: away } = config.device;
+  // sleep and locking are heard from Windows, and from logind on Linux
+  const desktop = ["win32", "linux"].includes(catalog?.platform);
+  const choose = (value) => {
+    if (value === brightness) return;
+    setChosen(value);
+    saveSettings({ "device.brightness": value }).finally(() => setChosen(null));
+  };
+  return html`<${Card} id="panel-display">
+    <${SettingRow} title=${t("Brightness")}>
+      <${Slider}
+        label=${t("Brightness")}
+        value=${chosen ?? brightness}
+        min=${0}
+        max=${100}
+        step=${5}
+        format=${(value) => `${value} %`}
+        onCommit=${choose}
+      />
+    <//>
+    <${AccentRow} accent=${config.accent || ""} windows=${catalog?.platform === "win32"} />
+    <${CardOpacity} level=${config.card_opacity ?? 0} />
+    <${LightColours} on=${Boolean(config.light_colours)} />
+    <${GraphSteps} on=${Boolean(config.graph_steps)} />
+    <${SettingRow}
+      title=${t("How the panel is mounted")}
+      hint=${t("Libre Panel's screens show in their version for it: Lumen Vertical for Lumen on a bar that stands on end.")}
+    >
+      <${MountedChoice} />
+    <//>
+    <${SettingRow}
+      title=${t("Upside down")}
+      hint=${t("For a panel that is mounted the other way round. The preview stays the right way up.")}
+    >
+      <${Toggle} label=${t("Upside down")} checked=${rotate === 180} onChange=${(on) => saveSettings({ "device.rotate": on ? 180 : 0 })} />
+    <//>
+    <${SettingRow}
+      class="dark-row"
+      title=${t("Dark when Libre Panel quits")}
+      hint=${t("When Libre Panel quits, Windows shutting down too, the panel shows black and its light goes off; it lights up again when Libre Panel starts. Off: it keeps the last picture.")}
+    >
+      <${Toggle} label=${t("Dark when Libre Panel quits")} checked=${Boolean(dark)} onChange=${(on) => saveSettings({ "device.dark_on_quit": on })} />
+    <//>
+    <${SettingRow}
+      class="night-row"
+      title=${t("At night")}
+      hint=${t("From one time to the other the panel has a brightness of its own, over midnight too; 0 is dark. The brightness above holds the rest of the day.")}
+    >
+      <${Toggle} label=${t("At night")} checked=${Boolean(night)} onChange=${(on) => saveSettings({ "device.night": on })} />
+    <//>
+    ${night ? html`<${NightFields} device=${config.device} />` : null}
+    ${desktop
+      ? html`<${SettingRow}
+          class="away-row"
+          title=${t("Dimmed while you are away")}
+          hint=${catalog?.platform === "win32"
+            ? t("While the computer is locked or its monitor is off, the panel takes the brightness below; 0 is dark. Back at the computer, it lights up again.")
+            : t("While the session is locked, the panel takes the brightness below; 0 is dark. Unlocked, it lights up again.")}
+        >
+          <${Toggle} label=${t("Dimmed while you are away")} checked=${away !== false} onChange=${(on) => saveSettings({ "device.dark_when_away": on })} />
+        <//>
+        ${away !== false ? html`<${AwayBrightness} level=${config.device.away_brightness} />` : null}`
+      : null}
+    ${desktop
+      ? html`<${SettingRow}
+          class="sleep-row"
+          title=${t("Dark while the computer sleeps")}
+          hint=${t("The panel goes dark when the computer goes to sleep and lights up again when it wakes. Off: it keeps the last picture, all night where the USB port stays powered.")}
+        >
+          <${Toggle} label=${t("Dark while the computer sleeps")} checked=${sleep !== false} onChange=${(on) => saveSettings({ "device.dark_on_sleep": on })} />
+        <//>`
+      : null}
+  <//>`;
+}
+
+/**
+ * An accent colour for every theme instead of its own (config.toml accent): Windows' or one of
+ * the person's; what is in the theme's accent colour takes it.
+ */
+function AccentRow({ accent, windows }) {
+  const own = accent.startsWith("#");
+  const mode = own ? "own" : accent || "theme";
+  const choose = (value) => {
+    if (value === mode) return;
+    saveSettings({ accent: value === "theme" ? "" : value === "own" ? "#E0457B" : value });
+  };
+  return html`<${SettingRow}
+    class="accent-row"
+    title=${t("Accent colour")}
+    hint=${t("Every screen in one colour of your choice: what is in its accent colour takes it. In Design the themes keep their own.")}
+  >
+    <div class="accent-choice">
+      <${Segmented}
+        label=${t("Accent colour")}
+        value=${mode}
+        onChange=${choose}
+        options=${[
+          { value: "theme", label: t("The theme's") },
+          ...(windows || accent === "system" ? [{ value: "system", label: t("Windows'") }] : []),
+          { value: "own", label: t("My own") },
+        ]}
+      />
+      ${own
+        ? html`<input type="color" class="accent-colour" aria-label=${t("My accent colour")} value=${accent.toLowerCase()}
+            onChange=${(event) => saveSettings({ accent: event.currentTarget.value.toUpperCase() })} />`
+        : null}
+    </div>
+  <//>`;
+}
+
+/**
+ * How much of the background the cards of every screen cover (config.toml card_opacity): as
+ * each theme has them (Libre Panel's own let it through a little), or the person's own, from
+ * 40 to 100 %; what is on them stays as it is.
+ */
+function CardOpacity({ level }) {
+  const [chosen, setChosen] = useState(null); // as the brightness slider above
+  const shown = chosen ?? level;
+  const own = shown > 0;
+  const choose = (value) => {
+    if (value === level) return;
+    setChosen(value);
+    saveSettings({ card_opacity: value }).finally(() => setChosen(null));
+  };
+  return html`<${SettingRow}
+    class="card-opacity-row"
+    title=${t("Card opacity")}
+    hint=${t("How much of the background the cards of every screen cover. Libre Panel's own themes let a little of it through; 100 % covers it all. What is on a card stays as it is.")}
+  >
+    <div class="card-opacity">
+      <${Segmented}
+        label=${t("Card opacity")}
+        value=${own ? "own" : "theme"}
+        onChange=${(value) => choose(value === "own" ? 80 : 0)}
+        options=${[{ value: "theme", label: t("The theme's") }, { value: "own", label: t("My own") }]}
+      />
+      ${own
+        ? html`<${Slider} label=${t("Card opacity")} value=${shown} min=${40} max=${100} step=${5}
+            format=${(value) => `${value} %`} onCommit=${choose} />`
+        : null}
+    </div>
+  <//>`;
+}
+
+/**
+ * Every screen in light colours, for a white PC (config.toml light_colours): each theme's own
+ * colours worked out for a light ground, or as they are made.
+ */
+function LightColours({ on }) {
+  return html`<${SettingRow}
+    class="light-colours-row"
+    title=${t("Colours")}
+    hint=${t("Light colours suit a white PC: every screen keeps its own colours, worked out for a light ground. The pictures of the themes show them as the panel does.")}
+  >
+    <${Segmented}
+      label=${t("Colours")}
+      value=${on ? "light" : "made"}
+      onChange=${(value) => saveSettings({ light_colours: value === "light" })}
+      options=${[{ value: "made", label: t("As made") }, { value: "light", label: t("Light colours") }]}
+    />
+  <//>`;
+}
+
+/**
+ * How graphs move (config.toml graph_steps): scrolling on, or a step at each reading with the
+ * panel at rest between (fewer frames on a video panel).
+ */
+function GraphSteps({ on }) {
+  return html`<${SettingRow}
+    class="graph-steps-row"
+    title=${t("Graphs")}
+    hint=${t("A step at each reading: a graph glides a moment when a reading comes and rests until the next one, and the panel takes fewer frames, less of the processor. Arena's frame rate scrolls on.")}
+  >
+    <${Segmented}
+      label=${t("Graphs")}
+      value=${on ? "steps" : "scroll"}
+      onChange=${(value) => saveSettings({ graph_steps: value === "steps" })}
+      options=${[{ value: "scroll", label: t("Scroll on") }, { value: "steps", label: t("A step at each reading") }]}
+    />
+  <//>`;
+}
+
+/** The panel's brightness while the person is away (0: dark). */
+function AwayBrightness({ level }) {
+  const [chosen, setChosen] = useState(null); // as the brightness slider above
+  const choose = (value) => {
+    if (value === level) return;
+    setChosen(value);
+    saveSettings({ "device.away_brightness": value }).finally(() => setChosen(null));
+  };
+  return html`<${SettingRow} class="away-brightness" title=${t("Brightness while you are away")}>
+    <${Slider} label=${t("Brightness while you are away")} value=${chosen ?? level} min=${0} max=${100} step=${5}
+      format=${(value) => (value ? `${value} %` : t("dark"))} onCommit=${choose} />
+  <//>`;
+}
+
+/** When the night begins and ends (at times, or with the sun), and the panel's brightness then. */
+function NightFields({ device }) {
+  const config = useConfig();
+  const [chosen, setChosen] = useState(null); // as the brightness slider above
+  const level = device.night_brightness;
+  const sun = device.night_from === "sunset" && device.night_to === "sunrise";
+  const placed = config?.weather?.latitude != null && config?.weather?.longitude != null;
+  const choose = (value) => {
+    if (value === level) return;
+    setChosen(value);
+    saveSettings({ "device.night_brightness": value }).finally(() => setChosen(null));
+  };
+  const follow = (on) =>
+    saveSettings(on ? { "device.night_from": "sunset", "device.night_to": "sunrise" } : { "device.night_from": "22:00", "device.night_to": "07:00" });
+  return html`<${SettingRow} class="night-times" title=${t("Night from … to")} stacked>
+    <div class="night-sun">
+      <${Toggle} label=${t("From sunset to sunrise")} checked=${sun} onChange=${follow} />
+      <span>${t("From sunset to sunrise")}</span>
+    </div>
+    ${sun
+      ? html`<div class="settings-row-hint" data-night-sun>${placed ? t("At the place of the weather, day by day.") : t("Choose a place under Weather: until then the night goes from 19:00 to 7:00.")}</div>`
+      : html`<div class="night-fields">
+          <${CommitField} class="time" label=${t("Night begins")} value=${device.night_from} placeholder="22:00"
+            onCommit=${(text) => saveSettings({ "device.night_from": text })} />
+          <span aria-hidden="true">–</span>
+          <${CommitField} class="time" label=${t("Night ends")} value=${device.night_to} placeholder="07:00"
+            onCommit=${(text) => saveSettings({ "device.night_to": text })} />
+        </div>`}
+    <${Slider} label=${t("Brightness at night")} value=${chosen ?? level} min=${0} max=${100} step=${5}
+      format=${(value) => (value ? `${value} %` : t("dark"))} onCommit=${choose} />
+  <//>`;
+}
+
+// -- more panels at once ------------------------------------------------------------------------
+
+const MORE_PANELS = 3; // beside this one (config.MORE_PANELS)
+const OWN_FILE = /^libre-panel-frame-\d+\.png$/; // a panel's own picture file, by its place
+
+/**
+ * The panels beside this one ([[panels]]): each shows a theme of its own, on the same readings.
+ * They are written back whole; one taken out moves those behind it up, and their picture file
+ * by default with them.
+ */
+function MorePanelsCard() {
+  const config = useConfig();
+  const info = useStore((s) => s.panelInfo);
+  const models = useStore((s) => s.specs?.models || []);
+  const themes = useStore((s) => s.themes || []);
+  const shownTheme = useStore((s) => s.app?.panel?.theme); // what panel 1 shows now
+  const [acrossStamp, setAcrossStamp] = useState(0); // a new picture across them: asked anew
+  if (!config) return null;
+  const panels = config.panels || [];
+  const running = info?.running?.more || [];
+  const write = (next) => change({ panels: next });
+  const edit = (n, changes) => write(panels.map((panel, i) => (i === n ? { ...panel, ...changes } : panel)));
+  const remove = (n) =>
+    write(panels.filter((_, i) => i !== n).map(({ output, ...panel }) => (OWN_FILE.test(output) ? panel : { ...panel, output })));
+  const add = panels.length < MORE_PANELS
+    ? html`<button type="button" class="btn" onClick=${() => newPanel({})}>${t("Add a panel")}</button>`
+    : null;
+  // which is which: each panel (and each screen of the ZC-360) shows its number a few seconds
+  // (identify.py)
+  const identify = (panels.length || info?.model?.screens > 1) && info?.running
+    ? html`<button type="button" class="btn" onClick=${() => endpoints.appAction("identify").catch(() => {})}>${t("Which is which?")}</button>`
+    : null;
+  // one picture of them all where they stand, each with what it shows now: to keep or share
+  const photo = panels.length && info?.running
+    ? html`<a class="btn" href=${endpoints.panelsPhoto()} download data-panels-photo
+        title=${t("One picture of all panels where they stand, each with what it shows now: to keep or to share")}>${t("Picture of all panels")}</a>`
+    : null;
+  // the themes of this panel and another change places (theirs shown, where it has none);
+  // panel 1's is asked for here where the app's start could not say it (yet), else the swap
+  // would do nothing
+  const swap = async (n) => {
+    if (!store.get().pages) store.set({ pages: await endpoints.pages() });
+    const first = normalTheme();
+    const other = panels[n].theme || running.find((item) => item.index === n)?.theme;
+    if (!first || !other) return;
+    await write(panels.map((panel, i) => (i === n ? { ...panel, theme: first, follow: null } : panel)));
+    store.set({ pages: await endpoints.setPage("normal", { theme: other }) });
+  };
+  const spare = panels.length < MORE_PANELS ? info?.spare || [] : [];
+  // the theme that goes beside panel 1's: its companion, where it has one (Lumen Companion)
+  const normal = normalTheme();
+  const companion = normal ? themes.find((theme) => theme.id === `${versionBase(normal) || normal}-companion`) : null;
+  // and while a game runs, Arena's companion beside Arena (the game's page)
+  const gaming = themes.some((theme) => theme.id === "arena-companion") ? { game_theme: "arena-companion" } : {};
+  const suggested = { ...(companion ? { theme: companion.id, follow: true, same_look: true } : {}), ...gaming };
+  // step by step: which panel, how it is mounted, what it shows (newpanel.js)
+  const newPanel = async (start) => {
+    const spareNow = panels.length < MORE_PANELS ? info?.spare || [] : [];
+    const chosen = await openDialog(
+      (close) => html`<${NewPanel} close=${close} start=${start} models=${models} spare=${spareNow}
+        themes=${panelThemes(themes, companion, models.find((item) => item.id === start.model) || null)} suggested=${suggested}
+        companion=${companion} />`,
+      { label: t("Add a panel") },
+    );
+    if (chosen) await write([...panels, chosen]);
+  };
+  // where they stand, in their real sizes: the first panel's model as set or found
+  const modelOf = (id) => models.find((model) => model.id === id) || null;
+  const device = config.device || {};
+  const arrangement = [
+    arrangementItem({
+      number: 1,
+      model: modelOf(device.model !== "auto" ? device.model : info?.model?.id),
+      size: info?.running?.size,
+      orientation: device.orientation,
+      at: device.at,
+      theme: shownTheme || normalTheme(),
+    }),
+    ...panels.map((panel, n) => {
+      const seen = running.find((item) => item.index === n);
+      return arrangementItem({
+        number: n + 2,
+        model: modelOf(panel.model && panel.model !== "auto" ? panel.model : seen?.model),
+        size: seen?.size,
+        orientation: panel.orientation,
+        at: panel.at,
+        theme: seen?.theme || panel.theme,
+      });
+    }),
+  ];
+  // the ZC-360's three screens: one picture, or each a panel of its own (zc360.js)
+  const zc360 = zc360Places(
+    device.model !== "auto" ? device.model : info?.model?.id,
+    panels,
+    panels.map((_, n) => running.find((item) => item.index === n)?.model),
+  );
+  const rebuild = async (plan) => {
+    if (!plan) return;
+    await change(plan.changes);
+    if (plan.theme) store.set({ pages: await endpoints.setPage("normal", { theme: plan.theme }) });
+  };
+  const place = (places) =>
+    change({ "device.at": places[0], panels: panels.map((panel, n) => ({ ...panel, at: places[n + 1] })) });
+  const lineUp = () => change({ "device.at": null, panels: panels.map((panel) => ({ ...panel, at: null })) });
+  // one picture across them: the panels not placed yet are placed where they are shown, so it
+  // covers them all as the view shows it
+  const picture = config.across ? endpoints.acrossPicture(acrossStamp || config.across) : null;
+  const choosePicture = async (file) => {
+    try {
+      const done = await endpoints.setAcross(await file.arrayBuffer());
+      setAcrossStamp(done.stamp);
+      if (arrangement.some((item) => !item.at)) await place(arranged(arrangement).map((item) => item.at));
+      else await loadSettings();
+    } catch (error) {
+      toastError(error);
+    }
+  };
+  return html`<${Card}
+    id="panel-more"
+    title=${t("More panels")}
+    text=${t("A second or third panel beside this one, each with a screen of its own, on the same readings. The game screen and the screens in turn are this panel's; smooth motion each one switches on for itself.")}
+    action=${html`<span class="more-actions">${identify}${photo}${add}</span>`}
+  >
+    ${spare.map(
+      (model) => html`<div class="more-spare" key=${`${model.id}${model.port || ""}`} data-spare=${model.id}>
+        <span>${t("Another panel is plugged in: {name}. Show something on it too?", { name: panelName(model) })}</span>
+        <button type="button" class="btn btn-primary"
+          onClick=${() => newPanel({ model: model.id, ...(model.port ? { port: model.port } : {}) })}>${t("Set it up")}</button>
+      </div>`,
+    )}
+    <${Zc360Row}
+      places=${zc360}
+      room=${panels.length + 2 <= MORE_PANELS}
+      onSplit=${() => rebuild(splitZc360(zc360.whole, panels, MORE_PANELS)).catch(toastError)}
+      onJoin=${() => rebuild(joinZc360(zc360.screens, panels)).catch(toastError)}
+    />
+    ${panels.length
+      ? html`<${Arrangement} items=${arrangement} onPlace=${place} onReset=${lineUp}
+          picture=${picture} onPicture=${choosePicture} onNoPicture=${() => change({ across: null })} />`
+      : null}
+    ${panels.map(
+      (panel, n) => html`<${MorePanel}
+        key=${n}
+        n=${n}
+        panel=${panel}
+        running=${running.find((item) => item.index === n)}
+        video=${(info?.more_video || []).find((item) => item.index === n)}
+        models=${models}
+        themes=${themes}
+        companion=${companion}
+        onChange=${(changes) => edit(n, changes)}
+        onRemove=${() => remove(n)}
+        onSwap=${() => swap(n).catch(toastError)}
+      />`,
+    )}
+  <//>`;
+}
+
+function MoreStatus({ panel, running }) {
+  if (!panel.on) return html`<${Status}>${t("Off")}<//>`;
+  if (!running) return null;
+  if (running.state === "showing")
+    return html`<${Status} tone="ok">${t("Shows {theme}", { theme: themeName(running.theme) })}<//>`;
+  return html`<${Status} tone="warn">${stateText(running.state)}${running.detail ? `: ${running.detail}` : ""}<//>`;
+}
+
+/** The themes a panel beside the first can show: its own; the companion of panel 1's theme,
+ * whichever that is (it changes with it); then each theme by name, which stays whatever panel 1
+ * shows, those made for `model` first. */
+function panelThemes(themes, companion, model) {
+  const fits = (theme) => fitsPanel(theme, model);
+  return [
+    { value: "", label: t("The panel's own") },
+    {
+      value: FOLLOW,
+      label: companion
+        ? t("The companion of panel 1's theme (now {name})", { name: companion.name || companion.id })
+        : t("The companion of panel 1's theme"),
+      group: t("Beside panel 1's theme"),
+    },
+    ...[...themes]
+      .sort((a, b) => Number(!fits(a)) - Number(!fits(b)))
+      .map((theme) => ({ value: theme.id, label: theme.name || theme.id, group: fits(theme) ? t("Themes") : t("For other panels") })),
+  ];
+}
+
+/** The themes a page of a panel beside the first can show: each by name ("" as ever). */
+const pageThemes = (themes) => themes.filter((option) => option.value && option.value !== FOLLOW);
+
+function MorePanel({ n, panel, running, video, models, themes, companion, onChange, onRemove, onSwap }) {
+  const [chosen, setChosen] = useState(null); // as the brightness slider above
+  const model = models.find((item) => item.id === panel.model);
+  const name = t("Panel {number}", { number: n + 2 });
+  const brightness = (value) => {
+    if (value === panel.brightness) return;
+    setChosen(value);
+    Promise.resolve(onChange({ brightness: value })).finally(() => setChosen(null));
+  };
+  const themeOptions = panelThemes(themes, companion, model);
+  return html`<div class="more-panel" data-more-panel=${n}>
+    <${SettingRow} class="more-panel-head" title=${model ? `${name}: ${panelName(model)}` : name} status=${html`<${MoreStatus} panel=${panel} running=${running} />`}>
+      <${Toggle} label=${t("{panel} on", { panel: name })} checked=${panel.on !== false} onChange=${(on) => onChange({ on })} />
+      <button type="button" class="btn" title=${t("Its theme and this panel's change places")} onClick=${onSwap}>${t("Swap with panel 1")}</button>
+      <button type="button" class="btn" onClick=${onRemove}>${t("Remove")}</button>
+    <//>
+    ${panel.on === false ? null : html`<${MoreSettings} n=${n} panel=${panel} video=${video} models=${models} themes=${themeOptions} companion=${companion} chosen=${chosen} onBrightness=${brightness} onChange=${onChange} />`}
+  </div>`;
+}
+
+/** What a panel that runs has to set: its model, theme, brightness, way up and port. */
+/**
+ * Smooth motion on a panel beside the first: its own switch and the name of its own standby
+ * clip, asked for this panel and never taken from another (the panel's video start carries it).
+ */
+function MoreVideo({ panel, video, onChange }) {
+  const name = useStore((s) => s.clipQuestion?.name);
+  const own = panel.video || {};
+  const on = (own.mode || "off") !== "off";
+  useEffect(() => {
+    if (on && !name) loadClipQuestion();
+  }, [on]);
+  const set = (changes) => onChange({ video: { ...own, ...changes } });
+  const gaps = video?.gaps || [];
+  return html`
+    <${SettingRow} title=${t("Smooth motion")} status=${on && video?.on ? html`<${Status} tone="ok">${t("On")}<//>` : null}
+      hint=${t("Up to 50 pictures a second on this panel too, where its model has a decoder for it. Each panel in smooth motion is a video of its own: it costs more of the computer.")}>
+      <${Toggle} label=${t("Smooth motion")} checked=${on} onChange=${(value) => set({ mode: value ? "auto" : "off" })} />
+    <//>
+    ${on && gaps.includes("model") ? html`<p class="setting-note warn">${t("Smooth motion is not proven on this panel's model yet: it stays at single pictures.")}</p>` : null}
+    ${on && gaps.includes("clip")
+      ? html`<${SettingRow} class="clip-row" title=${t("Name of this panel's standby clip")}
+          hint=${name
+            ? t("This panel's own standby clip, as its own app calls it: {name}. Nothing is written until you choose it.", { name })
+            : t("This panel's own standby clip, as its own app calls it. Nothing is written until you type it.")}>
+          <div class="clip-choice">
+            <${CommitField} label=${t("Name of this panel's standby clip")} value=${own.local_clip || ""} mono
+              onCommit=${(text) => set({ local_clip: text, clip_asked: true })} />
+            ${name ? html`<button type="button" class="btn" onClick=${() => set({ local_clip: name, clip_asked: true })}>${t("Use {name}", { name })}</button>` : null}
+          </div>
+        <//>`
+      : null}`;
+}
+
+function MoreSettings({ n, panel, video, models, themes, companion, chosen, onBrightness, onChange }) {
+  // (said once, at the first: it holds for all)
+  const hint = n === 0 ? t("Detect automatically takes a panel the others do not use. Two serial panels of the same kind: name the port of each below.") : null;
+  return html`
+    <${SettingRow} title=${t("Panel model")} hint=${hint}>
+      <${Select}
+        label=${t("Panel model")}
+        value=${panel.model || "auto"}
+        options=${[
+          { value: "auto", label: t("Detect automatically") },
+          ...models.map((item) => ({ value: item.id, label: panelName(item), group: item.vendor })),
+        ]}
+        onChange=${(value) => onChange({ model: value })}
+      />
+    <//>
+    <${SettingRow} title=${t("Theme")} hint=${n === 0 ? t("The companion of panel 1's theme changes with it: Arena Companion while panel 1 shows Arena. A theme chosen by name stays, whatever panel 1 shows.") : null}>
+      <${Select} label=${t("Theme")} value=${themeChoice(panel)} options=${themes} onChange=${(value) => onChange(chooseTheme(value, panel, companion))} />
+    <//>
+    <${SettingRow} title=${t("Look as panel 1's")} hint=${t("Its theme takes the colours, fonts and module frames of the theme panel 1 shows, and follows a change in Design.")}>
+      <${Toggle} label=${t("Look as panel 1's")} checked=${panel.same_look === true} onChange=${(on) => onChange({ same_look: on })} />
+    <//>
+    <${SettingRow} title=${t("While a game runs")} hint=${n === 0 ? t("While panel 1 shows the game's page or music's, this panel can show a theme of its own: the temperatures and fans during a game, say.") : null}>
+      <${Select} label=${t("While a game runs")} value=${panel.game_theme || ""} options=${[{ value: "", label: t("As ever") }, ...pageThemes(themes)]}
+        onChange=${(value) => onChange({ game_theme: value })} />
+    <//>
+    <${SettingRow} title=${t("While music plays")}>
+      <${Select} label=${t("While music plays")} value=${panel.media_theme || ""} options=${[{ value: "", label: t("As ever") }, ...pageThemes(themes)]}
+        onChange=${(value) => onChange({ media_theme: value })} />
+    <//>
+    <${SettingRow} title=${t("During an alarm")} hint=${n === 0 ? t("While a sensor is at its critical limit (the warnings of the notices): the temperatures and what keeps the PC busy, say.") : null}>
+      <${Select} label=${t("During an alarm")} value=${panel.alarm_theme ?? "lumen-companion"} options=${[{ value: "", label: t("As ever") }, ...pageThemes(themes)]}
+        onChange=${(value) => onChange({ alarm_theme: value })} />
+    <//>
+    <${SettingRow} title=${t("Brightness as panel 1's")} hint=${t("At night and while you are away too. Some panels look brighter than others at the same setting: even them out with the difference below.")}>
+      <${Toggle} label=${t("Brightness as panel 1's")} checked=${panel.follow_brightness !== false} onChange=${(on) => onChange({ follow_brightness: on })} />
+    <//>
+    ${panel.follow_brightness !== false
+      ? html`<${SettingRow} title=${t("Difference")}>
+          <${Slider} label=${t("Difference")} value=${panel.brightness_offset || 0} min=${-30} max=${30} step=${5}
+            format=${(value) => `${value > 0 ? "+" : ""}${value} %`} onCommit=${(value) => onChange({ brightness_offset: value })} />
+        <//>`
+      : html`<${SettingRow} title=${t("Brightness")}>
+          <${Slider} label=${t("Brightness")} value=${chosen ?? panel.brightness} min=${0} max=${100} step=${5}
+            format=${(value) => `${value} %`} onCommit=${onBrightness} />
+        <//>`}
+    <${SettingRow} title=${t("Upside down")}>
+      <${Toggle} label=${t("Upside down")} checked=${panel.rotate === 180} onChange=${(on) => onChange({ rotate: on ? 180 : 0 })} />
+    <//>
+    ${video?.usb ? html`<${MoreVideo} panel=${panel} video=${video} onChange=${onChange} />` : null}
+    <${SettingRow} title=${t("Port of a serial panel")}>
+      <${CommitField} label=${t("Port of a serial panel")} value=${panel.port || ""} placeholder="COM6, /dev/ttyACM1" mono
+        onCommit=${(port) => onChange({ port })} />
+    <//>
+  `;
+}
+
+// -- advanced --------------------------------------------------------------------------------
+
+const driverName = (name) =>
+  ({
+    auto: t("Automatic"),
+    turzx: t("Always the panel"),
+    virtual: t("Never the panel (a file only)"),
+  })[name] || name;
+
+/**
+ * How a TURZX USB panel takes its pictures without smooth motion (device.still): as PNG, the
+ * layer over the video, or as JPEG, the one under it, which its hardware decodes. Automatic is
+ * JPEG on the 5.2", which shows no PNG, and PNG on the others, where it is proven.
+ */
+function StillsRow({ still }) {
+  return html`<${SettingRow}
+    class="stills-row"
+    title=${t("Stills")}
+    hint=${t("How the pictures go to the panel without smooth motion. Automatic: JPEG on the 5.2″, which shows no PNG, and PNG on the others.")}
+  >
+    <${Segmented}
+      label=${t("Stills")}
+      value=${still}
+      onChange=${(value) => value !== still && change({ "device.still": value })}
+      options=${[
+        { value: "auto", label: t("Automatic") },
+        // (the formats' names, the same in every language)
+        ...["png", "jpeg"].map((value) => ({ value, label: value.toUpperCase() })),
+      ]}
+    />
+  <//>`;
+}
+
+function AdvancedCard() {
+  const config = useConfig();
+  const catalog = useCatalog();
+  const info = useStore((s) => s.panelInfo);
+  if (!config || !catalog) return null;
+  const text = (name, label, placeholder) => html`<${CommitField}
+    label=${label}
+    value=${setting(name, config)}
+    placeholder=${placeholder}
+    mono
+    onCommit=${(value) => change({ [name]: value })}
+  />`;
+  // the clip's name is asked for above while it is missing; once it is there it is kept here
+  const clip = info && videoApplies(config, info) && !info.video.gaps.includes("clip");
+  // a model that is known, and a TURZX USB one (the video's "usb" is also true for none known)
+  const turzx = Boolean(info?.model && info.video.usb);
+  return html`<${Disclosure}
+    id="panel-advanced"
+    title=${t("Advanced")}
+    hint=${t("For special cases: where the pictures go, the standby clip's name, the port of a serial panel, the video program.")}
+  >
+    <${SettingRow} title=${t("Where the pictures go")} hint=${t("Automatic: to the panel when one is connected, else to the picture file below.")}>
+      <${Select}
+        label=${t("Where the pictures go")}
+        value=${config.device.driver}
+        options=${catalog.drivers.map((name) => ({ value: name, label: driverName(name) }))}
+        onChange=${(value) => change({ "device.driver": value })}
+      />
+    <//>
+    <${SettingRow} title=${t("Picture file")} hint=${t("Where the pictures go when no panel is used. A short name is in the settings folder.")}>
+      ${text("device.output", t("Picture file"), "libre-panel-frame.png")}
+    <//>
+    ${turzx ? html`<${StillsRow} still=${config.device.still} />` : null}
+    ${clip
+      ? html`<${SettingRow} title=${t("Name of the standby clip")} hint=${t("The clip your panel plays by itself when the PC starts, as its own app names it. Smooth motion needs it.")}>
+          <${ClipField} value=${config.video.local_clip} />
+        <//>`
+      : null}
+    <${SettingRow}
+      title=${t("Port of a serial panel")}
+      hint=${t("Panels that connect as a serial port (the 3.5″ and the like) are found by themselves. Only if the wrong port is taken, name it.")}
+    >
+      ${text("device.port", t("Port of a serial panel"), "COM5, /dev/ttyACM0")}
+    <//>
+    <${SettingRow}
+      title=${t("Video program (ffmpeg)")}
+      hint=${t("Smooth motion turns the pictures into video with ffmpeg, which the downloads bring. Only if Libre Panel does not find it, name it.")}
+    >
+      ${text("video.ffmpeg", t("Video program (ffmpeg)"), "ffmpeg")}
+    <//>
+  <//>`;
+}
+
+export const panelGroups = [
+  { id: "found", order: 10, component: PanelFound, load: loadPanelSection },
+  { id: "video", order: 20, component: VideoCard },
+  { id: "display", order: 30, component: DisplayCard },
+  { id: "transitions", order: 32, component: TransitionsCard },
+  { id: "start-screen", order: 35, component: StartScreenCard },
+  { id: "advanced", order: 40, component: AdvancedCard },
+];
+
+// Settings → Panels: the panels beside the first, where they stand and what they show, a section
+// of its own (it was a card at the end of the first panel's)
+export const panelsGroups = [{ id: "more", order: 10, component: MorePanelsCard, load: loadPanelSection }];

@@ -1,0 +1,137 @@
+/* The look of Libre Panel's own console pages (Control, Autopilot) and of the editor pages
+   plugins bring (docs/PLUGINS.md): colours, controls and the few helpers of kit.js. A page
+   links it and sets the class plugin-page on its body, which kit.js does. The colours and the
+   typeface are the app's (app/app.css, whose names stand in the comments): a page shown in
+   the app is part of it. */
+
+@font-face {
+  font-family: "Barlow";
+  src: url("/app/fonts/Barlow-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Barlow";
+  src: url("/app/fonts/Barlow-Medium.ttf") format("truetype");
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Barlow";
+  src: url("/app/fonts/Barlow-SemiBold.ttf") format("truetype");
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Barlow";
+  src: url("/app/fonts/Barlow-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+
+:root {
+  --bg: #0a0e13; /* --bg */
+  --panel: #111820; /* --surface: fields, tiles */
+  --panel-2: #141c26; /* --surface-2 */
+  --panel-3: #1c2633; /* --surface-3 */
+  --line: #263241; /* --line-4: the edge of a control */
+  --text: #e8eef4;
+  --muted: #93a1b2;
+  --dim: #5f6e80;
+  --accent: #2ee6d6;
+  --accent-ink: #04211e;
+  --ok: #34d399;
+  --warn: #f5c46b;
+  --error: #f87171; /* --danger */
+  --radius: 8px;
+  --font: "Barlow", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 var(--font);
+}
+
+button, select, input, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 9px;
+}
+
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button.small { padding: 1px 7px; font-size: 12px; }
+button.icon-btn { padding: 2px 4px; font-size: 12px; line-height: 0; background: transparent; border-color: transparent; color: var(--dim); }
+button.icon-btn:hover { color: var(--text); border-color: var(--line); }
+button.icon-btn.on { color: var(--accent); }
+button.danger:hover { border-color: var(--error); color: var(--error); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+.toggle { display: flex; align-items: center; gap: 6px; }
+.group { display: inline-flex; align-items: center; gap: 4px; }
+
+h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+h3 { margin: 12px 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
+.hint { color: var(--muted); font-size: 12px; margin-top: 12px; }
+.section-title { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+
+/* minmax(0, 1fr): long option texts must not widen the column */
+.field { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
+details > .fields { grid-template-columns: minmax(0, 1fr); }
+.field .row button { flex: none; white-space: nowrap; }
+.field > span { color: var(--muted); font-size: 12px; }
+.field input[type="text"], .field input[type="number"], .field select, .field textarea { width: 100%; }
+.field textarea { min-height: 56px; resize: vertical; }
+.field .row, .row { display: flex; gap: 6px; align-items: center; }
+.field .row input[type="text"] { flex: 1; min-width: 0; }
+.field .row select { flex: 1; min-width: 0; width: auto; }
+.field input[type="color"], .swatch { width: 34px; height: 30px; padding: 2px; flex: none; }
+.field small { color: var(--muted); font-size: 11px; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.quad { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.check { display: flex; gap: 8px; align-items: center; }
+
+details { border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; }
+details[open] { padding-bottom: 10px; }
+details > summary { cursor: pointer; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+details > .fields { display: grid; gap: 10px; margin-top: 8px; }
+
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--muted); }
+[data-state="showing"] .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+[data-state="waiting"] .dot, [data-state="starting"] .dot { background: var(--warn); }
+[data-state="error"] .dot { background: var(--error); }
+[data-state="gone"] .dot { background: transparent; border: 1px solid var(--muted); }
+
+/* A page of its own (kit.js sets the class): a page that scrolls, in these colours. */
+body.plugin-page { display: block; height: auto; min-height: 100vh; padding: 20px 28px; overflow: auto; }
+body.plugin-page h1 { font-size: 20px; margin: 0 0 16px; }
+body.plugin-page h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 22px 0 10px; }
+
+.status {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status.warn { color: var(--warn); }
+.status.error { color: var(--error); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.chip { padding: 4px 10px; border-radius: 999px; background: var(--panel-2); font-size: 12.5px; }
+.chip.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }

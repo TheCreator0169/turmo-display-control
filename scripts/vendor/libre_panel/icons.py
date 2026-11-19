@@ -1,0 +1,651 @@
+"""Built-in line icons, drawn as vectors so they stay sharp at any size.
+
+Coordinates use a 24x24 grid (like common icon sets); everything is drawn at
+4x and downsampled. ``weather`` is resolved by the renderer from the WMO code.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from functools import lru_cache
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
+
+SS = 4  # supersampling
+
+ICON_NAMES = (
+    "cpu",
+    "gpu",
+    "ram",
+    "disk",
+    "network",
+    "download",
+    "upload",
+    "temperature",
+    "fan",
+    "power",
+    "clock",
+    "sun",
+    "moon",
+    "cloud",
+    "partly",
+    "rain",
+    "snow",
+    "storm",
+    "fog",
+    "humidity",
+    "wind",
+    "battery",
+    "plug",
+    "list",
+    "grid",
+    "signal",
+    "ethernet",
+    "wifi",
+    "wifi-1",
+    "wifi-2",
+    "link",
+    "uptime",
+    "sunrise",
+    "sunset",
+    "hourglass",
+    "image",
+    "globe",
+    "music",
+    "calendar",
+    "home",
+    "gamepad",
+    "agent",
+    "usb",
+    "stick",
+    "phone",
+    "ssd",
+    "play",
+    "pause",
+    "up",
+    "down",
+    "volume",
+    "mute",
+    "mic",
+    "mic_off",
+    "weather",
+)
+
+Color = tuple[int, int, int, int]
+
+
+class _Pen:
+    def __init__(self, size: int, color: Color, stroke: float) -> None:
+        self.s = size * SS / 24
+        self.img = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
+        self.draw = ImageDraw.Draw(self.img)
+        self.color = color
+        self.w = max(1, round(stroke * SS * size / 24))
+
+    def p(self, x: float, y: float) -> tuple[float, float]:
+        return (x * self.s, y * self.s)
+
+    def _cap(self, x: float, y: float) -> None:
+        cx, cy = self.p(x, y)
+        r = self.w / 2
+        self.draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=self.color)
+
+    def line(self, *points: tuple[float, float]) -> None:
+        self.draw.line([self.p(*pt) for pt in points], fill=self.color, width=self.w, joint="curve")
+        self._cap(*points[0])
+        self._cap(*points[-1])
+
+    def rect(self, x0: float, y0: float, x1: float, y1: float, r: float = 0) -> None:
+        box = [*self.p(x0, y0), *self.p(x1, y1)]
+        self.draw.rounded_rectangle(box, radius=r * self.s, outline=self.color, width=self.w)
+
+    def circle(self, cx: float, cy: float, r: float, fill: bool = False) -> None:
+        box = [*self.p(cx - r, cy - r), *self.p(cx + r, cy + r)]
+        if fill:
+            self.draw.ellipse(box, fill=self.color)
+        else:
+            self.draw.ellipse(box, outline=self.color, width=self.w)
+
+    def arc(self, cx: float, cy: float, r: float, a0: float, a1: float) -> None:
+        box = [*self.p(cx - r, cy - r), *self.p(cx + r, cy + r)]
+        self.draw.arc(box, a0, a1, fill=self.color, width=self.w)
+        for a in (a0, a1):
+            self._cap(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a)))
+
+    def polygon(self, points: list[tuple[float, float]]) -> None:
+        pts = [self.p(*pt) for pt in points]
+        self.draw.line([*pts, pts[0]], fill=self.color, width=self.w, joint="curve")
+
+    def shape(self, paint: Callable[[ImageDraw.ImageDraw, Callable], None], erase=None) -> None:
+        """Outline of an arbitrary filled shape (union of circles, rects, ...)."""
+        mask = Image.new("L", self.img.size, 0)
+        paint(ImageDraw.Draw(mask), self.p)
+        if erase is not None:
+            hole = Image.new("L", self.img.size, 0)
+            erase(ImageDraw.Draw(hole), self.p)
+            mask = ImageChops.subtract(mask, hole)
+        # Erode by the stroke width: a Gaussian blur is O(1) per pixel whatever the
+        # radius, and thresholding it at 2 sigma gives a round structuring element.
+        inner = mask.filter(ImageFilter.GaussianBlur(self.w / 2)).point(
+            lambda v: 255 if v >= 249 else 0
+        )
+        ring = ImageChops.subtract(mask, inner)
+        self.img.paste(self.color, (0, 0), ring)
+
+    def clear(self, paint: Callable[[ImageDraw.ImageDraw, Callable], None]) -> None:
+        """Erase a shape plus a gap of one stroke around it."""
+        mask = Image.new("L", self.img.size, 0)
+        paint(ImageDraw.Draw(mask), self.p)
+        grown = mask.filter(ImageFilter.GaussianBlur(self.w / 2)).point(
+            lambda v: 255 if v >= 6 else 0
+        )
+        self.img.paste((0, 0, 0, 0), (0, 0), grown)
+
+
+def _cloud(draw: ImageDraw.ImageDraw, p: Callable, dx: float = 0, dy: float = 0) -> None:
+    for cx, cy, r in ((8, 14.5, 4), (13, 11, 5.5), (17.5, 14.5, 3.8)):
+        draw.ellipse([*p(cx - r + dx, cy - r + dy), *p(cx + r + dx, cy + r + dy)], fill=255)
+    draw.rectangle([*p(8 + dx, 13 + dy), *p(17.5 + dx, 18.3 + dy)], fill=255)
+
+
+def _cloud_top(pen: _Pen, dy: float = -3) -> None:
+    pen.shape(lambda d, p: _cloud(d, p, 0, dy))
+
+
+def _sun(pen: _Pen, cx: float, cy: float, r: float, ray: float) -> None:
+    pen.circle(cx, cy, r)
+    for i in range(8):
+        a = math.radians(i * 45)
+        pen.line(
+            (cx + (r + 2) * math.cos(a), cy + (r + 2) * math.sin(a)),
+            (cx + (r + 2 + ray) * math.cos(a), cy + (r + 2 + ray) * math.sin(a)),
+        )
+
+
+def _cpu(pen: _Pen) -> None:
+    pen.rect(5, 5, 19, 19, 2)
+    pen.rect(9, 9, 15, 15, 1)
+    for v in (9, 12, 15):
+        pen.line((v, 2), (v, 5))
+        pen.line((v, 19), (v, 22))
+        pen.line((2, v), (5, v))
+        pen.line((19, v), (22, v))
+
+
+def _gpu(pen: _Pen) -> None:
+    pen.rect(2, 6, 22, 17, 2)
+    pen.circle(9, 11.5, 3)
+    pen.line((15, 9.5), (19, 9.5))
+    pen.line((15, 13.5), (19, 13.5))
+    for x in (6, 10, 14):
+        pen.line((x, 17), (x, 20))
+
+
+def _ram(pen: _Pen) -> None:
+    pen.rect(2, 7, 22, 15, 1.5)
+    for x in (5, 10.5, 16):
+        pen.rect(x, 9.5, x + 3, 12.5, 0.5)
+    for x in (6, 10, 14, 18):
+        pen.line((x, 15), (x, 18))
+
+
+def _disk(pen: _Pen) -> None:
+    pen.rect(3, 4, 21, 20, 2.5)
+    pen.circle(12, 11, 4)
+    pen.circle(12, 11, 0.9, fill=True)
+    pen.line((7, 17), (9.5, 17))
+
+
+def _download(pen: _Pen) -> None:
+    pen.line((12, 3), (12, 15))
+    pen.line((7, 10), (12, 15), (17, 10))
+    pen.line((5, 20), (19, 20))
+
+
+def _upload(pen: _Pen) -> None:
+    pen.line((12, 15), (12, 3))
+    pen.line((7, 8), (12, 3), (17, 8))
+    pen.line((5, 20), (19, 20))
+
+
+def _network(pen: _Pen) -> None:
+    pen.line((8, 3), (8, 19))
+    pen.line((4, 15), (8, 19), (12, 15))
+    pen.line((16, 21), (16, 5))
+    pen.line((12, 9), (16, 5), (20, 9))
+
+
+def _temperature(pen: _Pen) -> None:
+    pen.shape(
+        lambda d, p: (
+            d.rounded_rectangle([*p(8.5, 1.5), *p(15.5, 15)], radius=3.5 * pen.s, fill=255),
+            d.ellipse([*p(6.8, 12.3), *p(17.2, 22.7)], fill=255),
+        )
+    )
+    pen.circle(12, 17.5, 2.2, fill=True)
+    pen.line((12, 6.5), (12, 17))
+
+
+def _fan(pen: _Pen) -> None:
+    pen.circle(12, 12, 10)
+    pen.circle(12, 12, 1.6, fill=True)
+    for a in (0, 120, 240):
+        pen.arc(
+            12 + 4 * math.cos(math.radians(a + 60)),
+            12 + 4 * math.sin(math.radians(a + 60)),
+            4,
+            a + 150,
+            a + 290,
+        )
+
+
+def _power(pen: _Pen) -> None:
+    pen.polygon([(13, 2), (4, 14), (11, 14), (10, 22), (20, 9.5), (13, 9.5)])
+
+
+def _clock(pen: _Pen) -> None:
+    pen.circle(12, 12, 9.5)
+    pen.line((12, 6.5), (12, 12), (15.5, 14))
+
+
+def _sun_icon(pen: _Pen) -> None:
+    _sun(pen, 12, 12, 4, 2.5)
+
+
+def _moon(pen: _Pen) -> None:
+    pen.shape(
+        lambda d, p: d.ellipse([*p(3.5, 3.5), *p(20.5, 20.5)], fill=255),
+        erase=lambda d, p: d.ellipse([*p(10, 1), *p(24, 15)], fill=255),
+    )
+
+
+def _battery(pen: _Pen) -> None:
+    pen.rect(2, 7, 19.5, 17, 2)
+    pen.line((22, 10.5), (22, 13.5))
+    pen.draw.rounded_rectangle([*pen.p(5, 10), *pen.p(12, 14)], radius=pen.s, fill=pen.color)
+
+
+def _plug(pen: _Pen) -> None:
+    pen.line((9, 2.5), (9, 7))
+    pen.line((15, 2.5), (15, 7))
+    pen.shape(
+        lambda d, p: d.rounded_rectangle([*p(5.5, 7), *p(18.5, 15.5)], radius=4 * pen.s, fill=255)
+    )
+    pen.line((12, 15.5), (12, 21.5))
+
+
+def _list(pen: _Pen) -> None:
+    for y in (6, 12, 18):
+        pen.circle(4.5, y, 1.4, fill=True)
+        pen.line((9, y), (20, y))
+
+
+def _grid(pen: _Pen) -> None:
+    for x, y in ((3, 3), (13.5, 3), (3, 13.5), (13.5, 13.5)):
+        pen.rect(x, y, x + 7.5, y + 7.5, 1.5)
+
+
+def _ethernet(pen: _Pen) -> None:
+    """A network cable's plug, seen from the front."""
+    pen.line((5, 9), (8, 9), (8, 6), (16, 6), (16, 9), (19, 9), (19, 19), (5, 19), (5, 9))
+    for x in (9.5, 12, 14.5):
+        pen.line((x, 13), (x, 16))
+
+
+def _wifi_arcs(pen: _Pen, arcs: int) -> None:
+    """Wi-Fi: a dot and three arcs over it, ``arcs`` of them lit (the signal's strength), the
+    others faint."""
+    lit = pen.color
+    pen.circle(12, 19, 1.4, fill=True)
+    for i, r in enumerate((5.0, 9.5, 14.0)):
+        pen.color = lit if i < arcs else (*lit[:3], round((lit[3] if len(lit) > 3 else 255) * 0.28))
+        pen.arc(12, 20, r, 225, 315)
+    pen.color = lit
+
+
+def _wifi(pen: _Pen) -> None:
+    _wifi_arcs(pen, 3)
+
+
+def _wifi_1(pen: _Pen) -> None:
+    _wifi_arcs(pen, 1)
+
+
+def _wifi_2(pen: _Pen) -> None:
+    _wifi_arcs(pen, 2)
+
+
+def _uptime(pen: _Pen) -> None:
+    """Switched on, and since how long: the power symbol (a ring open at the top, a line into
+    it)."""
+    pen.arc(12, 13.5, 8, 300, 600)
+    pen.line((12, 3), (12, 11.5))
+
+
+def link_icon(kind: object, signal: object) -> str:
+    """The icon of the network connection (``link``): a cable's plug, or Wi-Fi with as many
+    arcs as its signal is strong (a third: one, two thirds: two, more: three)."""
+    if kind == "lan":
+        return "ethernet"
+    if kind != "wlan":
+        return "network"
+    if not isinstance(signal, int | float):
+        return "wifi"
+    return "wifi-1" if signal < 34 else "wifi-2" if signal < 67 else "wifi"
+
+
+def _signal(pen: _Pen) -> None:
+    for i, x in enumerate((5, 10, 15, 20)):
+        pen.line((x, 20), (x, 16 - i * 4))
+
+
+def _horizon_sun(pen: _Pen) -> None:
+    pen.arc(12, 16, 5, 180, 360)
+    for a in (180, 225, 270, 315, 360):
+        r = math.radians(a)
+        pen.line((12 + 7.5 * math.cos(r), 16 + 7.5 * math.sin(r)),
+                 (12 + 9.5 * math.cos(r), 16 + 9.5 * math.sin(r)))  # fmt: skip
+    pen.line((2, 16), (22, 16))
+
+
+def _sunrise(pen: _Pen) -> None:
+    _horizon_sun(pen)
+    pen.line((12, 23), (12, 19.5))
+    pen.line((10, 21.2), (12, 19.5), (14, 21.2))
+
+
+def _sunset(pen: _Pen) -> None:
+    _horizon_sun(pen)
+    pen.line((12, 19.5), (12, 23))
+    pen.line((10, 21.3), (12, 23), (14, 21.3))
+
+
+def _hourglass(pen: _Pen) -> None:
+    pen.line((6, 2.5), (18, 2.5))
+    pen.line((6, 21.5), (18, 21.5))
+    pen.polygon([(7.5, 2.5), (16.5, 2.5), (12, 12)])
+    pen.polygon([(12, 12), (16.5, 21.5), (7.5, 21.5)])
+
+
+def _image(pen: _Pen) -> None:
+    pen.rect(2.5, 4, 21.5, 20, 2)
+    pen.circle(8, 9.5, 1.8)
+    pen.line((3.5, 18), (9.5, 12.5), (13, 16), (16, 13), (20.5, 17.5))
+
+
+def _globe(pen: _Pen) -> None:
+    pen.circle(12, 12, 9.5)
+    pen.line((2.5, 12), (21.5, 12))
+    pen.draw.ellipse([*pen.p(7.5, 2.5), *pen.p(16.5, 21.5)], outline=pen.color, width=pen.w)
+    pen.line((4, 7.2), (20, 7.2))
+    pen.line((4, 16.8), (20, 16.8))
+
+
+def _music(pen: _Pen) -> None:
+    pen.line((9, 18), (9, 4.5), (20, 2.5), (20, 16))
+    pen.line((9, 8.8), (20, 6.8))
+    pen.circle(6.3, 18, 2.7, fill=True)
+    pen.circle(17.3, 16, 2.7, fill=True)
+
+
+def _play(pen: _Pen) -> None:
+    corners = [(7.5, 4.5), (7.5, 19.5), (19, 12)]
+    pen.draw.polygon([pen.p(*c) for c in corners], fill=pen.color)
+    pen.polygon(corners)  # its stroke rounds the corners
+
+
+def _pause(pen: _Pen) -> None:
+    for left in (6.5, 13.5):
+        box = [*pen.p(left, 4.5), *pen.p(left + 4, 19.5)]
+        pen.draw.rounded_rectangle(box, radius=pen.s * 1.1, fill=pen.color)
+
+
+def _speaker(pen: _Pen) -> None:
+    pen.polygon([(3, 9), (7, 9), (12, 4.5), (12, 19.5), (7, 15), (3, 15)])
+
+
+def _volume(pen: _Pen) -> None:
+    _speaker(pen)
+    pen.arc(12.5, 12, 4, -42, 42)
+    pen.arc(12.5, 12, 8, -48, 48)
+
+
+def _mute(pen: _Pen) -> None:
+    _speaker(pen)
+    pen.line((15.5, 9), (21, 15))
+    pen.line((21, 9), (15.5, 15))
+
+
+def _mic(pen: _Pen) -> None:
+    pen.rect(9, 2.5, 15, 14.5, 3)
+    pen.arc(12, 11, 7, 0, 180)
+    pen.line((12, 18), (12, 21.5))
+    pen.line((8.5, 21.5), (15.5, 21.5))
+
+
+def _mic_off(pen: _Pen) -> None:
+    _mic(pen)
+    pen.line((4, 3), (20, 21))
+
+
+def _up(pen: _Pen) -> None:
+    pen.line((12, 20), (12, 4.5))
+    pen.line((6, 10.5), (12, 4.5), (18, 10.5))
+
+
+def _down(pen: _Pen) -> None:
+    pen.line((12, 4), (12, 19.5))
+    pen.line((6, 13.5), (12, 19.5), (18, 13.5))
+
+
+def _calendar(pen: _Pen) -> None:
+    pen.rect(3, 5, 21, 21, 2)
+    pen.line((3, 10), (21, 10))
+    pen.line((8, 2.5), (8, 6.5))
+    pen.line((16, 2.5), (16, 6.5))
+    for x, y in ((8, 14), (12, 14), (16, 14), (8, 17.5), (12, 17.5)):
+        pen.circle(x, y, 0.9, fill=True)
+
+
+def _home(pen: _Pen) -> None:
+    pen.polygon([(3, 11), (12, 3), (21, 11), (19, 11), (19, 21), (5, 21), (5, 11)])
+    pen.line((10, 21), (10, 15), (14, 15), (14, 21))
+
+
+def _agent(pen: _Pen) -> None:
+    """An AI agent at work, as the agent widget draws it: a ring with its light at the top."""
+    pen.circle(12, 12.8, 8)
+    pen.circle(12, 4.8, 2.4, fill=True)
+
+
+def _gamepad(pen: _Pen) -> None:
+    pen.shape(
+        lambda d, p: (
+            d.rounded_rectangle([*p(3.5, 7), *p(20.5, 16)], radius=4.5 * pen.s, fill=255),
+            d.ellipse([*p(2, 9.5), *p(9.5, 19.5)], fill=255),
+            d.ellipse([*p(14.5, 9.5), *p(22, 19.5)], fill=255),
+        )
+    )
+    pen.line((8, 9.8), (8, 13.2))
+    pen.line((6.3, 11.5), (9.7, 11.5))
+    pen.circle(15.5, 10.5, 0.9, fill=True)
+    pen.circle(17.5, 12.6, 0.9, fill=True)
+
+
+def _usb(pen: _Pen) -> None:
+    """The USB trident: a shaft with an arrow, a circle and a square on its branches."""
+    pen.line((12, 19), (12, 4.5))
+    pen.draw.polygon([pen.p(12, 1.8), pen.p(9, 6.4), pen.p(15, 6.4)], fill=pen.color)
+    pen.line((12, 14.5), (6.5, 11), (6.5, 8.5))
+    pen.circle(6.5, 7, 1.9, fill=True)
+    pen.line((12, 11.5), (17.5, 8.5), (17.5, 7.2))
+    pen.draw.rectangle([*pen.p(15.7, 3.9), *pen.p(19.3, 7.5)], fill=pen.color)
+    pen.circle(12, 20.2, 2.1, fill=True)
+
+
+def _stick(pen: _Pen) -> None:
+    """A USB stick: the plug above, the body below."""
+    pen.rect(8, 2, 16, 9, 1)
+    pen.circle(10.4, 5.7, 0.7, fill=True)
+    pen.circle(13.6, 5.7, 0.7, fill=True)
+    pen.rect(6, 9, 18, 22, 2.5)
+    pen.line((10, 18), (14, 18))
+
+
+def _phone(pen: _Pen) -> None:
+    pen.rect(6, 2, 18, 22, 2.5)
+    pen.line((10.5, 5.8), (13.5, 5.8))
+    pen.line((10.5, 18.2), (13.5, 18.2))
+
+
+def _ssd(pen: _Pen) -> None:
+    """An M.2 module: the board with its notch, two chips and the screw hole."""
+    pen.rect(2, 7.5, 22, 16.5, 1.5)
+    pen.line((2, 10.5), (4.5, 10.5), (4.5, 13.5), (2, 13.5))
+    pen.rect(7, 10, 11.5, 14, 0.6)
+    pen.rect(13, 10, 17.5, 14, 0.6)
+    pen.circle(20, 12, 0.9, fill=True)
+
+
+def _cloud_icon(pen: _Pen) -> None:
+    pen.shape(lambda d, p: _cloud(d, p))
+
+
+def _partly(pen: _Pen) -> None:
+    _sun(pen, 8.5, 8.5, 3, 1.8)
+    pen.clear(lambda d, p: _cloud(d, p, 1.5, 3))
+    pen.shape(lambda d, p: _cloud(d, p, 1.5, 3))
+
+
+def _rain(pen: _Pen) -> None:
+    _cloud_top(pen)
+    for x in (8, 12, 16):
+        pen.line((x, 17.5), (x - 1.5, 21.5))
+
+
+def _snow(pen: _Pen) -> None:
+    _cloud_top(pen)
+    for x, y in ((8, 18.5), (12, 21), (16, 18.5)):
+        pen.circle(x, y, 0.9, fill=True)
+
+
+def _storm(pen: _Pen) -> None:
+    _cloud_top(pen)
+    pen.line((12.5, 16.5), (10, 20), (13.5, 20), (11, 23))
+
+
+def _fog(pen: _Pen) -> None:
+    _cloud_top(pen, -4)
+    pen.line((4, 17.5), (20, 17.5))
+    pen.line((6, 21), (18, 21))
+
+
+def _humidity(pen: _Pen) -> None:
+    pen.shape(
+        lambda d, p: (
+            d.polygon([p(12, 2.5), p(5.8, 13), p(18.2, 13)], fill=255),
+            d.ellipse([*p(5.5, 8.5), *p(18.5, 21.5)], fill=255),
+        )
+    )
+
+
+def _wind(pen: _Pen) -> None:
+    pen.line((3, 8), (14, 8))
+    pen.arc(14, 5.5, 2.5, -90, 90)
+    pen.line((3, 12), (18, 12))
+    pen.arc(18, 14.5, 2.5, -90, 90)
+    pen.line((3, 16), (10, 16))
+
+
+_ICONS: dict[str, Callable[[_Pen], None]] = {
+    "cpu": _cpu,
+    "gpu": _gpu,
+    "ram": _ram,
+    "disk": _disk,
+    "network": _network,
+    "download": _download,
+    "upload": _upload,
+    "temperature": _temperature,
+    "fan": _fan,
+    "power": _power,
+    "clock": _clock,
+    "sun": _sun_icon,
+    "moon": _moon,
+    "cloud": _cloud_icon,
+    "partly": _partly,
+    "rain": _rain,
+    "snow": _snow,
+    "storm": _storm,
+    "fog": _fog,
+    "humidity": _humidity,
+    "wind": _wind,
+    "battery": _battery,
+    "plug": _plug,
+    "list": _list,
+    "grid": _grid,
+    "signal": _signal,
+    "ethernet": _ethernet,
+    "wifi": _wifi,
+    "wifi-1": _wifi_1,
+    "wifi-2": _wifi_2,
+    "link": _wifi,  # (the renderer picks the connection's: link_icon)
+    "uptime": _uptime,
+    "sunrise": _sunrise,
+    "sunset": _sunset,
+    "hourglass": _hourglass,
+    "image": _image,
+    "globe": _globe,
+    "music": _music,
+    "calendar": _calendar,
+    "home": _home,
+    "gamepad": _gamepad,
+    "agent": _agent,
+    "usb": _usb,
+    "stick": _stick,
+    "phone": _phone,
+    "ssd": _ssd,
+    "play": _play,
+    "pause": _pause,
+    "up": _up,
+    "down": _down,
+    "volume": _volume,
+    "mute": _mute,
+    "mic": _mic,
+    "mic_off": _mic_off,
+}
+
+
+def weather_icon_name(code: float | int | None, night: bool = False) -> str:
+    """Icon for a WMO weather code as reported by Open-Meteo."""
+    try:
+        code = int(code)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):  # no code, or one that is no number
+        return "cloud"
+    if code in (0, 1):
+        return "moon" if night else "sun"
+    if code == 2:
+        return "partly"
+    if code == 3:
+        return "cloud"
+    if code in (45, 48):
+        return "fog"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "snow"
+    if code >= 95:
+        return "storm"
+    if 51 <= code <= 82:
+        return "rain"
+    return "cloud"
+
+
+@lru_cache(maxsize=256)
+def draw_icon(name: str, size: int, color: Color, stroke: float = 2.0) -> Image.Image:
+    """RGBA icon of ``size`` x ``size`` pixels; ``stroke`` is in 24-grid units.
+
+    Cached: callers must not modify the returned image.
+    """
+    size = max(8, min(int(size), 512))
+    pen = _Pen(size, color, stroke)
+    _ICONS.get(name, _cloud_icon)(pen)
+    return pen.img.resize((size, size), Image.Resampling.LANCZOS)

@@ -1,0 +1,22 @@
+# Build environment of TURMO (Python 3.14, Windows). Pins = the project venv at v0.3.2.
+altgraph==0.17.5
+cffi==2.1.1
+clr_loader==0.3.1
+libre-panel @ git+https://github.com/syntensa/libre-panel.git@66fb57f8192c997c799c796f42adb750423c0fe1
+numpy==2.5.4
+nvidia-ml-py==13.615.71
+packaging==26.3
+pefile==2024.8.26
+pillow==13.0.0
+psutil==7.2.2
+pycparser==3.12
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+pynvml==13.0.1
+pyserial==3.5
+pystray==0.19.5
+pythonnet==3.2.1
+pywin32-ctypes==0.2.3
+setuptools==84.2.1
+six==1.17.0
+tzdata==2026.6

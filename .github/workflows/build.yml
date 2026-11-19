@@ -1,0 +1,48 @@
+# Release build on a tag (v*). DRAFT: not run yet. The signing step needs the SignPath project
+# (organisation id, project and policy slugs, API token as repository secrets) - TODO(user).
+name: build
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install -r requirements.txt
+      - run: choco install innosetup -y --no-progress
+      - name: Tests
+        run: python scripts/test_gui_logic.py
+      # The elevated CPU helper is NOT rebuilt: the prebuilt folder is a release asset (TODO(user): tag and file name).
+      - name: Helper (CPU temperature), prebuilt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download helper-v1 --pattern TURMO-CpuTempHelper.zip
+          Expand-Archive TURMO-CpuTempHelper.zip -DestinationPath dist
+
+      - name: Build exes and Setup
+        run: python scripts/build_release.py ${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        with:
+          name: unsigned
+          path: dist/TURMO-Setup-${{ github.ref_name }}.exe
+      - uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: turmo
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-setup
+          path: signed
