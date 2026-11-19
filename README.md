@@ -1,6 +1,12 @@
+<p align="center"><img src="assets/turmo_icon.png" alt="TURMO logo" width="140"></p>
+
 # TURMO Display Control — Windows Application
 
 A professional Windows application for controlling TURMO 3.5" USB displays (VID:PID 1A86:5722).
+
+<p align="center"><img src="assets/readme/dashboard.png" alt="TURMO Dashboard" width="800"></p>
+
+[![Buy Me A Coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=TheCreator0169&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff)](https://www.buymeacoffee.com/TheCreator0169)
 
 ## Features
 
