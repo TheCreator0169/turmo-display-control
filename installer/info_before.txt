@@ -1,0 +1,12 @@
+About administrator rights
+
+The installer asks for administrator rights once. It uses them to register one Windows scheduled task named "TURMO CpuTemp Helper".
+
+What the task does:
+- it starts when you sign in and runs hidden with administrator rights, because reading the CPU temperature needs them;
+- it only reads the CPU temperature (through LibreHardwareMonitor and the PawnIO driver, which is installed separately) and answers the TURMO app on this PC only;
+- the uninstaller removes it.
+
+TURMO sends nothing over the network, except when you press Update in the About page (it asks GitHub for the latest release).
+
+If you do not want the task, close this installer: without it TURMO still works, but the CPU temperature is not shown.

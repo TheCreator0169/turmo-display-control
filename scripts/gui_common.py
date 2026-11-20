@@ -260,9 +260,12 @@ else:
     TURMO_RUNTIME_SCRIPT = PROJECT_ROOT / "scripts" / "turmo_runtime.py"
     from scripts.turmo_runtime import find_turmo_port, scan_all_ports, load_theme, LANDSCAPE_SIZE, TURING_SIZE, _preinit_libre_hardware_monitor
 
+GUI_EXE = TURMO_MONITOR_EXE.with_name("TURMO-Display-Control.exe")  # what the Start-with-Windows entry runs
+
 from scripts.settings import (GAIN_RANGE, Settings, dim_image, gain_values, keeps_celsius, read_link_status, read_serial_stats,
                               temps_in_unit)
 from scripts import theme_paths
+from scripts import startup_entry
 from scripts.errors import friendly_error  # noqa: E402,F401
 from scripts.editor_render import Shot
 

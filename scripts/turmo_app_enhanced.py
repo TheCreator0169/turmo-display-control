@@ -35,7 +35,8 @@ if not getattr(sys, "frozen", False):
 # Loading screen (v0.2.1): shown before the heavy imports below. Only when this file is the program
 # (the test suites import it and must not open a window).
 SPLASH = None
-if __name__ == "__main__":
+STARTUP = "--startup" in sys.argv  # v0.3.7.2: started by Windows at sign-in: no splash, window hidden in the tray
+if __name__ == "__main__" and not STARTUP:
     # The .NET runtime (CPU temperature) is loaded before the first Tk window exists: with the window first, the
     # frozen exe spent 5 s here (measured 2026-11-18). turmo_runtime._preinit_libre_hardware_monitor() sees it loaded.
     # clr_loader runs `dotnet --list-runtimes`; from this windowed exe that opened a terminal window (Windows
@@ -1870,8 +1871,13 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         try:
             import winreg
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-            winreg.QueryValueEx(key, "TURMO")
+            value = winreg.QueryValueEx(key, "TURMO")[0]
             winreg.CloseKey(key)
+            hidden = startup_entry.upgraded(value, GUI_EXE)
+            if hidden:  # v0.3.7.2: an entry written by an older version ran the console Monitor (a black window at sign-in)
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(key, "TURMO", 0, winreg.REG_SZ, hidden)
+                winreg.CloseKey(key)
             return True
         except FileNotFoundError:
             return False  # ok: no file: not found
@@ -1884,8 +1890,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             import winreg
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
             if self.startup_var.get():
-                # Use TURMO-Monitor.exe for Windows startup (standalone headless worker)
-                cmd = f'"{TURMO_MONITOR_EXE}" --monitor'
+                cmd = startup_entry.command(GUI_EXE)  # the GUI, hidden in the tray; it starts the Monitor
                 winreg.SetValueEx(key, "TURMO", 0, winreg.REG_SZ, cmd)
                 self.status_var.set(tr("Startup enabled"))
             else:
@@ -2656,10 +2661,16 @@ def main():
         stalls = SPLASH.stalls()
         if stalls:
             log_startup(startup_log, "SPLASH", "gaps over 50 ms (seconds after the first redraw, ms): " + ", ".join(f"{t} s {g} ms" for t, g in stalls))
-    app.show_window()  # after the loading screen is gone
+    if STARTUP:
+        root.withdraw()  # in the tray, no window; alpha back to 1 so "Open TURMO" shows it normally
+        root.attributes("-alpha", 1.0)
+        root.after(1500, lambda: app.start_monitor(reason="startup"))
+    else:
+        app.show_window()  # after the loading screen is gone
     log_startup(startup_log, "MAINLOOP", "Entering root.mainloop()")
     app.start_log_sweeper()
-    root.after(800, app.start_first_run)
+    if not STARTUP:
+        root.after(800, app.start_first_run)
     root.mainloop()
     log_startup(startup_log, "MAINLOOP_EXIT", "root.mainloop() exited")
 

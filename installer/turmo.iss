@@ -17,6 +17,7 @@ DefaultGroupName=TURMO Display Control
 UninstallDisplayIcon={app}\TURMO-Display-Control.exe
 SetupIconFile=turmo.ico
 LicenseFile=..\LICENSE
+InfoBeforeFile=info_before.txt
 WizardImageFile=wizard_side.bmp
 WizardSmallImageFile=wizard_small.bmp
 OutputDir=..\dist
@@ -48,8 +49,8 @@ Name: "{group}\TURMO Display Control"; Filename: "{app}\TURMO-Display-Control.ex
 Name: "{autodesktop}\TURMO Display Control"; Filename: "{app}\TURMO-Display-Control.exe"; Tasks: desktopicon
 
 [Registry]
-; Same entry as the Settings switch: the Monitor (headless) starts with Windows. Removed again on uninstall.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TURMO";   ValueData: """{app}\TURMO-Monitor.exe"" --monitor"; Tasks: startup; Flags: uninsdeletevalue
+; Same entry as the Settings switch: TURMO starts with Windows, hidden in the tray (the GUI starts the Monitor). Removed again on uninstall.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TURMO";   ValueData: """{app}\TURMO-Display-Control.exe"" --startup"; Tasks: startup; Flags: uninsdeletevalue
 
 [Run]
 ; The installer already runs as admin: the CPU temperature task is registered here, so the app never shows a UAC prompt for it.

@@ -2,6 +2,19 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.7.2 (2026-11-20)
+----------------------
+- "Start with Windows" now starts TURMO Display Control itself (`--startup`): no splash, the window stays hidden in the tray, and the GUI starts the Monitor with no console window. It replaces the v0.3.7.1 `conhost --headless` form. The installer writes the new entry; an older entry is rewritten when the app starts.
+
+v0.3.7.1 (2026-11-20)
+----------------------
+- Fix: with "Start with Windows" on, a black console window opened at sign-in (the Monitor is a console program). The entry now runs it through `conhost.exe --headless`, so no window appears. The installer writes the new form; an entry written by an older version is rewritten when the app starts.
+
+v0.3.7 (2026-11-20)
+--------------------
+- Installer: a page before the install explains the administrator rights (one scheduled task, "TURMO CpuTemp Helper", reads the CPU temperature only; the uninstaller removes it).
+- The GitHub Actions build (started by hand) signs the Setup only when the SignPath secrets exist, so it can run unsigned until then.
+
 v0.3.6.3 (2026-11-20)
 ---------------------
 - Language / Dark-Light change: the picture of the old window now fades out (about 0.12 s) onto the new one instead of jumping to it. The redraw itself still takes about 1.5 s (Tk lays out about 1000 widgets).
