@@ -2,6 +2,15 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.6.1 (2026-11-20)
+---------------------
+- Language / Dark-Light change: the window is redrawn in about 1.3 s instead of 3.8 s (old pages are dropped by Tk in one call; cards are sized before their page is shown).
+- Moving between pages: the Theme Editor is built while the app is idle instead of when first opened (it filled in piece by piece for about 2 s; now about 0.5 s), and every page's cards have their size before the page is first shown.
+
+v0.3.6 (2026-11-20)
+-------------------
+- Changing the language or the Dark/Light look no longer makes the window vanish: a picture of the window stays on screen while the pages are drawn again (still about 3 seconds, the window is frozen meanwhile).
+
 v0.3.5 (2026-11-20)
 -------------------
 - Errors in plain words: no internet, timeout, busy server, file in use, disk full. The Update button says "No internet connection." offline. Import/export of settings, screenshot, log export and "Open folder" no longer fail silently.

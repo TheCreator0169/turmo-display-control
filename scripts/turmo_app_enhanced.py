@@ -363,6 +363,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         # No status bar (design): the sidebar's device chip shows the state. The messages stay in status_var.
         self.status_var = tk.StringVar(value="Ready")
         self._dark_title_bar()
+        fit_cards(self.nb)  # v0.3.6.1: the cards of every page have their size before the page is first shown
 
     # ─── v0.2.4: pages built on first visit ───
     # Gallery, Sensors & Graphs, Diagnostics and About are an empty frame until they are opened (or, 1 s after the
@@ -398,12 +399,16 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         self.nb.insert(position, built)  # moves the new page from the end to where the empty frame is
         self.nb.forget(placeholder)
         placeholder.destroy()
+        fit_cards(self.nb.nametowidget(built))
         if selected:
             self.nb.select(built)
 
     def _prebuild_next(self, gen):
         """While idle, build the pages nobody opened yet, one at a time."""
-        if gen != self._lazy_gen or not self._lazy_pages:
+        if gen != self._lazy_gen:
+            return
+        if not self._lazy_pages:  # every page was opened by hand already
+            self.root.after(800, self._prebuild_editor, gen)
             return
         try:
             if not self._window_hidden():
@@ -412,6 +417,22 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             log_swallowed("prebuild page", e)
         if self._lazy_pages:
             self.root.after(800, self._prebuild_next, gen)
+        else:
+            self.root.after(800, self._prebuild_editor, gen)
+
+    def _prebuild_editor(self, gen):
+        """v0.3.6.1: the Theme Editor is built while idle, not when it is first opened (building it on screen showed the
+        page filling up piece by piece for over a second)."""
+        if gen != self._lazy_gen or self.editor_initialized:
+            return
+        try:
+            if self._window_hidden():
+                self.root.after(800, self._prebuild_editor, gen)  # nothing to see: wait until the window is back
+                return
+            self.theme_editor = ThemeEditor(self, self.editor_frame)
+            self.editor_initialized = True
+        except Exception as e:
+            log_swallowed("prebuild theme editor", e)
 
     # ─── v0.2.0 design: window icon, sidebar, dashboard ───
 
@@ -745,16 +766,44 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         set_mode(self.settings.app_mode)
         self.root.after_idle(self.rebuild_ui)
 
+    def _curtain(self):
+        """v0.3.5: a picture of the window, shown in a borderless window on top of it while the pages are built again, so
+        the window stays on screen (it used to vanish for 2 to 3 seconds). None when the window cannot be photographed
+        (minimised, in the tray): the caller hides it as before."""
+        try:
+            if self._window_hidden() or not self.root.winfo_viewable():
+                return None
+            from PIL import ImageGrab, ImageTk
+            self.root.update_idletasks()
+            x, y, w, h = self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_width(), self.root.winfo_height()
+            picture = ImageTk.PhotoImage(ImageGrab.grab((x, y, x + w, y + h)))
+            cover = tk.Toplevel(self.root)
+            cover.overrideredirect(True)
+            cover.geometry(f"{w}x{h}+{x}+{y}")
+            label = tk.Label(cover, image=picture, bd=0)
+            label.image = picture  # kept: Tk drops a picture nobody holds
+            label.pack()
+            cover.attributes("-topmost", True)
+            cover.update()
+            return cover
+        except Exception as e:  # ok: no curtain, the window is hidden while it is built, as before
+            log_swallowed("rebuild_ui curtain", e)
+            return None
+
     def rebuild_ui(self):
         tab = self.nb.index(self.nb.select())
+        cover = self._curtain()
         try:
-            self.root.attributes("-alpha", 0.0)  # nothing of the half-built window is drawn
+            if cover is None:
+                self.root.attributes("-alpha", 0.0)  # nothing of the half-built window is drawn
         except tk.TclError as e:
             log_swallowed("rebuild_ui hide window", e)
         try:
             for w in (self.sidebar, self.nb, getattr(self, "minimal_view", None)):
                 if w is not None:
-                    w.destroy()
+                    # v0.3.6.1: Tk drops the whole subtree at once (3x faster than tkinter walking about 1000 widgets)
+                    self.root.tk.call("destroy", w._w)
+                    self.root.children.pop(w._name, None)
             self.minimal_view, self._minimal_on = None, False
             self.theme_editor, self.editor_initialized = None, False
             for attr in getattr(self, "_lazy_attrs", ()):  # their widgets are gone: the pages are built again on demand
@@ -769,6 +818,8 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         finally:
             try:
                 self.root.attributes("-alpha", 1.0)
+                if cover is not None:
+                    cover.destroy()
             except tk.TclError as e:
                 log_swallowed("rebuild_ui show window", e)
 

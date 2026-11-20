@@ -190,6 +190,23 @@ class RoundedCard(tk.Canvas):
         self.after_idle(self._fit)
 
 
+def fit_cards(widget):
+    """v0.3.6.1: give every card under `widget` its height now, while its page is not on screen. A card is fitted when
+    its content first reports a size, which only happens once the page is shown: the first visit to each page then drew
+    the cards at 1 px and grew them one by one (a flicker, and up to 2 s). Inner cards first."""
+    cards = []
+
+    def walk(w):
+        for child in w.winfo_children():
+            walk(child)
+        if isinstance(w, RoundedCard) and not getattr(w, "_prefit", False):
+            cards.append(w)
+    walk(widget)
+    for card in cards:
+        card._prefit = True
+        card._fit()
+
+
 @focusable()
 class RoundedButton(tk.Canvas):
     """A flat button with rounded corners (Tk buttons cannot round). It takes the options the app

@@ -173,7 +173,7 @@ from scripts.modal import Modal, form_entry, form_label, form_spin  # noqa: E402
 from scripts.minimal_ui import MinimalView, MIN_SIZE as MINIMAL_MIN, SIZE as MINIMAL_SIZE  # noqa: E402
 from scripts.quick_panel import QuickPanel, work_area  # noqa: E402
 from scripts.gui_widgets import (  # noqa: E402,F401
-    Badge, ChoiceTile, ControlButton, DeviceChip, IconTile, LayerRow, Stepper, NavItem, RoundedButton, RoundedCard, ThemeChip, WidgetTile, draw_spark,
+    Badge, ChoiceTile, ControlButton, DeviceChip, fit_cards, IconTile, LayerRow, Stepper, NavItem, RoundedButton, RoundedCard, ThemeChip, WidgetTile, draw_spark,
     ScrollFrame, Segmented, Select, Slider, StatRow, Switch, Tip, make_button, page_header, round_rect, rounded_entry,
 )
 

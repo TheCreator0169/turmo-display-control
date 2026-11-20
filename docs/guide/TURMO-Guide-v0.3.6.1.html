@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TURMO Display Control v0.3.6.1 - Guide</title>
+<style>
+:root{--ink:#0b0e14;--muted:#566070;--line:#d8dee8;--accent:#0a7ea0;--paper:#fff}
+@page{size:A4;margin:18mm 16mm}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:11pt/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:170mm;margin:0 auto;padding:0 16px}
+h1{font-size:24pt;margin:0 0 2pt}
+.sub{color:var(--muted);margin:0 0 14pt}
+h2{font-size:14pt;margin:18pt 0 6pt;padding-bottom:3pt;border-bottom:1.5px solid var(--accent);break-after:avoid}
+h3{font-size:11.5pt;margin:12pt 0 3pt;break-after:avoid}
+p,li{margin:3pt 0}
+ol,ul{padding-left:18pt}
+code{font:10pt Consolas,monospace;background:#eef2f7;padding:1px 4px;border-radius:3px}
+table{border-collapse:collapse;width:100%;margin:6pt 0}
+td,th{border:1px solid var(--line);padding:4pt 7pt;text-align:left;vertical-align:top;font-size:10.5pt}
+th{background:#f1f4f9}
+.note{border-left:3px solid var(--accent);background:#f1f7fa;padding:5pt 9pt;margin:8pt 0}
+li,tr,.note{break-inside:avoid}
+</style></head><body><main>
+<h1>TURMO Display Control</h1>
+<p class="sub">Guide for version 0.3.0 &middot; Windows 10/11 (64-bit) &middot; TURMO 3.5" USB display</p>
+
+<h2>1. Install</h2>
+<ol>
+<li>Run <code>TURMO-Setup-v0.3.6.1.exe</code> and accept the administrator prompt (it is needed once, to register the task that reads the CPU temperature).</li>
+<li>Choose the options: <b>Desktop shortcut</b> and <b>Start TURMO with Windows</b>. Both are off by default.</li>
+<li>Open <b>TURMO Display Control</b> from the Start Menu.</li>
+</ol>
+<div class="note">The setup is not code-signed yet, so Windows SmartScreen may warn. Installing over an older version keeps your settings and your own themes.</div>
+<p>Portable use: extract the files to a folder and run <code>launch_portable.bat</code>; the settings are then stored next to the program.</p>
+
+<h2>2. First start</h2>
+<p>A welcome dialog checks four things and must be closed with <b>Done</b>: the display, the CPU temperature helper (<b>Enable</b> asks for one administrator confirmation), the language (English, Français or Português) and the look of the window (Default or Minimalist).</p>
+
+<h2>3. Everyday use</h2>
+<table>
+<tr><th>Page</th><th>What it does</th></tr>
+<tr><td>Dashboard</td><td>Device status, Start / Stop / Restart / Test image, orientation (Landscape or Portrait; the display follows at once), theme and brightness.</td></tr>
+<tr><td>Monitor</td><td>Starts and stops the Monitor, the program that sends the pictures to the display; shows its logs.</td></tr>
+<tr><td>Live Preview</td><td>The display's output on screen, with the real sensor values.</td></tr>
+<tr><td>Gallery</td><td>All themes. Your own themes get a picture, a bin (delete), a pencil (edit) and a copy button; the organize icon (top right) is on every card.</td></tr>
+<tr><td>Theme Editor</td><td>Drag widgets onto the canvas and set their sensor, colour and size. The list <b>In this theme</b> shows the layers; the arrows on the chosen row move it up or down. <b>Save theme</b> writes it; Export / Import JSON shares it.</td></tr>
+<tr><td>Sensors &amp; Graphs</td><td>Graph sensors, ranges, colours, history length.</td></tr>
+<tr><td>Settings</td><td>Units, widgets, start with Windows, brightness, App theme (Default or Minimalist), Logs (a switch to stop writing logs, days and MB to keep, Clean now, Open folder).</td></tr>
+<tr><td>Diagnostics, About</td><td>Checks (including the USB link and serial latency) and version information.</td></tr>
+</table>
+
+<h3>System tray</h3>
+<p>One click on the icon opens a quick panel (status, CPU / GPU / RAM, Start / Stop, brightness); a double click opens the window; right-click offers Open, Start/Stop Monitor and Quit. The Monitor keeps running when the window is hidden.</p>
+
+<h2>4. If the display is unplugged or asleep</h2>
+<p>The Monitor never needs a restart. It looks for the display again by itself (after 0.5, 1, 2, then every 5 seconds) and the app shows <b>Connecting</b>, <b>Reconnecting</b> or <b>Not found</b> until it is back. You can press Start with no display plugged in.</p>
+
+<h2>5. Where things are</h2>
+<table>
+<tr><td>Settings</td><td><code>%APPDATA%\TURMO\settings.json</code></td></tr>
+<tr><td>Your themes</td><td><code>%APPDATA%\TURMO\themes\custom</code></td></tr>
+<tr><td>Logs</td><td><code>%LOCALAPPDATA%\TURMO\logs</code> (old logs are removed by themselves)</td></tr>
+</table>
+
+<h2>6. Uninstall</h2>
+<p>Use Windows <b>Settings &gt; Apps</b>. The uninstaller removes the CPU temperature task and asks whether to delete your settings and themes; the default is to keep them.</p>
+
+<h2>7. Good to know</h2>
+<ul>
+<li>The program works fully offline; nothing is sent to the cloud.</li>
+<li>The menus are in English; French and Portuguese wording is still a draft.</li>
+<li>Licence: GNU General Public License, version 3 or later (GPL-3.0-or-later). The full text is in <code>LICENSE</code>, the credits of the bundled parts in <code>THIRD_PARTY_NOTICES.md</code>; both are installed with the app.</li>
+</ul>
+</main></body></html>
