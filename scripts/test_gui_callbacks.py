@@ -227,6 +227,104 @@ def run():
         print(f"[8d] lazy pages: FAIL ({e})")
         results["lazy_pages"] = False
 
+    # 8e. v0.3.6.2 smooth page change: a picture of the old page covers the notebook while the new page is drawn, then
+    # fades out (6 x 20 ms). A page change made while a picture is being taken is stored as _pending_tab and changes nothing.
+    # With Settings > Appearance off no picture is ever made.
+    try:
+        from scripts.gui_design import SIDEBAR_ITEMS
+        app.show_window()
+        root.update()
+        other = SIDEBAR_ITEMS.index("Settings")
+        real_cover = app._page_cover
+        covers = []
+
+        def spy(index):
+            c = real_cover(index)
+            covers.append(c)
+            return c
+
+        try:
+            app.select_tab(0)
+            root.update()
+            app._page_cover = spy
+            app.settings.smooth_pages = True
+            app.select_tab(other)
+            assert app.nb.index("current") == other, "page not selected"
+            assert app._cover is not None, "no picture of the old page was made (see the 'page cover' line in the log)"
+            deadline = time.time() + 2.0
+            while app._cover is not None and time.time() < deadline:
+                root.update()
+                time.sleep(0.02)
+            assert app._cover is None, "the picture did not fade out within 2 s"
+            # a page change requested while a picture is being taken is only stored
+            app._covering = True
+            try:
+                app.select_tab(0)
+                assert app.nb.index("current") == other, "page changed during a picture"
+                assert app._pending_tab == 0, getattr(app, "_pending_tab", None)
+                assert len(covers) == 1, "a picture was taken during the guard"
+            finally:
+                app._covering = False
+                app.__dict__.pop("_pending_tab", None)
+            # Settings > Appearance off: no picture at all
+            app.settings.smooth_pages = False
+            covers.clear()
+            app.select_tab(0)
+            app.select_tab(other)
+            root.update()
+            assert len(covers) == 2 and all(c is None for c in covers), covers
+            assert app._cover is None
+            assert app.nb.index("current") == other
+        finally:
+            app.__dict__.pop("_page_cover", None)
+            app.settings.smooth_pages = True
+            app.__dict__.pop("_covering", None)
+            app.__dict__.pop("_pending_tab", None)
+        print("[8e] smooth page change: PASS")
+        results["smooth_pages"] = True
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"[8e] smooth page change: FAIL ({e})")
+        results["smooth_pages"] = False
+
+    # 8f. v0.3.6.3 rebuild_ui hands its curtain to _fade_cover (registered as app._cover) instead of destroying it at once.
+    # Without that, app._cover is None right after the rebuild and the assert on the curtain below fails.
+    try:
+        app.show_window()
+        root.update()
+        real_curtain = app._curtain
+        made = []
+
+        def curtain_spy():
+            c = real_curtain()
+            made.append(c)
+            return c
+
+        toplevels_before = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+        app._curtain = curtain_spy
+        try:
+            app.rebuild_ui()
+        finally:
+            app.__dict__.pop("_curtain", None)
+        cover = made[-1] if made else None
+        if cover is not None:
+            assert app._cover is cover, f"curtain not handed to _fade_cover (app._cover={app._cover!r})"
+        deadline = time.time() + 2.0
+        while app._cover is not None and time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+        assert app._cover is None, "the curtain did not fade out within 2 s"
+        alpha = float(root.attributes("-alpha"))
+        assert alpha == 1.0, f"window alpha after rebuild is {alpha}"
+        toplevels_after = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+        assert len(toplevels_after) == len(toplevels_before), f"Toplevel children left: {toplevels_after}"
+        print(f"[8f] rebuild curtain fade: PASS (curtain made: {cover is not None})")
+        results["rebuild_curtain_fade"] = True
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"[8f] rebuild curtain fade: FAIL ({e})")
+        results["rebuild_curtain_fade"] = False
+
     # 9. Test on_close (withdraws window)
     try:
         app.on_close()

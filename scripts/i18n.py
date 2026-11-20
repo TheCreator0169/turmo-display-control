@@ -574,4 +574,6 @@ TABLE = {
     "Write logs": ("Écrire les journaux", "Gravar registos"),
     "Turn off to write no log file. Logs help when something goes wrong.": ("Désactivez pour ne plus écrire de journal. Les journaux aident quand quelque chose ne va pas.", "Desative para não gravar ficheiros de registo. Os registos ajudam quando algo corre mal."),
     "Four quick checks. You can change all of this later in Settings.": ("Quatre vérifications rapides. Vous pouvez tout changer plus tard dans les réglages.", "Quatro verificações rápidas. Pode alterar tudo mais tarde nas definições."),
+    "Smooth page changes": ("Changements de page fluides", "Mudanças de página suaves"),
+    "Fades to the new page once it is drawn. Off: pages change at once.": ("Fondu vers la nouvelle page une fois dessinée. Désactivé : les pages changent aussitôt.", "Transição suave para a nova página depois de desenhada. Desativado: as páginas mudam logo."),
 }

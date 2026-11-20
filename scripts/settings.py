@@ -61,6 +61,7 @@ class Settings:
     gpu_index: int = 0                      # which NVIDIA GPU to monitor (0 = first)
     color_correction: bool = True           # LCD only: evens out the panel's blue-heavy grey curve (see correct_panel)
     color_gain: dict = field(default_factory=lambda: {"r": 100, "g": 100, "b": 100})  # LCD white balance, % per colour
+    smooth_pages: bool = True               # Settings > Appearance: a page change fades from the old page to the finished new one
     logging_enabled: bool = True            # Settings > Logs > Write logs; off: the GUI and the Monitor write no log file
     log_keep_days: int = 7                  # old log files are removed after this many days (see runtime_logging.sweep_logs)
     log_max_mb: int = 20                    # and the oldest go first when the logs folder is bigger than this
@@ -85,6 +86,8 @@ class Settings:
         out = cls(**{k: v for k, v in data.items() if k in known})
         if not isinstance(out.logging_enabled, bool):
             out.logging_enabled = True
+        if not isinstance(out.smooth_pages, bool):
+            out.smooth_pages = True
         return out
 
     @staticmethod

@@ -108,7 +108,8 @@ def make_dash():
     obj.port_var = Var("COM4 ✓")
     obj.monitor_status_var = Var("Stopped")
     obj.settings = SimpleNamespace(orientation="landscape", refresh_ms=1000,
-                                   brightness=100, theme="cyberpunk-neon", units={"temp": "celsius"})
+                                   brightness=100, theme="cyberpunk-neon", units={"temp": "celsius"},
+                                   smooth_pages=False)  # v0.3.6.2: the page change takes no picture in these stubs
     obj.start_btn = Label()
     obj.stop_btn = Label()
     obj.dash_values = {k: Label() for k in ("TURMO port", "Resolution",

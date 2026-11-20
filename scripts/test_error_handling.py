@@ -160,6 +160,20 @@ class SettingsFiles(unittest.TestCase):
     def test_logging_is_on_by_default(self):
         self.assertTrue(self.S().logging_enabled)
 
+    def test_smooth_pages_is_on_by_default(self):
+        self.assertIs(self.S().smooth_pages, True)
+
+    def test_a_string_or_zero_smooth_pages_loads_as_on(self):
+        path = self.S.path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for raw in ('{"smooth_pages": "x"}', '{"smooth_pages": 0}', '{"smooth_pages": ""}'):
+            path.write_text(raw, encoding="utf-8")
+            self.assertIs(self.S.load().smooth_pages, True, raw)
+
+    def test_smooth_pages_off_survives_save_and_load(self):
+        self.S(smooth_pages=False).save()
+        self.assertIs(self.S.load().smooth_pages, False)
+
 
 if __name__ == "__main__":
     unittest.main()

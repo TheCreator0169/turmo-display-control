@@ -2,6 +2,14 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.6.3 (2026-11-20)
+---------------------
+- Language / Dark-Light change: the picture of the old window now fades out (about 0.12 s) onto the new one instead of jumping to it. The redraw itself still takes about 1.5 s (Tk lays out about 1000 widgets).
+
+v0.3.6.2 (2026-11-20)
+---------------------
+- Moving between pages: the old page stays on screen while the new one is drawn, then fades out (about 0.12 s), so cards no longer appear one after the other. Settings > Appearance > "Smooth page changes" (on by default; off: pages change at once). FR/PT texts are drafts.
+
 v0.3.6.1 (2026-11-20)
 ---------------------
 - Language / Dark-Light change: the window is redrawn in about 1.3 s instead of 3.8 s (old pages are dropped by Tk in one call; cards are sized before their page is shown).

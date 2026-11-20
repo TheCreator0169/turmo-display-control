@@ -792,6 +792,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
     def rebuild_ui(self):
         tab = self.nb.index(self.nb.select())
+        self._rebuilding = True
         cover = self._curtain()
         try:
             if cover is None:
@@ -817,15 +818,90 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             self.root.update()  # every widget is drawn in its final colours before the window shows again
         finally:
             try:
+                self._rebuilding = False
                 self.root.attributes("-alpha", 1.0)
                 if cover is not None:
-                    cover.destroy()
+                    old = getattr(self, "_cover", None)
+                    if old is not None and old is not cover:
+                        self._drop_cover(old)
+                    self._cover = cover
+                    self._fade_cover(cover)  # v0.3.6.2: the old window fades into the new one instead of jumping
             except tk.TclError as e:
                 log_swallowed("rebuild_ui show window", e)
 
     def select_tab(self, index):
-        self.nb.select(index)
-        self._sync_sidebar()
+        if getattr(self, "_covering", False):
+            self._pending_tab = index  # a click that came while the picture was made: it wins
+            return
+        cover = self._page_cover(index)
+        index = self.__dict__.pop("_pending_tab", index)
+        try:
+            self.nb.select(index)
+            self._sync_sidebar()
+            if cover is not None:
+                self.root.update_idletasks()
+                self.root.update()  # the new page is drawn completely behind the picture of the old one
+        finally:
+            if cover is not None:
+                self._fade_cover(cover)  # also when a page builder raised: the picture never stays on screen
+
+    def _page_cover(self, index):
+        """v0.3.6.2: the picture of the page being left, shown over the pages while the new one is drawn (its cards used to
+        appear one after the other). None when the setting is off, in the middle of a rebuild, or nothing can be photographed."""
+        old = getattr(self, "_cover", None)
+        if old is not None:
+            self._drop_cover(old)
+        if not self.settings.smooth_pages or getattr(self, "_rebuilding", False):
+            return None
+        try:
+            if self._window_hidden() or not self.root.winfo_viewable() or not self.nb.winfo_ismapped():
+                return None
+            if self.nb.index("current") == index:
+                return None
+            from PIL import ImageGrab, ImageTk
+            self.root.update_idletasks()
+            x, y, w, h = self.nb.winfo_rootx(), self.nb.winfo_rooty(), self.nb.winfo_width(), self.nb.winfo_height()
+            picture = ImageTk.PhotoImage(ImageGrab.grab((x, y, x + w, y + h)))
+            cover = tk.Toplevel(self.root)
+            self._cover = cover  # known before anything else can fail or run
+            cover.overrideredirect(True)
+            cover.geometry(f"{w}x{h}+{x}+{y}")
+            label = tk.Label(cover, image=picture, bd=0)
+            label.image = picture
+            label.pack()
+            cover.attributes("-topmost", True)
+            self._covering = True
+            try:
+                cover.update()  # the picture must be on screen before the page changes
+            finally:
+                self._covering = False
+            return cover
+        except Exception as e:  # ok: the pages change without the fade
+            log_swallowed("page cover", e)
+            if getattr(self, "_cover", None) is not None:
+                self._drop_cover(self._cover)
+            return None
+
+    def _drop_cover(self, cover):
+        try:
+            cover.destroy()
+        except tk.TclError:  # ok: the picture is already gone (window closed)
+            pass
+        if getattr(self, "_cover", None) is cover:
+            self._cover = None
+
+    def _fade_cover(self, cover, step=0):
+        """The picture fades out in 6 steps of 20 ms (about 120 ms), showing the finished page."""
+        if getattr(self, "_cover", None) is not cover:
+            return  # another page change took over
+        try:
+            if step >= 6:
+                self._drop_cover(cover)
+                return
+            cover.attributes("-alpha", 1.0 - (step + 1) / 6)
+            self.root.after(20, self._fade_cover, cover, step + 1)
+        except tk.TclError:
+            self._drop_cover(cover)
 
     def _sync_sidebar(self, event=None):
         if not hasattr(self, "_sidebar_items"):
@@ -1475,6 +1551,9 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         self.compact_var = tk.BooleanVar(value=self.settings.compact)
         Switch(row(inner, tr("Compact layout"), tr("Smaller margins.")), self.compact_var.get(),
                lambda _v: self.on_compact_change(), bg2, variable=self.compact_var).pack()
+        self.smooth_var = tk.BooleanVar(value=self.settings.smooth_pages)
+        Switch(row(inner, tr("Smooth page changes"), tr("Fades to the new page once it is drawn. Off: pages change at once.")),
+               self.smooth_var.get(), lambda _v: self.on_smooth_change(), bg2, variable=self.smooth_var).pack()
 
         # Port override
         inner = card("Port", tr("Port"), tr("Fix the COM port of the display."))
@@ -1777,6 +1856,10 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
     def on_compact_change(self):
         self.settings.compact = self.compact_var.get()
+        self.settings.save()
+
+    def on_smooth_change(self):
+        self.settings.smooth_pages = self.smooth_var.get()
         self.settings.save()
 
     def on_port_override_change(self):
