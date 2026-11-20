@@ -2,6 +2,10 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.7.3 (2026-11-20)
+----------------------
+- Fix: if an old "Start with Windows" entry cannot be rewritten, the switch stays on (it showed off). The test run no longer reads or rewrites the real start-up entry.
+
 v0.3.7.2 (2026-11-20)
 ----------------------
 - "Start with Windows" now starts TURMO Display Control itself (`--startup`): no splash, the window stays hidden in the tray, and the GUI starts the Monitor with no console window. It replaces the v0.3.7.1 `conhost --headless` form. The installer writes the new entry; an older entry is rewritten when the app starts.

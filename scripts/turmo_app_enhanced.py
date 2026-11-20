@@ -1875,9 +1875,12 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             winreg.CloseKey(key)
             hidden = startup_entry.upgraded(value, GUI_EXE)
             if hidden:  # v0.3.7.2: an entry written by an older version ran the console Monitor (a black window at sign-in)
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(key, "TURMO", 0, winreg.REG_SZ, hidden)
-                winreg.CloseKey(key)
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(key, "TURMO", 0, winreg.REG_SZ, hidden)
+                    winreg.CloseKey(key)
+                except OSError as _e:  # the entry exists: the switch stays on, the rewrite is tried again next time
+                    log_swallowed("startup entry rewrite", _e)
             return True
         except FileNotFoundError:
             return False  # ok: no file: not found

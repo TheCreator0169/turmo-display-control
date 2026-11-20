@@ -11,6 +11,10 @@ def run():
     import tempfile  # the real settings and custom themes are not touched by this run
     _tmp = tempfile.mkdtemp(prefix="turmo-cb-")
     os.environ["APPDATA"] = os.environ["LOCALAPPDATA"] = _tmp
+    import winreg  # the user's real Start-with-Windows entry is not read, nor rewritten, by this run
+    def _no_entry(*a, **k):
+        raise FileNotFoundError
+    winreg.QueryValueEx = _no_entry
     
     # 1. Import the app module
     try:
