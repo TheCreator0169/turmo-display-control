@@ -1,9 +1,13 @@
-# Release build on a tag (v*). DRAFT: not run yet. The signing step needs the SignPath project
-# (organisation id, project and policy slugs, API token as repository secrets) - TODO(user).
+# Release build, started by hand (Actions > build > Run workflow, version such as v0.3.3). DRAFT, never finished:
+# it needs the prebuilt helper release asset and the SignPath project (organisation id and API token as repository
+# secrets) - TODO(user). It was started by every tag before; that only sent failure mails.
 name: build
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. v0.3.3"
+        required: true
 permissions:
   contents: read
 jobs:
@@ -27,12 +31,12 @@ jobs:
           Expand-Archive TURMO-CpuTempHelper.zip -DestinationPath dist
 
       - name: Build exes and Setup
-        run: python scripts/build_release.py ${{ github.ref_name }}
+        run: python scripts/build_release.py ${{ inputs.version }}
       - uses: actions/upload-artifact@v4
         id: unsigned
         with:
           name: unsigned
-          path: dist/TURMO-Setup-${{ github.ref_name }}.exe
+          path: dist/TURMO-Setup-${{ inputs.version }}.exe
       - uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}

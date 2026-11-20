@@ -1871,7 +1871,6 @@ class ThemePaths(unittest.TestCase):
 
     def test_a_theme_of_the_user_gets_its_gallery_picture_once_it_has_run(self):
         """The gallery shows "No preview" for a new custom theme; after it ran, its own picture is kept in its folder."""
-        import time
         from PIL import Image
         from scripts import theme_paths
         tmp = self._env()
@@ -1889,8 +1888,10 @@ class ThemePaths(unittest.TestCase):
         stamp = picture.stat().st_mtime_ns
         save(obj, "mine", Image.new("RGB", (8, 8), "blue"))  # same theme.json: not written again
         self.assertEqual(picture.stat().st_mtime_ns, stamp)
-        time.sleep(0.05)
-        (theme_paths.custom_dir() / "mine" / "theme.json").write_text('{"edited": 1}')  # the theme changed
+        theme_json = theme_paths.custom_dir() / "mine" / "theme.json"
+        theme_json.write_text('{"edited": 1}')  # the theme changed
+        newer = picture.stat().st_mtime_ns + 10 * 10**9  # explicit: a runner's file clock can be too coarse for a short sleep
+        os.utime(theme_json, ns=(newer, newer))
         save(obj, "mine", Image.new("RGB", (8, 8), "blue"))
         self.assertTrue(obj._picture_new)
         self.assertEqual(Image.open(picture).getpixel((0, 0)), (0, 0, 255))
