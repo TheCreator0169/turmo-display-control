@@ -912,7 +912,8 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
     def _update_poll_on(self):
         """The poller thread runs while the window is visible and Live Preview is off (the preview reads the sensors
         itself). Called every Dashboard tick, so it also stops a second after the preview starts."""
-        self._poll_on = not self.preview_running and not self._window_hidden()
+        shown = not self._window_hidden() or time.time() < getattr(self, "_meters_wanted_until", 0)
+        self._poll_on = not self.preview_running and shown
 
     def temp_unit(self):
         """"celsius" or "fahrenheit": the Units choice as it is on screen (the page's variable, before it is saved),

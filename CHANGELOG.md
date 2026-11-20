@@ -2,6 +2,11 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.3 (2026-11-20)
+-------------------
+- Fix: the tray panel and the Minimalist window showed a dash for the GPU (and the CPU temperature) unless Live Preview was on; they now read the sensors like the Dashboard, also while the window is in the tray.
+- Clean build: made from a neutral folder, so the compiled files no longer carry the builder's Windows user name or PC name. No change to the app.
+
 v0.3.2 (2026-11-19)
 -------------------
 - About: a License row (GPL-3.0-or-later). FR/PT word "Licence" / "Licença" is a draft.

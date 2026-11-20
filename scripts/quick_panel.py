@@ -3,6 +3,7 @@ Synology Drive one). Status, three live meters, Start/Stop, brightness and a lin
 Built from the app's own widgets; it reads what the Dashboard already reads (no extra sensor polling)."""
 
 import ctypes
+import time
 import tkinter as tk
 from ctypes import wintypes
 
@@ -45,12 +46,14 @@ def meter_colour(percent):
 
 def read_meters(app):
     """{cpu, gpu, ram: (percent or None, temperature or None)} from what the Dashboard already reads."""
+    app._meters_wanted_until = time.time() + 3  # the poller must run for a tray panel or the Minimalist window, window hidden or not
     values = app._psutil_readings()
     with app._preview_lock:
         readings = dict(app._preview_readings) if app.preview_running else {}
 
-    def read(key):
-        return getattr(readings.get(key), "value", None)
+    def read(key):  # the Live Preview's reading, else the sensor poller's (plain numbers): GPU and CPU temperature
+        value = getattr(readings.get(key), "value", None)
+        return value if value is not None else values.get(key)
     return {"cpu": (values.get("cpu.load"), read("cpu.temp")), "gpu": (read("gpu.load"), read("gpu.temp")),
             "ram": (values.get("mem.load"), None)}
 

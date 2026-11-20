@@ -824,6 +824,31 @@ class SensorsWithoutPreview(unittest.TestCase):
         obj._update_poll_on()
         self.assertFalse(obj._poll_on)
 
+    def test_the_quick_panel_shows_gpu_and_cpu_temperature_from_the_poller_when_the_preview_is_off(self):
+        # v0.3.4: GPU showed a dash in the tray panel and the Minimalist window (only the Live Preview was read)
+        from scripts import quick_panel
+        obj = make_app()
+        obj.preview_running, obj._window_hidden = False, (lambda: False)
+        values = {"cpu.load": 7.0, "mem.load": 40.0, "gpu.load": 12.0, "gpu.temp": 55.0, "cpu.temp": 61.0}
+        obj._poller = mock.Mock(running=mock.Mock(return_value=True), latest=mock.Mock(return_value=values))
+        obj._preview_lock, obj._preview_readings = mock.MagicMock(), {}
+        meters = quick_panel.read_meters(obj)
+        self.assertEqual(meters["gpu"], (12.0, 55.0))
+        self.assertEqual(meters["cpu"], (7.0, 61.0))
+
+    def test_the_poller_runs_for_the_tray_panel_while_the_window_is_hidden(self):
+        # v0.3.4: the tray panel showed no GPU: with the window in the tray nothing asked the poller to run
+        obj = make_app()
+        obj._window_hidden, obj.preview_running = (lambda: True), False
+        obj._update_poll_on()
+        self.assertFalse(obj._poll_on)
+        obj._meters_wanted_until = time.time() + 3  # set by quick_panel.read_meters
+        obj._update_poll_on()
+        self.assertTrue(obj._poll_on)
+        obj._meters_wanted_until = time.time() - 1  # the panel closed: the poller stops again
+        obj._update_poll_on()
+        self.assertFalse(obj._poll_on)
+
     def test_without_a_poller_cpu_load_and_ram_still_show(self):
         obj = make_app()
         obj.preview_running = False
