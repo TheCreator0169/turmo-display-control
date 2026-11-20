@@ -384,7 +384,7 @@ class ThemeEditor:
                 self.editor_canvas.create_image(ox, oy, image=self._photo, anchor=tk.NW)
         except Exception as e:  # a theme the renderer refuses: the plain boxes below still let it be edited
             shot = None
-            self.app.status_var.set(f"Preview: {e}")
+            self.app.status_var.set(tr("Preview error: {reason}").format(reason=tr(friendly_error(e))))
 
         if self.show_grid.get():
             for x in range(0, tw + 1, 20):
@@ -862,7 +862,7 @@ class ThemeEditor:
         def apply():
             value = chosen.get().strip()
             if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
-                self.app.toast("Use a colour like #00E5FF", "error")
+                self.app.toast(tr("Use a colour like #00E5FF"), "error")
                 return
             modal.close()
             var.set(value)
@@ -976,7 +976,7 @@ class ThemeEditor:
         disk and the applied theme does not change until the user clicks Save theme."""
         base = "custom-blank-canvas"
         if not theme_paths.folder(DATA_ROOT / "themes", base).is_dir():
-            self.app.toast("The blank canvas theme is missing.", "error")
+            self.app.toast(tr("The blank canvas theme is missing."), "error")
             return
         self.theme_name, self._named = base, None
         self.load_current_theme()
@@ -992,10 +992,10 @@ class ThemeEditor:
         folders = {"landscape": themes / slug, "portrait": themes / f"{slug}-320x480"}
         sources = {o: self.theme_dir(o) for o in folders}
         if (slug != self.theme_name or getattr(self, "_draft", False)) and self._theme_taken(slug):
-            self.app.toast(f"A theme named \"{slug}\" already exists. Pick another name.", "error")
+            self.app.toast(tr("A theme named \"{slug}\" already exists. Pick another name.").format(slug=slug), "error")
             return
         if not is_editable_theme(slug):
-            self.app.toast("Built-in themes cannot be changed. Give it another name to save a copy.", "error")
+            self.app.toast(tr("Built-in themes cannot be changed. Give it another name to save a copy."), "error")
             return
         try:
             themes.mkdir(parents=True, exist_ok=True)
@@ -1005,7 +1005,7 @@ class ThemeEditor:
                     shutil.copytree(sources[o], dst)
             theme_path = folders[orientation] / "theme.json"
             if not theme_path.exists():
-                self.app.toast(f"Theme file not found: {theme_path}", "error")
+                self.app.toast(tr("Theme file not found: {path}").format(path=theme_path), "error")
                 return
             with open(theme_path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -1023,14 +1023,14 @@ class ThemeEditor:
                 for other in folders.values():
                     theme_paths.set_title(other, slug)
         except (OSError, ValueError) as e:
-            self.app.toast(f"Could not save {slug}: {e}", "error")
+            self.app.toast(tr("Could not save {slug}: {reason}").format(slug=slug, reason=tr(friendly_error(e))), "error")
             return
         self._stash = {(slug if k[0] == self.theme_name else k[0], k[1]): v for k, v in self._stash.items()}
         self.theme_name = self._named = slug
         self._pending_palette = None
         self.name_var.set(slug)
-        self.app.toast(f"Theme saved: {slug} ({orientation})")
-        self.app.status_var.set(f"Theme saved: {slug} ({orientation})")
+        self.app.toast(tr("Theme saved: {slug} ({orientation})").format(slug=slug, orientation=orientation))
+        self.app.status_var.set(tr("Theme saved: {slug} ({orientation})").format(slug=slug, orientation=orientation))
         if hasattr(self.app, "_gallery_grid"):
             self.app._gallery_render()
 
@@ -1084,7 +1084,7 @@ class ThemeEditor:
             data["widgets"] = [w for w in data.get("widgets", []) if w.get("locked")] + [widget_to_dict(w) for w in self.widgets]
             with open(filepath, "w") as f:
                 json.dump(data, f, indent=2)
-            self.app.toast(f"Theme exported to {filepath}")
+            self.app.toast(tr("Theme exported to {path}").format(path=filepath))
 
     def import_json(self):
         """Import a theme .json (an exported file or a theme.json): its widgets and palette are loaded into the
@@ -1099,7 +1099,7 @@ class ThemeEditor:
                 raise ValueError("it has no widget list")
             widgets = [widget_from_dict(w) for w in data["widgets"] if isinstance(w, dict) and not w.get("locked")]
         except (OSError, ValueError, TypeError) as e:  # a bad file leaves the current layout untouched
-            self.app.toast(f"Could not import {path.name}: {e}", "error")
+            self.app.toast(tr("Could not import {name}: {reason}").format(name=path.name, reason=tr(friendly_error(e))), "error")
             return
         self.widgets = widgets
         if isinstance(data.get("palette"), dict):
@@ -1107,7 +1107,7 @@ class ThemeEditor:
             self.palette = ThemePalette(data["palette"])
         self.name_var.set(self._suggest_name(self._slug(str(data.get("name") or path.stem))))
         self.redraw_canvas()
-        self.app.toast(f"Imported {len(widgets)} widgets from {path.name}. Click Save theme to keep them.")
+        self.app.toast(tr("Imported {count} widgets from {name}. Click Save theme to keep them.").format(count=len(widgets), name=path.name))
 
 
 DEFAULT_THEME = "cyberpunk-neon"  # applied when the applied custom theme is deleted

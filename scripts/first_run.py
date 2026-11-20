@@ -1,5 +1,5 @@
-"""First-run screen (v0.3.0): shown once after a fresh install (no settings file at launch). Three checks in one
-dialog: the display, the CPU temperature helper, and the look (Default or Minimalist). Methods of TurmoApp, mixed in."""
+"""First-run screen (v0.3.0): shown once after a fresh install (no settings file at launch). Four checks in one
+dialog: the display, the CPU temperature helper, the language and the look (Default or Minimalist). Methods of TurmoApp, mixed in."""
 
 from scripts.gui_common import *  # noqa: F401,F403
 
@@ -51,7 +51,7 @@ class FirstRunPage:
     def show_first_run(self):
         bg2, muted, small = PALETTE["bg2"], PALETTE["muted"], (self.ui_font, 9)
         modal = Modal(self, tr("Welcome to TURMO"), width=460, dismissable=False)  # Done is the only way out
-        tk.Label(modal.body, text=tr("Three quick checks. You can change all of this later in Settings."), bg=bg2, fg=muted,
+        tk.Label(modal.body, text=tr("Four quick checks. You can change all of this later in Settings."), bg=bg2, fg=muted,
                  font=(self.ui_font, 10), justify=tk.LEFT, anchor="w", wraplength=410).pack(fill=tk.X, pady=(0, 10))
 
         def line(name, hint=""):
@@ -82,7 +82,30 @@ class FirstRunPage:
             self.toggle_cpu_temp_helper()
         enable = make_button(row, tr("Enable (one-time admin prompt)"), ask_helper, (self.ui_font, 10),
                              variant="primary", backdrop=bg2, small=True)
-        # 3. the look
+        # 3. the language: chosen at once (no question, this is the first choice); the window is drawn again in it and
+        #    the guard below shows this dialog again, in the new language
+        row, _ = line("Language", None)
+        langs = tk.Frame(modal.body, bg=bg2)
+        langs.pack(fill=tk.X, pady=(0, 8))
+        lang_now = self.settings.language if self.settings.language in ("en", "fr", "pt") else "en"
+        lang_tiles = {}
+
+        def pick_language(key):
+            if key == lang_now:
+                return
+            for k, tile in lang_tiles.items():
+                tile.set_selected(k == key)
+            modal.close()  # also applies a Look already picked
+            self.settings.language = key
+            self.settings.save()
+            i18n.set_language(key)
+            self.root.after_idle(self.rebuild_ui)
+        for i, (key, name) in enumerate((("en", "English"), ("fr", "Français"), ("pt", "Português"))):
+            langs.columnconfigure(i, weight=1, uniform="firstlang")
+            tile = ChoiceTile(langs, name, key == lang_now, lambda k=key: pick_language(k), bg2, (self.ui_semibold, 10))
+            tile.grid(row=0, column=i, sticky="ew", padx=(0, 8) if i < 2 else 0)
+            lang_tiles[key] = tile
+        # 4. the look
         row, _ = line("Look", None)
         tiles = tk.Frame(modal.body, bg=bg2)
         tiles.pack(fill=tk.X, pady=(0, 8))

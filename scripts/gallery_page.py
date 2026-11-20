@@ -377,14 +377,14 @@ class GalleryPage:
         """Delete a custom theme (its folder and its portrait variant) after a confirmation. The official
         themes are refused. If the theme is the applied one, the default theme is applied instead."""
         if not is_custom_theme(slug):
-            self.toast("Official themes cannot be deleted.")
+            self.toast(tr("Official themes cannot be deleted."))
             return
         applied = slug == self.settings.theme
         themes = theme_paths.custom_dir().resolve()  # only the user's themes are deletable
         folders = [themes / f"{slug}{v}" for v in ("", "-320x480")]
         folders = [f for f in folders if f.is_dir() and f.resolve().parent == themes]
         if not folders:
-            self.toast(f"The theme \"{slug}\" is not in the custom themes folder, so it cannot be deleted here.")
+            self.toast(tr("The theme \"{slug}\" is not in the custom themes folder, so it cannot be deleted here.").format(slug=slug))
             return
         note = f"\n\nIt is the applied theme: {DEFAULT_THEME} will be applied instead." if applied else ""
         self.confirm(tr("Delete theme"), f"Delete the theme \"{slug}\"?{note}\n\nIts folder is removed from disk. "
@@ -445,9 +445,9 @@ class GalleryPage:
             for folder in folders:
                 shutil.rmtree(folder)
         except OSError as e:
-            self.toast(f"Could not delete {slug}: {e}", "error")
+            self.toast(tr("Could not delete {slug}: {reason}").format(slug=slug, reason=tr(friendly_error(e))), "error")
         else:
-            self.status_var.set(f"Deleted theme {slug}")
+            self.status_var.set(tr("Deleted theme {slug}").format(slug=slug))
         self._refresh_dashboard_status()
         self._gallery_render()
 
@@ -480,7 +480,7 @@ class GalleryPage:
         self._refresh_dashboard_status()  # not _refresh_dashboard: that starts one more 1 s loop each time
         self._gallery_render()
         # v0.2.4.1: a running Monitor sees the new theme in settings.json and draws it by itself, no restart
-        self.toast(f"Applied {slug}")
+        self.toast(tr("Applied {slug}").format(slug=slug))
 
     def toast(self, text, kind="info"):
         """A small in-app notice that slides in at the bottom right, then leaves (replaces a message box)."""
@@ -543,7 +543,7 @@ class GalleryPage:
 
     def gallery_edit(self, slug):
         if not is_editable_theme(slug):  # the built-in themes are not edited; duplicate one to change it
-            self.toast("Built-in themes cannot be edited. Duplicate it to make your own copy.")
+            self.toast(tr("Built-in themes cannot be edited. Duplicate it to make your own copy."))
             return
         self.theme_var.set(slug)
         self.on_theme_change()
@@ -578,9 +578,9 @@ class GalleryPage:
         except Exception as e:
             for folder in made:  # no half-made copy is left behind
                 shutil.rmtree(folder, ignore_errors=True)
-            self.toast(f"Could not duplicate {slug}: {e}", "error")
+            self.toast(tr("Could not duplicate {slug}: {reason}").format(slug=slug, reason=tr(friendly_error(e))), "error")
             return None
-        self.status_var.set(f"Duplicated {slug} as {new}")
+        self.status_var.set(tr("Duplicated {slug} as {new}").format(slug=slug, new=new))
         self._gallery_render()
         return new
 
@@ -591,7 +591,7 @@ class GalleryPage:
         if self.editor_initialized:
             self.theme_editor.start_draft()
         else:
-            self.toast("The Theme Editor could not start. See the log.", "error")
+            self.toast(tr("The Theme Editor could not start. See the log."), "error")
 
     def gallery_import(self):
         """Import theme (.json): open the Theme Editor and use its import."""
@@ -600,4 +600,4 @@ class GalleryPage:
         if self.editor_initialized:
             self.theme_editor.import_json()
         else:
-            self.toast("The Theme Editor could not start. See the log.", "error")
+            self.toast(tr("The Theme Editor could not start. See the log."), "error")

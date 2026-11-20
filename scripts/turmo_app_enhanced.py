@@ -138,6 +138,11 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             log_runtime("APP", "INIT", "Runtime logging initialized")
 
         self.root = root
+        # v0.3.5: an error inside a button or timer is logged and shown in plain words, not lost on a hidden stderr
+        from scripts.errors import CallbackErrors
+        self.root.report_callback_exception = CallbackErrors(
+            lambda e: log_exception("APP", "CALLBACK_ERROR", e),
+            lambda text: self.toast(tr(text), kind="error"))
         self.root.title("TURMO Display Control")
         self.root.geometry("%dx%d" % self._window_sizes()[0])
         self._apply_window_icon()
@@ -191,7 +196,10 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
         log_startup(self._startup_log, "SETTINGS", "Loading settings")
         self._first_run = not Settings.path().exists()  # v0.3.0: a fresh install shows the first-run dialog once
+        if Settings.quarantine_damaged():
+            log_runtime("APP", "SETTINGS_DAMAGED", "settings.json was not valid and was moved to settings.json.bad")
         self.settings = Settings.load()
+        set_logging_enabled(self.settings.logging_enabled)
         i18n.set_missing_logger(_log_missing_text)
         i18n.set_language(self.settings.language)  # before any widget is built: they draw through tr()
         _splash_step("settings")
@@ -1461,7 +1469,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
     def refresh_port(self):
         """Refresh the port detection with detailed status."""
-        self.status_var.set("Scanning ports...")
+        self.status_var.set(tr("Scanning ports..."))
         self.root.update_idletasks()
 
         port = find_turmo_port()
@@ -1475,13 +1483,13 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
         if port:
             self.port_var.set(f"{port} ✓")
-            self.status_var.set(f"TURMO connected on {port}")
+            self.status_var.set(tr("TURMO connected on {port}").format(port=port))
         elif turmo_in_pnp:
             self.port_var.set("Busy / In Use ⚠")
-            self.status_var.set("TURMO detected but COM port busy (another app?)")
+            self.status_var.set(tr("TURMO detected but COM port busy (another app?)"))
         else:
             self.port_var.set("Not found ✗")
-            self.status_var.set("No TURMO device (VID 1A86:5722) detected")
+            self.status_var.set(tr("No TURMO device (VID 1A86:5722) detected"))
 
         # Update Start button state
         if hasattr(self, 'start_btn'):
@@ -1531,7 +1539,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             theme = "minimal-dark"
         self.settings.theme = theme
         self.settings.save()
-        self.status_var.set(f"Theme: {theme}")
+        self.status_var.set(tr("Theme: {theme}").format(theme=theme))
         # Reload theme editor if open
         if self.editor_initialized and self.theme_editor:
             self.theme_editor.follow(theme)
@@ -1548,7 +1556,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             self.theme_editor.editor_orientation.set(self.settings.orientation)
             self.theme_editor.on_orientation_change()
         self.settings.save()
-        self.status_var.set(f"Orientation: {self.settings.orientation}")
+        self.status_var.set(tr("Orientation: {orientation}").format(orientation=tr(self.settings.orientation.capitalize())))
         self._refresh_preview_caption()
         if self.preview_running:
             self.restart_preview()
@@ -1745,10 +1753,10 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
                 # Use TURMO-Monitor.exe for Windows startup (standalone headless worker)
                 cmd = f'"{TURMO_MONITOR_EXE}" --monitor'
                 winreg.SetValueEx(key, "TURMO", 0, winreg.REG_SZ, cmd)
-                self.status_var.set("Startup enabled")
+                self.status_var.set(tr("Startup enabled"))
             else:
                 winreg.DeleteValue(key, "TURMO")
-                self.status_var.set("Startup disabled")
+                self.status_var.set(tr("Startup disabled"))
             winreg.CloseKey(key)
         except Exception as e:
             self.show_error(tr("Startup Error"), f"Failed to update startup: {e}")
@@ -1936,12 +1944,12 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             _log_event("MONITOR_START", reason)
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
-            self.status_var.set("Monitor started")
+            self.status_var.set(tr("Monitor started"))
             self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] Monitor started on {port}\n")
             self.log_text.see(tk.END)
             self.start_preview()
         except Exception as e:
-            self.show_error("Start Error", f"Failed to start monitor: {e}")
+            self.show_error(tr("Start Error"), tr("Failed to start the Monitor: {reason}").format(reason=tr(friendly_error(e))))
 
     def stop_monitor(self, reason="button"):
         """Stop the monitor worker and verify COM4 is released.
@@ -2064,7 +2072,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         self.stop_preview()
         self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] Monitor stopped\n")
         self.log_text.see(tk.END)
-        self.status_var.set("Monitor stopped")
+        self.status_var.set(tr("Monitor stopped"))
 
     def _force_kill_pid(self, pid):
         """taskkill /F /T on one exact PID. A failure is written to the log and the runtime log, never raised."""
@@ -2166,8 +2174,8 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         for line in lines or ["No error message from the worker."]:
             self.log_text.insert(tk.END, f"  {line}\n")
         self.log_text.see(tk.END)
-        self.status_var.set("Monitor stopped by itself, see the Monitor log")
-        self.toast("The Monitor stopped by itself. The Monitor log says why.", "error")
+        self.status_var.set(tr("Monitor stopped by itself, see the Monitor log"))
+        self.toast(tr("The Monitor stopped by itself. The Monitor log says why."), "error")
         _log_event("MONITOR_EXIT", f"code={code} {' | '.join(lines)}")
 
     def _cleanup_stale_workers(self):
@@ -2244,7 +2252,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             self.show_error(tr("Test Image"), f"Could not check for a running Monitor: {e}")
             return
         if live:
-            self.show_warning("Monitor running", f"A TURMO Monitor is still running (PID {live[0]}) and holds COM4. Stop it first.")
+            self.show_warning(tr("Monitor running"), tr("A TURMO Monitor is still running (PID {pid}) and holds COM4. Stop it first.").format(pid=live[0]))
             return
 
         # Verify COM4 is free before sending test image
@@ -2272,7 +2280,7 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
             creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=creation_flags)
             if result.returncode == 0:
-                self.status_var.set("Test image sent")
+                self.status_var.set(tr("Test image sent"))
                 self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] Test image sent\n")
             else:
                 errmsg = result.stderr.strip() if result.stderr else ""
@@ -2408,7 +2416,12 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         )
         if filepath:
             import shutil
-            shutil.copy2(self.settings.path(), filepath)
+            try:
+                shutil.copy2(self.settings.path(), filepath)
+            except OSError as e:
+                log_exception("APP", "EXPORT_SETTINGS", e)
+                self.show_error(tr("Could not export the settings"), tr(friendly_error(e)))
+                return
             self.show_info(tr("Exported"), f"Settings exported to {filepath}")
 
     def import_settings(self):
@@ -2417,8 +2430,20 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         )
         if filepath:
             import shutil
-            shutil.copy2(filepath, self.settings.path())
+            try:
+                Settings.check_file(filepath)
+                keep = self.settings.path().with_name("settings.json.bak")
+                if self.settings.path().exists():
+                    shutil.copy2(self.settings.path(), keep)
+                swap = self.settings.path().with_name("settings.json.new")
+                shutil.copy2(filepath, swap)
+                os.replace(swap, self.settings.path())  # whole file or nothing
+            except (OSError, ValueError) as e:
+                log_exception("APP", "IMPORT_SETTINGS", e)
+                self.show_error(tr("Could not import the settings"), tr(friendly_error(e)))
+                return
             self.settings = Settings.load()
+            set_logging_enabled(self.settings.logging_enabled)
             # Reload UI
             self.theme_var.set(self.settings.theme)
             self.landscape_var.set(self.settings.orientation == "landscape")

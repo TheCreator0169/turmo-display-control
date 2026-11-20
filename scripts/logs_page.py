@@ -11,6 +11,9 @@ class LogsPage:
     def build_logs_card(self, card, row, bg2, small):
         """The Logs section of Settings: how long and how much to keep, what is there now, Clean now, Open folder."""
         inner = card("Logs", tr("Logs"), tr("Keep the log files small: old ones are removed by themselves."))
+        self.log_on_var = tk.BooleanVar(value=self.settings.logging_enabled)
+        Switch(row(inner, tr("Write logs"), tr("Turn off to write no log file. Logs help when something goes wrong.")),
+               self.log_on_var.get(), lambda _v: self.on_logging_toggle(), bg2, variable=self.log_on_var).pack()
         self.log_keep_var = tk.IntVar(value=valid_choice(self.settings.log_keep_days, KEEP_DAYS_CHOICES, 7))
         Segmented(row(inner, tr("Keep logs for"), tr("Days an old log file is kept.")),
                   [(d, str(d)) for d in KEEP_DAYS_CHOICES], self.log_keep_var.get(),
@@ -30,6 +33,11 @@ class LogsPage:
     def refresh_log_stats(self):
         files, size = log_folder_stats()
         self.log_now_var.set(f"{files} {tr('files')}, {size / 1048576:.1f} MB")
+
+    def on_logging_toggle(self):
+        self.settings.logging_enabled = bool(self.log_on_var.get())
+        set_logging_enabled(self.settings.logging_enabled)
+        self.settings.save()  # the Monitor reads it within a second
 
     def on_log_rule_change(self):
         self.settings.log_keep_days = int(self.log_keep_var.get())
@@ -60,6 +68,7 @@ class LogsPage:
             os.startfile(str(folder))  # Windows only, like the rest of the app
         except (OSError, AttributeError) as e:
             log_swallowed("open log folder", e)
+            self.show_error(tr("Could not open the logs folder"), tr(friendly_error(e)))
 
     def start_log_sweeper(self):
         """Sweep the logs in a background thread now and again in 24 hours (no extra process, no scheduled task)."""

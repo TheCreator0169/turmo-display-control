@@ -2333,7 +2333,7 @@ class LogsSettingsAndWiring(unittest.TestCase):
         from scripts import logs_page
         shown, stats = [], []
         st = settings.Settings()
-        stub = types.SimpleNamespace(settings=st, root=types.SimpleNamespace(after=lambda ms, fn: fn()),
+        stub = types.SimpleNamespace(settings=st, root=types.SimpleNamespace(after=lambda ms, fn: (time.sleep(0.01), fn())),  # a real wait: the worker thread must get to run
                                      refresh_log_stats=lambda: stats.append(1),
                                      show_info=lambda title, text, modal=False: shown.append(text))
         with mock.patch.object(logs_page, "sweep_logs", lambda **kw: (3, 2097152)):

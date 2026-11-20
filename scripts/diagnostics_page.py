@@ -264,5 +264,9 @@ class DiagnosticsPage:
         dest = filedialog.asksaveasfilename(defaultextension=".log", initialfile="turmo_runtime.log",
                                             filetypes=[("Log file", "*.log"), ("All files", "*.*")])
         if dest:
-            shutil.copyfile(path, dest)
-            self.status_var.set(f"Logs exported to {dest}")
+            try:
+                shutil.copyfile(path, dest)
+            except OSError as e:
+                self.show_error(tr("Could not export the logs"), tr(friendly_error(e)))
+                return
+            self.status_var.set(tr("Logs exported to {path}").format(path=dest))

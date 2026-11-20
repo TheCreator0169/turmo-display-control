@@ -76,11 +76,15 @@ class Fetch(unittest.TestCase):
         self.assertFalse(release.has_installer())
 
     def test_an_unreachable_github_is_a_readable_error(self):
+        import socket
+        import urllib.error
+        from scripts import errors
+
         def boom(req, timeout):
-            raise OSError("no network")
+            raise urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))
         with self.assertRaises(uc.UpdateError) as caught:
             uc.fetch_latest(urlopen=boom)
-        self.assertIn("no network", str(caught.exception))
+        self.assertEqual(str(caught.exception), errors.NO_INTERNET)
 
     def test_a_release_without_a_version_tag_is_refused(self):
         with self.assertRaises(uc.UpdateError):

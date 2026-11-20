@@ -2,6 +2,16 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.5 (2026-11-20)
+-------------------
+- Errors in plain words: no internet, timeout, busy server, file in use, disk full. The Update button says "No internet connection." offline. Import/export of settings, screenshot, log export and "Open folder" no longer fail silently.
+- An error inside a button or timer is logged and shown once, instead of the button seeming dead.
+- Settings: saved atomically; an imported file is checked first (old one kept as settings.json.bak); a damaged file is kept as settings.json.bad instead of being overwritten.
+- Settings > Logs: "Write logs" switch (on by default). Off: no log file is written once the settings are read.
+- About the texts: about 55 messages (status line, toasts, theme errors) are now translated. FR/PT are drafts.
+- Welcome screen: a Language row (English / Français / Português) before Look; the choice applies at once and the screen reappears in that language. FR/PT "Four quick checks" is a draft.
+- Clean-up: unused OrganizeButton removed.
+
 v0.3.4 (2026-11-20)
 -------------------
 - About: the Update button now works. It asks GitHub for the latest release only when pressed; if a newer one exists it offers to download the installer, checks its SHA-256 against the release's SHA256SUMS.txt, then starts it. FR/PT texts are drafts.

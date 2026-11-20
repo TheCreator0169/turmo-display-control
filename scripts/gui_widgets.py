@@ -978,45 +978,6 @@ class Badge(tk.Canvas):
 
 
 @focusable()
-class OrganizeButton(tk.Canvas):
-    """The two-bar 'organize' chip (a long bar over a short one) that sits over a gallery card's preview.
-    A dark rounded square keeps it readable on light and dark previews. `command` runs on a click."""
-    SIZE = 28
-
-    def __init__(self, parent, backdrop, command):
-        super().__init__(parent, bg=backdrop, highlightthickness=0, bd=0, width=self.SIZE, height=self.SIZE,
-                         cursor="hand2")
-        self._command, self._hover, self._images = command, False, {}
-        self.bind("<Configure>", lambda _e: self._redraw())
-        self.bind("<Enter>", lambda _e: self._set_hover(True))
-        self.bind("<Leave>", lambda _e: self._set_hover(False))
-        self.bind("<Button-1>", lambda _e: self._command())
-
-    def _icon(self, colour):
-        if colour not in self._images:
-            from PIL import Image, ImageColor, ImageDraw, ImageTk
-            k, w, h = 8, 14, 10
-            im = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
-            d = ImageDraw.Draw(im)
-            rgb = ImageColor.getrgb(colour) + (255,)
-            d.rounded_rectangle((0, 0, w * k - 1, 3 * k), radius=1.5 * k, fill=rgb)
-            d.rounded_rectangle((0, 7 * k, 9 * k, h * k - 1), radius=1.5 * k, fill=rgb)
-            self._images[colour] = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
-        return self._images[colour]
-
-    def _set_hover(self, on):
-        self._hover = on
-        self._redraw()
-
-    def _redraw(self):
-        s = self.SIZE
-        fill = P["bg3"] if self._hover else mix(P["bg0"], P["bg2"], 0.3)
-        draw_round_rect(self, s, s, 8, fill, P["line2"], 1)
-        self.delete("icon")
-        self.create_image(s // 2, s // 2, image=self._icon(P["cyan"] if self._hover else P["text"]), tags="icon")
-
-
-@focusable()
 class ControlButton(tk.Canvas):
     """Dashboard control (screens.css .ctrl-btn): a card-shaped button with an icon tile at the top left,
     then a title and a subtitle. `tint` colours the tile (None = cyan glyph on a neutral tile). Disabled is

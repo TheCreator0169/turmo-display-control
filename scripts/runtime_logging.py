@@ -16,6 +16,17 @@ from typing import Optional, Dict, Any
 
 _RUNTIME_LOG_FILE: Optional[Path] = None
 _RUNTIME_LOG_LOCK = threading.Lock()
+_ENABLED = True  # v0.3.5: Settings > Logs > "Write logs"; applies once the settings are read (the first start-up lines are still written)
+
+
+def set_enabled(on: bool) -> None:
+    global _ENABLED
+    _ENABLED = bool(on)
+
+
+def is_enabled() -> bool:
+    return _ENABLED
+
 
 def init_runtime_log() -> Path:
     """Initialize persistent runtime log under %LOCALAPPDATA%\\TURMO\\logs\\"""
@@ -29,6 +40,8 @@ def init_runtime_log() -> Path:
 def log_runtime(component: str, event: str, message: str = "", exc: Optional[Exception] = None, level: str = "INFO", **kwargs):
     """Write a runtime diagnostic entry with timestamp, PID, thread, component, event."""
     global _RUNTIME_LOG_FILE
+    if not _ENABLED:
+        return
     if _RUNTIME_LOG_FILE is None:
         init_runtime_log()
     assert _RUNTIME_LOG_FILE is not None

@@ -153,6 +153,13 @@ class AboutPage:
                 self.root.after(200, poll)
         self.root.after(200, poll)
 
+    def _reason(self, error):
+        """The text for the user: an UpdateError already holds a plain sentence; any other error is translated to one."""
+        from scripts import update_check
+        from scripts.errors import friendly_error
+        log_exception("UPDATE", "ERROR", getattr(error, "__cause__", None) or error)
+        return tr(str(error) if isinstance(error, update_check.UpdateError) else friendly_error(error))
+
     def check_for_updates(self):
         """The Update button: ask GitHub for the latest release, then offer it. Nothing happens by itself."""
         from scripts import update_check
@@ -167,7 +174,7 @@ class AboutPage:
         from scripts.app_version import TURMO_VERSION
         self._update_busy = False
         if "error" in box:
-            self.show_error(tr("Could not check for updates"), str(box["error"]))
+            self.show_error(tr("Could not check for updates"), self._reason(box["error"]))
             return
         release = box["release"]
         if not update_check.is_newer(release.tag, TURMO_VERSION):
@@ -206,10 +213,10 @@ class AboutPage:
             state["over"] = True
             modal.close()
             if "error" in box:
-                self.show_error(tr("Could not download the update"), str(box["error"]))
+                self.show_error(tr("Could not download the update"), self._reason(box["error"]))
                 return
             try:
                 os.startfile(box["path"])  # the installer asks for administrator rights and closes TURMO itself
             except OSError as e:
-                self.show_error(tr("Could not start the installer"), str(e))
+                self.show_error(tr("Could not start the installer"), self._reason(e))
         self._run_in_thread(work, done)

@@ -207,7 +207,7 @@ class GraphPage:
         if selection:
             idx = self.graph_tree.index(selection[0])
             if self.graph_configs[idx]["id"] in LOCKED_GRAPHS:
-                self.toast(f"{self.graph_configs[idx]['id']} is a default graph and cannot be removed", "error")
+                self.toast(tr("{name} is a default graph and cannot be removed").format(name=self.graph_configs[idx]['id']), "error")
                 return
             del self.graph_configs[idx]
             self.refresh_graph_tree()
@@ -220,7 +220,7 @@ class GraphPage:
         try:  # saved in the custom folder, even for the official Custom Blank Canvas (copy on save)
             theme_path = theme_paths.own_copy(DATA_ROOT / "themes", self.settings.theme) / "theme.json"
         except OSError as e:
-            self.show_error("Error", f"Could not prepare the theme folder: {e}")
+            self.show_error(tr("Error"), tr("Could not prepare the theme folder: {reason}").format(reason=tr(friendly_error(e))))
             return
         if not theme_path.exists():
             self.show_error(tr("Error"), tr("Theme file not found"))

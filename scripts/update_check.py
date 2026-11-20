@@ -11,6 +11,8 @@ import os
 import re
 import urllib.request
 
+from scripts.errors import friendly_error
+
 REPO = "TheCreator0169/turmo-display-control"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"
@@ -20,8 +22,15 @@ SUMS_NAME = "SHA256SUMS.txt"
 HEADERS = {"User-Agent": "TURMO-update-check", "Accept": "application/vnd.github+json"}
 
 
+NO_VERSION = "The latest release could not be understood."
+NO_CHECKSUM = "The release has no checksum for its installer, so the download was not started."
+MISMATCH = "The download does not match its checksum and was deleted."
+MESSAGES = (NO_VERSION, NO_CHECKSUM, MISMATCH)
+
+
 class UpdateError(Exception):
-    """A readable reason why the check or the download could not finish."""
+    """A reason for the user: one English sentence (a key of the language table, show it through tr()). The raw error is
+    kept as `__cause__` for the log."""
 
 
 class Release:
@@ -53,11 +62,13 @@ def fetch_latest(urlopen=urllib.request.urlopen, timeout=10):
     try:
         with urlopen(urllib.request.Request(API, headers=HEADERS), timeout=timeout) as response:
             data = json.load(response)
+    except ValueError as e:  # an answer that is not JSON (a Wi-Fi login page, for instance)
+        raise UpdateError(NO_VERSION) from e
     except Exception as e:
-        raise UpdateError(f"GitHub did not answer ({e})") from e
+        raise UpdateError(friendly_error(e)) from e
     tag = data.get("tag_name", "")
     if version_tuple(tag) is None:
-        raise UpdateError("the latest release has no version tag")
+        raise UpdateError(NO_VERSION)
     assets = {a.get("name"): _own_url(a.get("browser_download_url")) for a in data.get("assets", [])}
     setup = next((name for name in assets if SETUP_RE.match(name or "")), None)
     return Release(tag, data.get("html_url", ""), setup, assets.get(setup), assets.get(SUMS_NAME))
@@ -77,10 +88,10 @@ def fetch_checksum(release, urlopen=urllib.request.urlopen, timeout=15):
         with urlopen(urllib.request.Request(release.sums_url, headers=HEADERS), timeout=timeout) as response:
             text = response.read(65536).decode("utf-8", "replace")
     except Exception as e:
-        raise UpdateError(f"the checksum file could not be read ({e})") from e
+        raise UpdateError(friendly_error(e)) from e
     digest = parse_sums(text, release.setup_name)
     if digest is None:
-        raise UpdateError("the release has no checksum for its installer")
+        raise UpdateError(NO_CHECKSUM)
     return digest
 
 
@@ -103,10 +114,10 @@ def download(release, folder, expected, progress=None, urlopen=urllib.request.ur
                     progress(done, total)
     except Exception as e:
         _remove(part)
-        raise UpdateError(f"the download failed ({e})") from e
+        raise UpdateError(friendly_error(e)) from e
     if digest.hexdigest() != expected:
         _remove(part)
-        raise UpdateError("the download does not match its checksum and was deleted")
+        raise UpdateError(MISMATCH)
     os.replace(part, final)
     return final
 

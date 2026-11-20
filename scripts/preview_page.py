@@ -199,18 +199,22 @@ class PreviewPage:
         path = filedialog.asksaveasfilename(defaultextension=".png", initialfile="turmo_screenshot.png",
                                             filetypes=[("PNG image", "*.png")])
         if path:
-            frame.save(path)
-            self.status_var.set(f"Screenshot saved: {path}")
+            try:
+                frame.save(path)
+            except (OSError, ValueError) as e:
+                self.show_error(tr("Could not save the screenshot"), tr(friendly_error(e)))
+                return
+            self.status_var.set(tr("Screenshot saved: {path}").format(path=path))
 
     def start_preview(self):
         if self.preview_running:
             return
         # ponytail: backoff — don't restart a worker that keeps dying
         if hasattr(self, '_preview_cooldown_until') and time.time() < self._preview_cooldown_until:
-            self.status_var.set(f"Preview paused (cooldown: {int(self._preview_cooldown_until - time.time())}s)")
+            self.status_var.set(tr("Preview paused (cooldown: {seconds}s)").format(seconds=int(self._preview_cooldown_until - time.time())))
             return
         self.preview_running = True
-        self.status_var.set("Preview running")
+        self.status_var.set(tr("Preview running"))
         self._refresh_preview_caption()
         # ponytail: background worker produces frames, main-thread timer displays them
         self._preview_frame = None
@@ -233,7 +237,7 @@ class PreviewPage:
     def stop_preview(self):
         _log_event("PREVIEW_STOP", f"gen={getattr(self, '_preview_gen', 0)}")
         self.preview_running = False
-        self.status_var.set("Preview stopped")
+        self.status_var.set(tr("Preview stopped"))
         self._refresh_preview_caption()
 
     def restart_preview(self):
@@ -403,12 +407,12 @@ class PreviewPage:
 
         if err:
             self._preview_err = None
-            self.status_var.set(f"Preview error: {err}")
+            self.status_var.set(tr("Preview error: {reason}").format(reason=tr(friendly_error(err))))
             self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] Preview ERROR: {err}\n")
             self.log_text.see(tk.END)
             # ponytail: backoff — if the worker keeps dying, pause restarts for 15s
             self._preview_cooldown_until = time.time() + 15.0
-            self.status_var.set("Preview paused (cooldown: 15s)")
+            self.status_var.set(tr("Preview paused (cooldown: {seconds}s)").format(seconds=15))
             # ponytail: reschedule so a transient error can recover on next tick
             self.root.after(5000, lambda: self._preview_ui_tick(gen))
             return

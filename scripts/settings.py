@@ -61,6 +61,7 @@ class Settings:
     gpu_index: int = 0                      # which NVIDIA GPU to monitor (0 = first)
     color_correction: bool = True           # LCD only: evens out the panel's blue-heavy grey curve (see correct_panel)
     color_gain: dict = field(default_factory=lambda: {"r": 100, "g": 100, "b": 100})  # LCD white balance, % per colour
+    logging_enabled: bool = True            # Settings > Logs > Write logs; off: the GUI and the Monitor write no log file
     log_keep_days: int = 7                  # old log files are removed after this many days (see runtime_logging.sweep_logs)
     log_max_mb: int = 20                    # and the oldest go first when the logs folder is bigger than this
 
@@ -75,18 +76,71 @@ class Settings:
         if not p.exists():
             return cls()
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            data = json.loads(p.read_text(encoding="utf-8-sig"))  # -sig: a file saved with a BOM (PowerShell 5) still reads
+        except (OSError, ValueError):  # ValueError: not JSON, or not UTF-8
+            return cls()
+        if not isinstance(data, dict):
             return cls()
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        out = cls(**{k: v for k, v in data.items() if k in known})
+        if not isinstance(out.logging_enabled, bool):
+            out.logging_enabled = True
+        return out
+
+    @staticmethod
+    def check_file(path) -> None:
+        """Raise ValueError unless `path` is a JSON object holding at least one known setting (used before an import
+        replaces the real file)."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        except UnicodeDecodeError as e:
+            raise ValueError("not text") from e
+        if not isinstance(data, dict) or not (set(data) & set(Settings.__dataclass_fields__)):
+            raise ValueError("not a TURMO settings file")
+        defaults = Settings()
+        for key, value in data.items():
+            if key not in Settings.__dataclass_fields__:
+                continue
+            want = type(getattr(defaults, key))
+            ok = (isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) < 1e9
+                  if want in (int, float) else isinstance(value, want))
+            if not ok:
+                raise ValueError(f"{key} has a wrong value")
+
+    @classmethod
+    def quarantine_damaged(cls):
+        """At GUI start only (the Monitor reads the file while it may be being written): a file that is not valid JSON is
+        renamed to settings.json.bad so the user's choices are not silently overwritten. True when it was moved."""
+        p = cls.path()
+        try:
+            json.loads(p.read_text(encoding="utf-8-sig"))
+            return False
+        except (OSError, ValueError):
+            if not p.exists():
+                return False
+        try:
+            os.replace(p, p.with_name(p.name + ".bad"))
+        except OSError:
+            return False  # ok: left in place; load() falls back to the defaults
+        return True
 
     def save(self) -> None:
         p = self.path()
         p.parent.mkdir(parents=True, exist_ok=True)
         data = asdict(self)
         data["font_scale"] = round(float(data["font_scale"]), 2)  # 1.01, not 1.0139784946236559
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp = p.with_name(p.name + ".tmp")  # v0.3.5: write beside, then swap: the Monitor reads this file every second
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:  # the Monitor has the file open for a moment (Windows)
+                if attempt == 4:
+                    p.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
+                    tmp.unlink(missing_ok=True)
+                else:
+                    time.sleep(0.05)
         try:
             os.chmod(p, 0o600)  # owner read/write only
         except OSError:

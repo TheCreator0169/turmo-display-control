@@ -26,7 +26,8 @@ try:
     from scripts.runtime_logging import (
         init_runtime_log, log_runtime, log_exception, log_callback,
         log_worker_start, log_worker_result, log_com_error, get_runtime_log_path,
-        install_thread_excepthook, safe_callback, run_worker, popen_worker,
+        install_thread_excepthook, safe_callback, run_worker, popen_worker, set_enabled as set_logging_enabled,
+        is_enabled as logging_enabled,
         KEEP_DAYS_CHOICES, MAX_MB_CHOICES, log_dir, log_folder_stats, rotate_startup_log, sweep_logs, valid_choice
     )
     RUNTIME_LOGGING_AVAILABLE = True
@@ -37,6 +38,8 @@ except ImportError as e:
     # Fallback stubs
     def init_runtime_log() -> Optional[Path]: return None
     def log_runtime(*args, **kwargs): pass
+    def set_logging_enabled(on): pass
+    def logging_enabled(): return True
     def log_exception(*args, **kwargs): pass
     def log_callback(*args, **kwargs): pass
     def log_worker_start(*args, **kwargs): pass
@@ -75,6 +78,8 @@ def init_startup_log() -> Path:
 
 def log_startup(log_file: Path, stage: str, message: str, exc: Exception = None):
     """Write a startup diagnostic entry with timestamp, PID, session info."""
+    if not logging_enabled():
+        return
     try:
         pid = os.getpid()
         session_id = os.environ.get("SESSIONNAME", "unknown")
@@ -168,7 +173,7 @@ from scripts.modal import Modal, form_entry, form_label, form_spin  # noqa: E402
 from scripts.minimal_ui import MinimalView, MIN_SIZE as MINIMAL_MIN, SIZE as MINIMAL_SIZE  # noqa: E402
 from scripts.quick_panel import QuickPanel, work_area  # noqa: E402
 from scripts.gui_widgets import (  # noqa: E402,F401
-    Badge, ChoiceTile, ControlButton, DeviceChip, IconTile, LayerRow, Stepper, NavItem, OrganizeButton, RoundedButton, RoundedCard, ThemeChip, WidgetTile, draw_spark,
+    Badge, ChoiceTile, ControlButton, DeviceChip, IconTile, LayerRow, Stepper, NavItem, RoundedButton, RoundedCard, ThemeChip, WidgetTile, draw_spark,
     ScrollFrame, Segmented, Select, Slider, StatRow, Switch, Tip, make_button, page_header, round_rect, rounded_entry,
 )
 
@@ -258,6 +263,7 @@ else:
 from scripts.settings import (GAIN_RANGE, Settings, dim_image, gain_values, keeps_celsius, read_link_status, read_serial_stats,
                               temps_in_unit)
 from scripts import theme_paths
+from scripts.errors import friendly_error  # noqa: E402,F401
 from scripts.editor_render import Shot
 
 

@@ -1159,6 +1159,8 @@ def cmd_render_theme(_args: argparse.Namespace) -> int:
     global _disp
     from settings import LinkStatus, SerialTimer, Settings, correct_panel, dim_image, keeps_celsius, temps_in_unit
     settings = Settings.load()
+    from runtime_logging import set_enabled as _set_logging
+    _set_logging(settings.logging_enabled)
     # CLI flags override persisted settings
     port = _args.port or settings.port or find_turmo_port()
     if not port and _args.once:  # the live Monitor waits for the display instead (UsbLink)
@@ -1358,6 +1360,7 @@ def cmd_render_theme(_args: argparse.Namespace) -> int:
                             if len(h) > MAX_HIST:
                                 h.pop(0)
                     live = Settings.load()
+                    _set_logging(live.logging_enabled)
                     seen_orientation, new_landscape, turned = _orientation_to_draw(seen_orientation, live.orientation, landscape)
                     if turned:  # v0.3.0: Portrait/Landscape from the GUI reaches the panel without a restart
                         landscape = new_landscape
