@@ -26,7 +26,7 @@ A professional Windows application for controlling TURMO 3.5" USB displays (VID:
 - **Local Settings Persistence** (JSON config)
 - **Portable Mode** — run from USB without installation
 - **One-Click Windows Installer**
-- **No Cloud Dependency** — fully local operation
+- **No Cloud Dependency** — fully local operation; the only network call is the **Update** button in About, which asks GitHub for the latest release when you press it
 
 ## Quick Start
 

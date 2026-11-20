@@ -2,6 +2,10 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.4 (2026-11-20)
+-------------------
+- About: the Update button now works. It asks GitHub for the latest release only when pressed; if a newer one exists it offers to download the installer, checks its SHA-256 against the release's SHA256SUMS.txt, then starts it. FR/PT texts are drafts.
+
 v0.3.3 (2026-11-20)
 -------------------
 - Fix: the tray panel and the Minimalist window showed a dash for the GPU (and the CPU temperature) unless Live Preview was on; they now read the sensors like the Dashboard, also while the window is in the tray.

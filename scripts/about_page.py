@@ -3,6 +3,12 @@
 from scripts.gui_common import *  # noqa: F401,F403
 
 
+UPDATE_TEXT = ("TURMO {version} is available (you have {current}).\n\nThe installer is downloaded from GitHub, checked "
+               "against its SHA-256 and started. Windows may warn, because the installer is not code-signed yet.")
+NO_INSTALLER_TEXT = ("TURMO {version} is available, but its release has no installer this app can check. "
+                     "Open {page} to download it.")
+
+
 class AboutPage:
     """Methods of TurmoApp (mixed in), moved out of turmo_app_enhanced.py in v0.2.3."""
 
@@ -21,8 +27,8 @@ class AboutPage:
                            bg0, (self.ui_semibold, 16), (self.ui_font, 10))
         head.pack(fill=tk.X, pady=(0, 14))
         head.actions.pack_configure(anchor="center")
-        # visual only for now: a press does nothing and nothing leaves the machine
-        make_button(head.actions, tr("Update"), lambda: None, (self.ui_font, 10), variant="default", backdrop=bg0,
+        # v0.3.4: one request to GitHub, only when this is pressed (scripts/update_check.py)
+        make_button(head.actions, tr("Update"), self.check_for_updates, (self.ui_font, 10), variant="default", backdrop=bg0,
                     icon=("\uE895", (ICON_FONT, 11))).pack()
         semi, font, mono = (self.ui_semibold, 11), (self.ui_font, 10), ("Cascadia Code", 10)
         cols = tk.Frame(body, bg=bg0)
@@ -124,3 +130,86 @@ class AboutPage:
             "• Drag-and-drop theme editor\n"
             "• Graph sensor customization\n"
             "• No cloud dependency - fully local")
+
+
+    # --- Update (v0.3.4) -------------------------------------------------------------------------------------------
+    def _run_in_thread(self, work, done):
+        """Run `work(box)` on a thread; `done(box)` runs on the Tk thread once it has set box["finished"]."""
+        import threading
+        box = {}
+
+        def target():
+            try:
+                work(box)
+            except Exception as e:  # ok: not lost, `done` shows it to the user
+                box["error"] = e
+            box["finished"] = True
+        threading.Thread(target=target, daemon=True).start()
+
+        def poll():
+            if box.get("finished"):
+                done(box)
+            else:
+                self.root.after(200, poll)
+        self.root.after(200, poll)
+
+    def check_for_updates(self):
+        """The Update button: ask GitHub for the latest release, then offer it. Nothing happens by itself."""
+        from scripts import update_check
+        if getattr(self, "_update_busy", False):
+            return
+        self._update_busy = True
+        self.toast(tr("Checking for updates..."))
+        self._run_in_thread(lambda box: box.update(release=update_check.fetch_latest()), self._update_checked)
+
+    def _update_checked(self, box):
+        from scripts import update_check
+        from scripts.app_version import TURMO_VERSION
+        self._update_busy = False
+        if "error" in box:
+            self.show_error(tr("Could not check for updates"), str(box["error"]))
+            return
+        release = box["release"]
+        if not update_check.is_newer(release.tag, TURMO_VERSION):
+            self.toast(tr("You have the latest version ({version}).").format(version=TURMO_VERSION))
+        elif not release.has_installer():
+            self.show_warning(tr("Update available"), tr(NO_INSTALLER_TEXT).format(version=release.tag, page=release.page))
+        else:
+            self.confirm(tr("Update available"), tr(UPDATE_TEXT).format(version=release.tag, current=TURMO_VERSION),
+                         tr("Download and install"), lambda: self._download_update(release))
+
+    def _download_update(self, release):
+        import os
+        import tempfile
+        from scripts import update_check
+        from scripts.modal import Modal
+        modal = Modal(self, tr("Downloading..."), width=400)
+        label = tk.Label(modal.body, text="0 %", bg=PALETTE["bg2"], fg=PALETTE["text"], font=(self.ui_font, 10))
+        label.pack(fill=tk.X, pady=(4, 0))
+        modal.show()
+        state = {"percent": 0}
+
+        def progress(done, total):
+            state["percent"] = int(100 * done / total) if total else 0
+
+        def work(box):
+            expected = update_check.fetch_checksum(release)
+            box["path"] = update_check.download(release, tempfile.gettempdir(), expected, progress)
+
+        def show_percent():
+            if label.winfo_exists() and not state.get("over"):
+                label.config(text=f"{state['percent']} %")
+                self.root.after(300, show_percent)
+        show_percent()
+
+        def done(box):
+            state["over"] = True
+            modal.close()
+            if "error" in box:
+                self.show_error(tr("Could not download the update"), str(box["error"]))
+                return
+            try:
+                os.startfile(box["path"])  # the installer asks for administrator rights and closes TURMO itself
+            except OSError as e:
+                self.show_error(tr("Could not start the installer"), str(e))
+        self._run_in_thread(work, done)

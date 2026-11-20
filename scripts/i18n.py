@@ -370,6 +370,25 @@ TABLE = {
         "Saúde do link USB, processos em segundo plano e registro ao vivo."),
     "Units": ("Unités", "Unidades"),
     "Update": ("Mise à jour", "Atualizar"),
+    "Checking for updates...": ("Recherche de mises à jour...", "A procurar atualizações..."),
+    "You have the latest version ({version}).": (
+        "Vous avez la dernière version ({version}).", "Tem a versão mais recente ({version})."),
+    "Could not check for updates": (
+        "Impossible de vérifier les mises à jour", "Não foi possível verificar as atualizações"),
+    "Update available": ("Mise à jour disponible", "Atualização disponível"),
+    "TURMO {version} is available, but its release has no installer this app can check. Open {page} to download it.": (
+        "TURMO {version} est disponible, mais sa version n'a pas d'installateur que l'application peut vérifier. "
+        "Ouvrez {page} pour le télécharger.",
+        "O TURMO {version} está disponível, mas a sua versão não tem um instalador que a aplicação possa verificar. "
+        "Abra {page} para o transferir."),
+    "TURMO {version} is available (you have {current}).\n\nThe installer is downloaded from GitHub, checked against its SHA-256 and started. Windows may warn, because the installer is not code-signed yet.": (
+        "TURMO {version} est disponible (vous avez {current}).\n\nL'installateur est téléchargé depuis GitHub, vérifié avec son SHA-256 puis lancé. Windows peut afficher un avertissement, car l'installateur n'est pas encore signé.",
+        "O TURMO {version} está disponível (tem {current}).\n\nO instalador é transferido do GitHub, verificado com o seu SHA-256 e iniciado. O Windows pode avisar, porque o instalador ainda não está assinado."),
+    "Download and install": ("Télécharger et installer", "Transferir e instalar"),
+    "Downloading...": ("Téléchargement...", "A transferir..."),
+    "Could not download the update": (
+        "Impossible de télécharger la mise à jour", "Não foi possível transferir a atualização"),
+    "Could not start the installer": ("Impossible de lancer l'installateur", "Não foi possível iniciar o instalador"),
     "Use colour": ("Utiliser la couleur", "Usar a cor"),
     "VRAM": ("VRAM", "VRAM"),
     "Version": ("Version", "Versão"),
