@@ -16,7 +16,7 @@ from scripts.errors import friendly_error
 REPO = "TheCreator0169/turmo-display-control"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"
-SETUP_RE = re.compile(r"^TURMO-Setup-v\d+\.\d+\.\d+\.exe$")
+SETUP_RE = re.compile(r"^TURMO-Setup-v\d+\.\d+\.\d+(?:\.\d+)?\.exe$")
 TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
 SUMS_NAME = "SHA256SUMS.txt"
 HEADERS = {"User-Agent": "TURMO-update-check", "Accept": "application/vnd.github+json"}

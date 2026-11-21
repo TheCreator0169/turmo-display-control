@@ -2,6 +2,10 @@ TURMO - CHANGELOG
 =================
 
 
+v0.3.8 (2026-11-21)
+--------------------
+- Fix: the Update button said a release "has no installer this app can check" for versions with four numbers (v0.3.7.3). It now finds installers named with three or four numbers. Versions before this one still show that message for four-number releases: download those by hand.
+
 v0.3.7.3 (2026-11-20)
 ----------------------
 - Fix: if an old "Start with Windows" entry cannot be rewritten, the switch stays on (it showed off). The test run no longer reads or rewrites the real start-up entry.

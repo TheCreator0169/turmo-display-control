@@ -64,6 +64,14 @@ class Fetch(unittest.TestCase):
         self.assertEqual(release.sums_url, BASE + "SHA256SUMS.txt")
         self.assertTrue(release.has_installer())
 
+    def test_a_four_part_version_installer_is_found(self):
+        name = "TURMO-Setup-v0.3.7.3.exe"
+        assets = [{"name": name, "browser_download_url": BASE + name},
+                  {"name": "SHA256SUMS.txt", "browser_download_url": BASE + "SHA256SUMS.txt"}]
+        release = uc.fetch_latest(urlopen=lambda req, timeout: FakeResponse(latest_json("v0.3.7.3", assets)))
+        self.assertTrue(release.has_installer())
+        self.assertEqual(release.setup_name, name)
+
     def test_an_installer_address_outside_this_projects_releases_is_dropped(self):
         assets = [{"name": SETUP, "browser_download_url": "https://evil.example/" + SETUP},
                   {"name": "SHA256SUMS.txt", "browser_download_url": BASE + "SHA256SUMS.txt"}]
