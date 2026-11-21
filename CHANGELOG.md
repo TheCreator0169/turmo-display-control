@@ -1,6 +1,12 @@
 TURMO - CHANGELOG
 =================
 
+Builds, hashes and test results of every build are in BUILD_HISTORY.md.
+
+v0.3.8.1 (2026-11-21)
+----------------------
+- Fix: a Monitor that started at the very moment the window scanned the process list could be counted as a second Monitor for one scan (the parent of a brand-new process was unknown).
+- Fix: the log clean-up could delete the log the running window was still writing, when a newer log existed.
 
 v0.3.8 (2026-11-21)
 --------------------
@@ -81,7 +87,7 @@ v0.3.0 (2026-11-19)
 - Gallery: your own themes get a picture; the organize icon is on every card and the bin, pencil and copy icons on your own themes only.
 - Theme Editor: the layer list moves a widget up or down in the drawing order.
 - Version label 8 px on the portrait LCD themes; Serial latency tile in Diagnostics.
-- Versions v0.2.2 to v0.2.9.x: development builds, not published.
+- Versions v0.2.2 to v0.2.9.x: see BUILD_HISTORY.md and docs/progress.md.
 
 v0.2.1 (2026-11-18)
 -------------------

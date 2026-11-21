@@ -189,6 +189,8 @@ def sweep_logs(directory=None, keep_days=7, max_mb=20, now=None):
     for item in files:
         newest.setdefault(item[0], item)
     spared = set(item[1] for item in newest.values())
+    if _RUNTIME_LOG_FILE is not None:  # the log this process is writing, even when a newer one exists
+        spared.add(Path(_RUNTIME_LOG_FILE))
     for kind in newest:  # the newest log of each kind that holds an error survives, whatever its age
         for item in (f for f in files if f[0] == kind and f[1] not in spared):
             if _has_error(item[1]):

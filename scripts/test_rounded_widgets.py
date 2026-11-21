@@ -467,8 +467,16 @@ class ModalTests(unittest.TestCase):
         modal = Modal(fake, "Esc")
         modal.show()
         self.root.update()
-        modal.scrim.event_generate("<Escape>")
-        self.root.update()
+        # A key event goes to the window that has the keyboard focus. On a busy PC Windows can grant the focus late
+        # (this test failed once in about 24 runs under load), so ask for it again and retry for up to 3 s.
+        import time
+        end = time.monotonic() + 3.0
+        while fake._modal is not None and time.monotonic() < end:
+            modal.scrim.focus_force()
+            self.root.update()
+            modal.scrim.event_generate("<Escape>")
+            self.root.update()
+            time.sleep(0.05)
         self.assertIsNone(fake._modal)
 
 

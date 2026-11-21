@@ -107,6 +107,8 @@ def _process_rows():
             cmd = " ".join(p.cmdline() or []) if "python" in low else ""
             if "turmo-monitor" in low or ("python" in low and cmd):
                 ppid = parent_of.get(p.info["pid"]) if parent_of is not None else p.info["ppid"]
+                if ppid is None:  # born after the snapshot: ask this one process (rare), never leave None
+                    ppid = p.ppid()
                 rows.append((p.info["pid"], name, cmd, ppid))
         except Exception as e:  # a process that vanished or is not ours to read
             log_swallowed("process scan", e)

@@ -450,6 +450,18 @@ class ProcessScan(unittest.TestCase):
         self.assertNotIn("ppid", seen["attrs"])  # per-process ppid cost 5 s on the first scan
         self.assertTrue(all(isinstance(r[3], int) for r in rows))
 
+    def test_a_process_missing_from_the_parent_snapshot_still_gets_its_real_parent(self):
+        # A process born after the ppid snapshot is not in it. Its parent id used to be None, so a Monitor child
+        # looked like a second top-level Monitor for one scan (and this suite failed once in about 6 runs).
+        import os
+        from psutil import _psutil_windows as cext
+        with mock.patch.object(cext, "ppid_map", return_value={}):
+            rows = app._process_rows()
+        mine = [r for r in rows if r[0] == os.getpid()]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0][3], os.getppid())
+        self.assertTrue(all(isinstance(r[3], int) for r in rows))
+
     def test_rows_find_this_python_with_its_real_parent(self):
         import os
         mine = [r for r in app._process_rows() if r[0] == os.getpid()]
@@ -2202,6 +2214,18 @@ class LogRegulator(unittest.TestCase):
         self.assertEqual((removed, size), (2, 200))
         self.assertEqual(self.names(), ["notes_runtime_20260101_000000.log", "runtime_20260101_000000.log",
                                         "runtime_20260104_000000.log.d", "settings.json", "tkinter_minimal_startup.log"])
+
+    def test_the_log_this_process_is_writing_stays_even_when_a_newer_one_exists(self):
+        # A GUI left open longer than "keep days" while another run wrote a newer log: its own open log must not go.
+        mine = self.make("runtime_20260101_000000.log", 50)
+        self.make("runtime_20260102_000000.log", 40)
+        self.make("runtime_20260103_000000.log", 1)
+        before, self.rl._RUNTIME_LOG_FILE = self.rl._RUNTIME_LOG_FILE, mine
+        self.addCleanup(setattr, self.rl, "_RUNTIME_LOG_FILE", before)
+        self.rl.sweep_logs(self.dir, keep_days=7, max_mb=20, now=self.now)
+        self.assertEqual(self.names(), ["runtime_20260101_000000.log", "runtime_20260103_000000.log"])
+        # not merely recreated: the sweep's own "removed" line is written to this file, which would bring back an empty one
+        self.assertTrue(mine.read_text(encoding="utf-8").startswith("x" * 100))  # its old content is still there
 
     def test_the_newest_log_of_each_kind_stays_however_old(self):
         for kind in ("runtime", "startup", "lifecycle"):
