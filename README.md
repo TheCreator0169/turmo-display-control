@@ -16,7 +16,7 @@ A professional Windows application for controlling TURMO 3.5" USB displays (VID:
 - **Visual Drag-and-Drop Theme Editor** — create custom layouts visually
 - **Portrait & Landscape** orientation selector
 - **Real-time Sensor Monitoring**: CPU/GPU/RAM/Network/Disk
-- **CPU Temperature** via LibreHardwareMonitor + PawnIO driver
+- **CPU Temperature** via LibreHardwareMonitor + [PawnIO](https://pawnio.eu) driver
 - **NVIDIA GPU Monitoring** via NVML (multi-GPU support)
 - **Graph Customization** — select sensors, ranges, colors, history length
 - **Brightness & Refresh Rate** controls
@@ -27,6 +27,17 @@ A professional Windows application for controlling TURMO 3.5" USB displays (VID:
 - **Portable Mode** — run from USB without installation
 - **One-Click Windows Installer**
 - **No Cloud Dependency** — fully local operation; the only network call is the **Update** button in About, which asks GitHub for the latest release when you press it
+
+## Before you download
+
+For the **CPU temperature**, install this first (everything else works without it):
+
+| What | Link | Needed? |
+|---|---|---|
+| **PawnIO** driver (v2.2.0 or newer) | <https://pawnio.eu> | Yes, for the CPU temperature. Not installed by TURMO. |
+| **LibreHardwareMonitor** | <https://github.com/LibreHardwareMonitor/LibreHardwareMonitor> | No: its library is already inside TURMO. Link given for reference. |
+
+Without PawnIO the app still runs; only the CPU temperature is missing.
 
 ## Quick Start
 
@@ -48,23 +59,18 @@ custom themes. Uninstalling asks whether to delete them (the default is to keep 
 
 - Windows 10/11 (64-bit)
 - TURMO 3.5" USB display connected (CH340 serial, VID:PID 1A86:5722)
-- **PawnIO driver v2.2.0+** (for CPU temperature) — install from official source
-- **LibreHardwareMonitor.NET10** (for CPU temperature sensors)
+- [PawnIO driver v2.2.0+](https://pawnio.eu) (for CPU temperature)
+- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor): bundled, nothing to install
 - NVIDIA GPU (optional, for GPU monitoring)
 
 ## Hardware Setup
 
-1. Install PawnIO driver (required for CPU temperature):
-   - Download from official source
-   - Run installer with `-install -silent` arguments
-   - Approve UAC prompt
+1. Install the [PawnIO driver](https://pawnio.eu) (needed for the CPU temperature):
+   - Download the setup from <https://pawnio.eu>
+   - Run it and approve the UAC prompt
 
-2. Install LibreHardwareMonitor:
-   - Download `LibreHardwareMonitor.NET10` from official releases
-   - Install to `C:\Program Files\LibreHardwareMonitor.NET10`
-
-3. Connect TURMO display via USB
-   - Should appear as COM port (CH340)
+2. Connect the TURMO display via USB
+   - It appears as a COM port (CH340)
    - Auto-detected by the application
 
 ## Usage
@@ -134,5 +140,5 @@ Whoever receives a TURMO build may ask for its source code; it is this repositor
 
 - TURMO-OpenSource community
 - libre-panel library
-- LibreHardwareMonitor
-- PawnIO driver by namazso
+- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+- [PawnIO](https://pawnio.eu) driver by namazso
