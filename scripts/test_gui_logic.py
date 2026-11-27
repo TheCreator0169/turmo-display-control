@@ -1361,6 +1361,21 @@ class PawnioRow(unittest.TestCase):
             self.assertNotEqual(app.i18n.tr(text), text, text)
 
 
+class UpdateLeavesTheWay(unittest.TestCase):
+    """v0.3.8.4: the Update button quits TURMO after starting the installer; the installer closes what is left."""
+
+    def test_the_window_quits_itself_after_the_installer_starts(self):
+        src = open(os.path.join(ROOT, "scripts", "about_page.py"), encoding="utf-8").read()
+        start = src.index("os.startfile(box[\"path\"])")
+        tail = src[start:start + 900]
+        self.assertIn("self.root.after(1500, self.quit_app)", tail)
+        self.assertLess(tail.index("return"), tail.index("self.quit_app"))  # not when the installer failed to start
+
+    def test_setup_closes_running_copies_without_asking(self):
+        iss = open(os.path.join(ROOT, "installer", "turmo.iss"), encoding="utf-8").read()
+        self.assertIn("CloseApplications=force", iss)
+
+
 class TrayQuitDeferred(unittest.TestCase):
     def test_quit_menu_item_hands_off_to_the_tk_thread(self):
         obj = make_app()

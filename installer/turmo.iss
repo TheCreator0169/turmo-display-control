@@ -27,7 +27,7 @@ SolidCompression=yes
 ; Per-machine (the CPU helper task needs admin). TODO(user): confirm per-machine only.
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
-CloseApplications=yes
+CloseApplications=force
 CloseApplicationsFilter=TURMO-*.exe
 RestartApplications=no
 

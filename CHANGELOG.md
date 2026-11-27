@@ -3,6 +3,10 @@ TURMO - CHANGELOG
 
 Builds, hashes and test results of every build are in BUILD_HISTORY.md.
 
+v0.3.8.4 (2026-11-27)
+----------------------
+- Fix: pressing Update started the installer but TURMO stayed open (its close button only hides it in the tray), so the installer could not close it and asked the user to end it in the Task Manager. TURMO now quits by itself a moment after the installer starts, and the installer closes any copy still running without asking.
+
 v0.3.8.3 (2026-11-27)
 ----------------------
 - New: Settings, in the CPU temperature card, has a "PawnIO driver" row. It says whether the driver is installed (and its version), and when it is missing or older than version 2 it shows a "Get PawnIO (pawnio.eu)" button that opens the official page. The CPU temperature needs this driver.

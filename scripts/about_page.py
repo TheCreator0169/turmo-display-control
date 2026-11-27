@@ -216,7 +216,11 @@ class AboutPage:
                 self.show_error(tr("Could not download the update"), self._reason(box["error"]))
                 return
             try:
-                os.startfile(box["path"])  # the installer asks for administrator rights and closes TURMO itself
+                os.startfile(box["path"])  # the installer asks for administrator rights
             except OSError as e:
                 self.show_error(tr("Could not start the installer"), self._reason(e))
+                return
+            # Leave now: the close button only hides this window in the tray, so the installer could not close it
+            # ("automatic close" failed, the user had to end TURMO in the Task Manager).
+            self.root.after(1500, self.quit_app)
         self._run_in_thread(work, done)
