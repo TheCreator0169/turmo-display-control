@@ -397,3 +397,33 @@ def log_kind(level):
 def recent_errors(entries, count=3):
     """The last `count` error entries, newest last."""
     return [e for e in entries if log_kind(e[1]) == "err"][-count:]
+
+
+PAWNIO_URL = "https://pawnio.eu"
+_PAWNIO_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO"
+
+
+def pawnio_version():
+    """Installed PawnIO driver version ("" if it does not say), None when it is not installed."""
+    try:
+        import winreg
+    except ImportError:
+        return None
+    for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _PAWNIO_KEY, 0, winreg.KEY_READ | view) as key:
+                try:
+                    return str(winreg.QueryValueEx(key, "DisplayVersion")[0])
+                except OSError:
+                    return ""
+        except OSError:
+            continue
+    return None
+
+
+def pawnio_state(version):
+    """'missing', 'old' (major below 2: the CPU temperature needs 2 or newer) or 'ok'."""
+    if version is None:
+        return "missing"
+    m = re.match(r"\d+", version)
+    return "old" if m and int(m.group()) < 2 else "ok"

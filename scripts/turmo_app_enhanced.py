@@ -1462,6 +1462,10 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         self.helper_btn = make_button(control, tr("Enable CPU temperature (one-time UAC)"), self.toggle_cpu_temp_helper,
                                       (self.ui_font, 10), variant="primary", backdrop=bg2)
         self.helper_btn.pack()
+        self.pawnio_status = tk.StringVar()
+        control = row(inner, tr("PawnIO driver"), "", desc_var=self.pawnio_status)
+        self.pawnio_btn = make_button(control, tr("Get PawnIO (pawnio.eu)"), lambda: os.startfile(PAWNIO_URL),
+                                      (self.ui_font, 10), variant="primary", backdrop=bg2)
         self._refresh_helper_status()
 
         # Display
@@ -1916,8 +1920,23 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
     # ─── CPU Temp Helper ───
 
+    def _refresh_pawnio(self):
+        """Say whether the PawnIO driver (CPU temperature) is installed; offer the official page when it is not."""
+        version = pawnio_version()
+        state = pawnio_state(version)
+        self.pawnio_status.set({
+            "missing": tr("Not installed: needed to show the CPU temperature."),
+            "old": tr("Too old: version 2 or newer is needed."),
+            "ok": f"{tr('Installed')} {version}".strip(),
+        }[state])
+        if state == "ok":
+            self.pawnio_btn.pack_forget()
+        elif not self.pawnio_btn.winfo_ismapped():
+            self.pawnio_btn.pack()
+
     def _refresh_helper_status(self):
         """Check if the helper is running and update the status label."""
+        self._refresh_pawnio()
         import socket
         try:
             s = socket.create_connection(("127.0.0.1", 18234), timeout=0.5)

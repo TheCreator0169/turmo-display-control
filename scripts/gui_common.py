@@ -166,6 +166,7 @@ from scripts.gui_design import (  # noqa: E402
     LOCKED_GRAPHS, RATE, SENSOR_FORMATS, format_rate, SENSOR_NAMES, sensor_format, sensor_name, SIDEBAR_GLYPHS, SIDEBAR_GROUPS, SIDEBAR_ITEMS, FULL_SIZE, window_size,
     SIDEBAR_W, TEXT_FONTS, LINK_LABELS, device_chip_text, device_status, filter_themes, metric_text, pick_family, scale_history, sparkline_points, temp_in,
     collapse_description, is_custom_theme, pick_topmost, is_editable_theme, log_kind, move_theme, order_themes, mix, parse_log, recent_errors, unique_theme_name,
+    PAWNIO_URL, pawnio_state, pawnio_version,
 )
 from scripts import i18n  # noqa: E402,F401
 from scripts.i18n import tr  # noqa: E402,F401  (the texts the window draws, see i18n.py)

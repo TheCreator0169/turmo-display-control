@@ -1336,6 +1336,31 @@ class TrayAndPortWords(unittest.TestCase):
                 self.assertEqual(app.i18n.tr(text), want, (text, lang))
 
 
+class PawnioRow(unittest.TestCase):
+    """v0.3.8.3: Settings says whether PawnIO is installed and links to the official page when it is not."""
+
+    def test_state_from_the_version(self):
+        self.assertEqual(app.pawnio_state(None), "missing")
+        self.assertEqual(app.pawnio_state("1.9.0"), "old")
+        self.assertEqual(app.pawnio_state("2.2.0"), "ok")
+        self.assertEqual(app.pawnio_state(""), "ok")  # installed, version not said
+
+    def test_the_link_is_the_official_site_and_the_row_is_wired(self):
+        self.assertEqual(app.PAWNIO_URL, "https://pawnio.eu")
+        src = open(os.path.join(ROOT, "scripts", "turmo_app_enhanced.py"), encoding="utf-8").read()
+        self.assertIn("os.startfile(PAWNIO_URL)", src)
+        self.assertIn("self._refresh_pawnio()", src)
+
+    def test_words_in_both_languages(self):
+        self.addCleanup(app.i18n.set_language, "en")
+        for text in ("PawnIO driver", "Get PawnIO (pawnio.eu)", "Installed", "Too old: version 2 or newer is needed.",
+                     "Not installed: needed to show the CPU temperature."):
+            app.i18n.set_language("fr")
+            self.assertNotEqual(app.i18n.tr(text), text, text)
+            app.i18n.set_language("pt")
+            self.assertNotEqual(app.i18n.tr(text), text, text)
+
+
 class TrayQuitDeferred(unittest.TestCase):
     def test_quit_menu_item_hands_off_to_the_tk_thread(self):
         obj = make_app()

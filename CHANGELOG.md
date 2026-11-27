@@ -3,6 +3,10 @@ TURMO - CHANGELOG
 
 Builds, hashes and test results of every build are in BUILD_HISTORY.md.
 
+v0.3.8.3 (2026-11-27)
+----------------------
+- New: Settings, in the CPU temperature card, has a "PawnIO driver" row. It says whether the driver is installed (and its version), and when it is missing or older than version 2 it shows a "Get PawnIO (pawnio.eu)" button that opens the official page. The CPU temperature needs this driver.
+
 v0.3.8.2 (2026-11-21)
 ----------------------
 - Fix: with Fahrenheit chosen, the landscape themes showed the number without a letter on the screen (142°). They now show 142°F. Celsius is unchanged.
