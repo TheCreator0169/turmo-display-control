@@ -423,6 +423,30 @@ class KitTests(unittest.TestCase):
             self.root.update()
         self.assertEqual(sf._bar.winfo_manager(), "pack")
 
+    def test_a_scrolling_list_inside_a_scrolling_column_takes_the_wheel_while_its_bar_shows(self):
+        """v0.3.8.2: the Theme Editor's left column scrolls and holds the layers list, which scrolls too. The wheel over
+        the list must move the list only (not both); over the rest of the column it moves the column."""
+        outer = gw.ScrollFrame(self.root, "#0B0E14")
+        outer.configure(width=300, height=150)
+        outer.pack_propagate(False)
+        self._show(outer)
+        tk.Frame(outer.body, height=120, width=100).pack()
+        inner = gw.ScrollFrame(outer.body, "#0B0E14")
+        inner._canvas.configure(width=1, height=60)
+        inner.pack(fill=tk.X)
+        row = tk.Frame(inner.body, height=300, width=100)
+        row.pack()
+        tk.Frame(outer.body, height=200, width=100).pack()
+        for _ in range(4):
+            self.root.update()
+        self.assertEqual(outer._bar.winfo_manager(), "pack")
+        self.assertEqual(inner._bar.winfo_manager(), "pack")
+        self.assertTrue(outer._inner_scroll_takes(row))  # over the list: the list scrolls, the column does not
+        self.assertFalse(outer._inner_scroll_takes(outer.body))  # over the rest: the column scrolls
+        self.assertFalse(inner._inner_scroll_takes(row))  # the list itself is not "inside" another list
+        inner._bar.pack_forget()  # a list that fits (no bar) lets the wheel through
+        self.assertFalse(outer._inner_scroll_takes(row))
+
     def test_stat_row_and_page_header(self):
         row = self._show(gw.StatRow(self.root, "cpu.load", "#0B0E14", FONT, ("Consolas", 9)), fill=tk.X)
         row.set_value("42%")

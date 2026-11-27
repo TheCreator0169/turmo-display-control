@@ -176,6 +176,33 @@ def temps_in_unit(readings, history, unit):
     return out, hist
 
 
+def fahrenheit_theme(theme):
+    """The theme to draw in Fahrenheit (v0.3.8.2). The landscape themes write a bare "°" after a temperature, which
+    would read "140°" once the reading is converted; here that "°" becomes "°F". A format that already writes {unit}
+    (the portrait themes) or a fixed letter is left alone, and Celsius never calls this. Returns `theme` itself when
+    nothing changes, else a copy; the input is never edited."""
+    from dataclasses import replace
+    widgets, changed = [], False
+    for w in theme.widgets:
+        fmt = w.get("format")
+        if w.get("type") == "metric" and str(w.get("sensor", "")).endswith(".temp") and isinstance(fmt, str) and fmt.endswith("°"):
+            w, changed = {**w, "format": fmt + "F"}, True
+        widgets.append(w)
+    return replace(theme, widgets=widgets) if changed else theme
+
+
+def renderer_for_unit(renderer, unit, cache, make):
+    """The renderer to draw with for `unit` ("fahrenheit" or anything else). Celsius returns `renderer`; Fahrenheit
+    returns one built by `make(theme)` from `fahrenheit_theme(renderer.theme)`, kept in `cache` (a dict the caller
+    owns) until `renderer` changes, so a theme is rebuilt once per theme change, not once per frame."""
+    if unit != "fahrenheit":
+        return renderer
+    if cache.get("for") is not renderer:
+        theme = fahrenheit_theme(renderer.theme)
+        cache["for"], cache["drawn"] = renderer, (renderer if theme is renderer.theme else make(theme))
+    return cache["drawn"]
+
+
 CELSIUS_MODULES = ("temps", "ring", "stat")  # libre_panel modules that write "°C" with 20..100 bars and heat rules at 75 and 88
 
 

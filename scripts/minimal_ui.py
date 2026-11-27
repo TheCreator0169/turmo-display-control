@@ -4,7 +4,7 @@ the layout is smaller. Settings has the App theme choice, where Default brings b
 
 import tkinter as tk
 
-from scripts.i18n import tr
+from scripts.i18n import port_text, tr
 from scripts.gui_design import LINK_LABELS, ICON_FONT, NO_VALUE, SIDEBAR_ITEMS, mix, PALETTE, is_custom_theme, SENSOR_NAMES, metric_text, sensor_format
 from scripts.gui_widgets import (Badge, ChoiceTile, RoundedCard, ScrollFrame, Segmented, Select, Slider, Switch,
                                  make_button)
@@ -276,11 +276,11 @@ class MinimalView(tk.Frame):
             label, level = LINK_LABELS[link]
             self._state.set(tr(label), PALETTE["warn" if level == "busy" else "crit"])
         else:
-            self._state.set("Running" if running else "Stopped", PALETTE["green"] if running else PALETTE["muted"])
+            self._state.set(tr("Running") if running else tr("Stopped"), PALETTE["green"] if running else PALETTE["muted"])
         accent = PALETTE["crit"] if running else PALETTE["cyan"]  # Stop is red, Start is the accent colour
         self._toggle.config(text=tr("Stop") if running else tr("Start"), bg=accent, fg=PALETTE["on_accent"],
                             active_bg=mix(accent, "#FFFFFF", 0.88))
-        port = app.port_var.get().replace(" ✓", "")
+        port = port_text(app.port_var.get()).replace(" ✓", "")
         self._port.config(text=port)
         self._port_info.config(text=port)
         for key, (percent, temp) in read_meters(app).items():

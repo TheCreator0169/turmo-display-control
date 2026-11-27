@@ -1232,9 +1232,17 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
         # Hardware
         inner = card(left, tr("Hardware"), top=0)
         holder = line(inner, tr("TURMO port"))
-        self.port_var = tk.StringVar(value="Detecting...")
-        tk.Label(holder, textvariable=self.port_var, bg=bg2, fg=PALETTE["text"],
-                 font=("Cascadia Code", 10, "bold")).pack(side=tk.LEFT, padx=(0, 12))
+        self.port_var = tk.StringVar(value="Detecting...")  # the logic reads these English values; the label shows them translated
+        port_label = tk.Label(holder, text=i18n.port_text(self.port_var.get()), bg=bg2, fg=PALETTE["text"],
+                              font=("Cascadia Code", 10, "bold"))
+        port_label.pack(side=tk.LEFT, padx=(0, 12))
+
+        def show_port(*_):
+            try:
+                port_label.config(text=i18n.port_text(self.port_var.get()))
+            except tk.TclError:  # ok: the label went away with a rebuilt window
+                pass
+        self.port_var.trace_add("write", show_port)
         make_button(holder, tr("Refresh"), self.refresh_port, font, variant="ghost", backdrop=bg2, small=True).pack(
             side=tk.LEFT, padx=(0, 8))
         make_button(holder, tr("Scan all ports"), self.show_all_ports, font, variant="ghost", backdrop=bg2,
@@ -2485,12 +2493,12 @@ class TurmoApp(AboutPage, GraphPage, PreviewPage, DiagnosticsPage, GalleryPage, 
 
         menu = pystray.Menu(
             pystray.MenuItem("Show", on_click, default=True, visible=False),  # the click, not a menu line
-            pystray.MenuItem("Open TURMO", on_show),
+            pystray.MenuItem(lambda item: tr("Open TURMO"), on_show),  # a function: the text follows the language when the menu opens
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Start Monitor", on_start),
-            pystray.MenuItem("Stop Monitor", on_stop),
+            pystray.MenuItem(lambda item: tr("Start Monitor"), on_start),
+            pystray.MenuItem(lambda item: tr("Stop Monitor"), on_stop),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", on_quit)
+            pystray.MenuItem(lambda item: tr("Quit"), on_quit)
         )
 
         self.tray_icon = pystray.Icon("TURMO", create_image(), "TURMO Display", menu)

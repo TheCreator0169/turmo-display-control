@@ -55,6 +55,12 @@ def tr(text):
     return entry[_INDEX[_current]]
 
 
+def port_text(value):
+    """What a window shows for the TURMO port text: the three fixed messages translated, a COM port as it is. The
+    StringVar behind it keeps the English values, because the logic reads them."""
+    return tr(value) if value in ("Detecting...", "Busy / In Use ⚠", "Not found ✗") else value
+
+
 TABLE = {
     "Logs": ("Journaux", "Registros"),
     "Keep the log files small: old ones are removed by themselves.": ("Garde les journaux petits : les anciens sont supprimés tout seuls.", "Mantém os registros pequenos: os antigos são removidos sozinhos."),
@@ -265,6 +271,9 @@ TABLE = {
     "OK": ("OK", "OK"),
     "Open Live Preview →": ("Ouvrir l'aperçu en direct →", "Abrir pré-visualização ao vivo →"),
     "Open TURMO": ("Ouvrir TURMO", "Abrir o TURMO"),
+    "Quit": ("Quitter", "Sair"),
+    "Start Monitor": ("Démarrer le moniteur", "Iniciar o monitor"),
+    "Stop Monitor": ("Arrêter le moniteur", "Parar o monitor"),
     "Open full diagnostics": ("Ouvrir les diagnostics complets", "Abrir diagnóstico completo"),
     "Orientation": ("Orientation", "Orientação"),
     "POSITION AND SIZE": ("POSITION ET TAILLE", "POSIÇÃO E TAMANHO"),

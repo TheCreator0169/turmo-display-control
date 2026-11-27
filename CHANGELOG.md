@@ -3,6 +3,12 @@ TURMO - CHANGELOG
 
 Builds, hashes and test results of every build are in BUILD_HISTORY.md.
 
+v0.3.8.2 (2026-11-21)
+----------------------
+- Fix: with Fahrenheit chosen, the landscape themes showed the number without a letter on the screen (142°). They now show 142°F. Celsius is unchanged.
+- Fix: in a short window the Theme Editor squeezed the "IN THIS THEME" list to almost nothing. The left column now scrolls and the list keeps its height.
+- The tray menu, the Running/Stopped badges and the port text of the Hardware card now follow the language (English, Français, Português).
+
 v0.3.8.1 (2026-11-21)
 ----------------------
 - Fix: a Monitor that started at the very moment the window scanned the process list could be counted as a second Monitor for one scan (the parent of a brand-new process was unknown).

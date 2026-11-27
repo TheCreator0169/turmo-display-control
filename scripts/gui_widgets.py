@@ -1461,4 +1461,15 @@ class ScrollFrame(tk.Frame):
         if under is not None and isinstance(under.winfo_toplevel(), SelectList):
             return  # an open drop-down list takes the wheel
         if self._bar.winfo_manager() and under is not None and str(under).startswith(str(self)):
+            if self._inner_scroll_takes(under):
+                return  # a list inside this one (the Theme Editor's layers) scrolls instead of this frame
             self._canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _inner_scroll_takes(self, under):
+        """True when `under` sits in another ScrollFrame, nested in this one, whose scroll bar is showing."""
+        w = under
+        while w is not None and w is not self:
+            if isinstance(w, ScrollFrame) and w is not self and w._bar.winfo_manager():
+                return True
+            w = w.master
+        return False

@@ -1157,7 +1157,7 @@ def cmd_test_image(_args: argparse.Namespace) -> int:
 
 def cmd_render_theme(_args: argparse.Namespace) -> int:
     global _disp
-    from settings import LinkStatus, SerialTimer, Settings, correct_panel, dim_image, keeps_celsius, temps_in_unit
+    from settings import LinkStatus, SerialTimer, Settings, correct_panel, dim_image, keeps_celsius, renderer_for_unit, temps_in_unit
     settings = Settings.load()
     from runtime_logging import set_enabled as _set_logging
     _set_logging(settings.logging_enabled)
@@ -1198,6 +1198,7 @@ def cmd_render_theme(_args: argparse.Namespace) -> int:
             return 1
         img, cfg = Image.new("RGB", (W, H)), {}
 
+    _unit_cache = {}  # the Fahrenheit renderer of the current theme (settings.renderer_for_unit)
     link_status = link = None
     if _args.once:
         _disp = disp = TurmoDisplay(port, landscape=landscape)
@@ -1397,7 +1398,7 @@ def cmd_render_theme(_args: argparse.Namespace) -> int:
                     unit = "celsius" if celsius_only else live.units.get("temp")  # Settings > Units, hot
                     shown, shown_hist = temps_in_unit(readings, _hist, unit)
                     drawn = snap if shown is readings else Snapshot(readings=shown, history=dict(shown_hist))
-                    frame, _box = renderer.render(drawn)
+                    frame, _box = renderer_for_unit(renderer, unit, _unit_cache, Renderer).render(drawn)  # Fahrenheit: °F after the number
                     frame = frame.convert("RGB").resize((W, H), Image.LANCZOS)
                     # Brightness slider of the GUI: re-read each frame so a change applies while running
                     try:

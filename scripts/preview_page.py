@@ -277,6 +277,7 @@ class PreviewPage:
                     self._preview_err = f"Theme load: {e}"  # ok: the error is kept in _preview_err and shown
                     return
                 self._preview_renderer = Renderer(theme, preview=True)
+                self._preview_unit_cache = {}
                 self._preview_celsius_only = keeps_celsius(theme_path)  # a "temps" module is Celsius-only
                 self._preview_renderer_key = theme_name
                 self._preview_provider = PsutilProvider()
@@ -350,7 +351,7 @@ class PreviewPage:
                 unit = "celsius" if getattr(self, "_preview_celsius_only", False) else self.temp_unit_for_thread()
                 shown, shown_hist = temps_in_unit(readings, self._preview_hist, unit)  # as the Monitor does
                 snap = Snapshot(readings=shown, history=dict(shown_hist))
-                frame, _ = renderer.render(snap)
+                frame, _ = renderer_for_unit(renderer, unit, self._preview_unit_cache, lambda t: Renderer(t, preview=True)).render(snap)
                 frame = frame.convert("RGB")
                 self._save_theme_picture(theme_name, frame)  # before the dimming: the picture is the theme, not the brightness
                 frame = dim_image(frame, self.settings.brightness)  # same dimming as the Monitor

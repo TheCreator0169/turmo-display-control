@@ -263,7 +263,7 @@ else:
 GUI_EXE = TURMO_MONITOR_EXE.with_name("TURMO-Display-Control.exe")  # what the Start-with-Windows entry runs
 
 from scripts.settings import (GAIN_RANGE, Settings, dim_image, gain_values, keeps_celsius, read_link_status, read_serial_stats,
-                              temps_in_unit)
+                              renderer_for_unit, temps_in_unit)
 from scripts import theme_paths
 from scripts import startup_entry
 from scripts.errors import friendly_error  # noqa: E402,F401

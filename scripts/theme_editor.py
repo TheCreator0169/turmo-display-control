@@ -189,9 +189,13 @@ class ThemeEditor:
         # Left: the widget palette as tiles
         left = RoundedCard(panes, bg2, PALETTE["line"], bg0)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-        tk.Label(left.inner, text=tr("WIDGETS"), bg=bg2, fg=PALETTE["muted"], font=(app.ui_font, 8, "bold"),
+        # v0.3.8.2: the column scrolls when the window is short (1366x768 at 125 % and more left the list under 50 px)
+        column = ScrollFrame(left.inner, bg2, stretch=True)
+        column._canvas.configure(width=1)  # a Canvas asks for 378 px by default
+        column.pack(fill=tk.BOTH, expand=True)
+        tk.Label(column.body, text=tr("WIDGETS"), bg=bg2, fg=PALETTE["muted"], font=(app.ui_font, 8, "bold"),
                  anchor="w").pack(fill=tk.X, padx=14, pady=(14, 8))
-        tiles = tk.Frame(left.inner, bg=bg2)
+        tiles = tk.Frame(column.body, bg=bg2)
         tiles.pack(fill=tk.X, padx=14, pady=(0, 14))
         tiles.columnconfigure(0, weight=1, uniform="tile")
         tiles.columnconfigure(1, weight=1, uniform="tile")
@@ -213,12 +217,14 @@ class ThemeEditor:
                                                           pady=(0, 8) if i < 6 else 0)
 
         # Under the palette: the widgets already in the theme, to pick one without hunting for it on the canvas
-        tk.Frame(left.inner, bg=PALETTE["line"], height=1).pack(fill=tk.X)
-        self._layers_title = tk.Label(left.inner, text=tr("IN THIS THEME"), bg=bg2, fg=PALETTE["muted"],
+        tk.Frame(column.body, bg=PALETTE["line"], height=1).pack(fill=tk.X)
+        self._layers_title = tk.Label(column.body, text=tr("IN THIS THEME"), bg=bg2, fg=PALETTE["muted"],
                                       font=(app.ui_font, 8, "bold"), anchor="w")
         self._layers_title.pack(fill=tk.X, padx=14, pady=(12, 8))
-        self._layers = ScrollFrame(left.inner, bg2)
-        self._layers._canvas.configure(width=1)  # a Canvas asks for 378 px by default, which widened the column
+        self._layers = ScrollFrame(column.body, bg2)
+        # width=1: a Canvas asks for 378 px by default, which widened the column. The height is the least the list
+        # keeps (about three rows, what it has at the normal window size); the column above scrolls instead of squeezing it away.
+        self._layers._canvas.configure(width=1, height=self.app.px(120))
         self._layers.pack(fill=tk.BOTH, expand=True, padx=(14, 6), pady=(0, 12))
         self._layers_sig = None
 

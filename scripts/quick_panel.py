@@ -8,7 +8,7 @@ import tkinter as tk
 from ctypes import wintypes
 
 from scripts.gui_design import PALETTE, temp_in
-from scripts.i18n import tr
+from scripts.i18n import port_text, tr
 from scripts.gui_widgets import Badge, RoundedCard, Slider, make_button
 
 def transparent_key():
@@ -196,10 +196,10 @@ class QuickPanel:
     def _refresh(self):
         app = self.app
         running = app.monitor_status_var.get().startswith("Running")
-        self._state.set("Running" if running else "Stopped", PALETTE["green"] if running else PALETTE["muted"])
+        self._state.set(tr("Running") if running else tr("Stopped"), PALETTE["green"] if running else PALETTE["muted"])
         self._toggle_btn.config(text=tr("Stop monitor") if running else tr("Start monitor"))
         port = getattr(app, "port_var", None)
-        self._port.config(text=(port.get() if port is not None else "").replace(" ✓", ""))
+        self._port.config(text=port_text(port.get() if port is not None else "").replace(" ✓", ""))
         for key, (percent, temp) in read_meters(app).items():
             draw_meter(*self._meters[key], percent, temp, app.temp_unit())
 

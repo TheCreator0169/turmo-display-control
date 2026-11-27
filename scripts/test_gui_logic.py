@@ -1312,6 +1312,30 @@ class StopMonitorReviewFindings(unittest.TestCase):
         self.assertNotIn("MONITOR_KILL_FAILED", [c.args[0] for c in log_event.call_args_list])
 
 
+class TrayAndPortWords(unittest.TestCase):
+    """v0.3.8.2: the tray menu, the Running/Stopped badges and the Hardware card's port text follow the language."""
+
+    def setUp(self):
+        self.addCleanup(app.i18n.set_language, "en")
+
+    def test_the_port_text_is_translated_but_a_com_port_and_the_logic_values_are_not(self):
+        app.i18n.set_language("fr")
+        self.assertEqual(app.i18n.port_text("Not found ✗"), "Introuvable ✗")
+        self.assertEqual(app.i18n.port_text("Busy / In Use ⚠"), "Occupé ⚠")
+        self.assertEqual(app.i18n.port_text("Detecting..."), "Détection...")
+        self.assertEqual(app.i18n.port_text("COM4 ✓"), "COM4 ✓")
+        app.i18n.set_language("en")
+        self.assertEqual(app.i18n.port_text("Not found ✗"), "Not found ✗")
+
+    def test_the_tray_words_exist_in_both_languages(self):
+        for text, fr, pt in (("Quit", "Quitter", "Sair"), ("Start Monitor", "Démarrer le moniteur", "Iniciar o monitor"),
+                             ("Stop Monitor", "Arrêter le moniteur", "Parar o monitor"), ("Open TURMO", "Ouvrir TURMO", "Abrir o TURMO"),
+                             ("Running", "En cours", "Em execução"), ("Stopped", "Arrêté", "Parado")):
+            for lang, want in (("fr", fr), ("pt", pt), ("en", text)):
+                app.i18n.set_language(lang)
+                self.assertEqual(app.i18n.tr(text), want, (text, lang))
+
+
 class TrayQuitDeferred(unittest.TestCase):
     def test_quit_menu_item_hands_off_to_the_tk_thread(self):
         obj = make_app()
@@ -1321,6 +1345,9 @@ class TrayQuitDeferred(unittest.TestCase):
         fake_pystray = mock.Mock(name="pystray")
 
         def menu_item(label, action=None, **_kwargs):
+            if _kwargs.get("visible") is not False:  # the hidden click item never shows its text
+                self.assertTrue(callable(label), "tray text must be a function so it follows the language")  # v0.3.8.2
+                label = label(None)
             actions[label] = action
             return mock.Mock(name=f"MenuItem({label})")
 
@@ -1331,6 +1358,7 @@ class TrayQuitDeferred(unittest.TestCase):
                 mock.patch.object(app.threading, "Thread", FakeThread):
             obj.start_tray()
         icon = obj.tray_icon
+        self.assertEqual({"Open TURMO", "Start Monitor", "Stop Monitor", "Quit"} - set(actions), set())  # all four lines, English
         actions["Quit"](icon, None)  # what pystray calls on its own thread
         obj._quit_from_tray.assert_not_called()  # must not run on the pystray thread
         obj.root.after.assert_called_once()
@@ -1757,6 +1785,62 @@ class LcdTemperatureUnit(unittest.TestCase):
         self.assertTrue(self.s.keeps_celsius(themes / "hardware-dashboard"))
         self.assertFalse(self.s.keeps_celsius(themes / "cyberpunk-neon"))
         self.assertFalse(self.s.keeps_celsius(themes / "no-such-theme"))
+
+    def test_every_official_theme_shows_a_unit_letter_in_fahrenheit_and_celsius_is_unchanged(self):
+        """v0.3.8.2: the landscape themes wrote a bare "°" and showed "140°" in Fahrenheit. In Fahrenheit the
+        letter is added (140°F); Celsius keeps its own text, so the 6 landscape themes still read 61°."""
+        from libre_panel.render.formatting import safe_format
+        from libre_panel.theme.model import load_theme
+        themes = Path(__file__).resolve().parent.parent / "themes"
+        checked = 0
+        for folder in sorted(p for p in themes.iterdir() if (p / "theme.json").is_file()):
+            theme = load_theme(folder.resolve())
+            temps = [w for w in theme.widgets if str(w.get("sensor", "")).endswith(".temp") and w.get("type") == "metric"]
+            f_theme = self.s.fahrenheit_theme(theme)
+            for before, after in zip(theme.widgets, f_theme.widgets):
+                if before in temps:
+                    self.assertTrue(safe_format(after["format"], 140.0, "°F", "").endswith("°F"), (folder.name, after["format"]))
+                    self.assertEqual(safe_format(after["format"], 140.0, "°F", ""), "140°F", folder.name)
+                    checked += 1
+                else:
+                    self.assertEqual(before, after, folder.name)  # nothing else changes
+            if not temps:
+                self.assertIs(f_theme, theme, folder.name)  # no temperature widget: the same object
+            self.assertEqual([w.get("format") for w in theme.widgets], [w.get("format") for w in load_theme(folder.resolve()).widgets])  # input not edited
+        self.assertGreaterEqual(checked, 24)  # 6 landscape and 6 portrait themes, CPU and GPU
+
+    def test_the_monitor_and_the_live_preview_draw_through_the_unit_renderer(self):
+        """The wiring: without these calls every other Fahrenheit test stays green and the LCD shows 140° again."""
+        scripts = Path(__file__).resolve().parent
+        for name in ("turmo_runtime.py", "preview_page.py"):
+            self.assertIn("renderer_for_unit(", (scripts / name).read_text(encoding="utf-8"), name)
+
+    def test_portrait_themes_are_returned_untouched_in_fahrenheit(self):
+        from libre_panel.theme.model import load_theme
+        themes = Path(__file__).resolve().parent.parent / "themes"
+        folders = [p for p in themes.iterdir() if p.name.endswith("-320x480") and (p / "theme.json").is_file()]
+        self.assertGreaterEqual(len(folders), 6)
+        for folder in folders:
+            theme = load_theme(folder.resolve())
+            self.assertIs(self.s.fahrenheit_theme(theme), theme, folder.name)  # their {unit} already says F
+
+    def test_the_renderer_for_the_unit_is_built_once_per_theme_and_only_for_fahrenheit(self):
+        from types import SimpleNamespace
+        from libre_panel.theme.model import load_theme
+        themes = Path(__file__).resolve().parent.parent / "themes"
+        landscape = SimpleNamespace(theme=load_theme((themes / "cyberpunk-neon").resolve()))
+        dashboard = SimpleNamespace(theme=load_theme((themes / "hardware-dashboard").resolve()))
+        built, cache = [], {}
+        make = lambda theme: built.append(theme) or SimpleNamespace(theme=theme)
+        self.assertIs(self.s.renderer_for_unit(landscape, "celsius", cache, make), landscape)
+        self.assertIs(self.s.renderer_for_unit(landscape, None, cache, make), landscape)
+        self.assertEqual(built, [])  # Celsius builds nothing
+        first = self.s.renderer_for_unit(landscape, "fahrenheit", cache, make)
+        self.assertIsNot(first, landscape)
+        self.assertIs(self.s.renderer_for_unit(landscape, "fahrenheit", cache, make), first)
+        self.assertEqual(len(built), 1)  # built once, not once per frame
+        self.assertIs(self.s.renderer_for_unit(dashboard, "fahrenheit", cache, make), dashboard)  # no temp widget: same one
+        self.assertEqual(len(built), 1)
 
     def test_the_portrait_themes_write_the_unit_not_a_fixed_c(self):
         """A fixed "°C" in the format would read 140°C after the conversion."""

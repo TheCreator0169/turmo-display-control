@@ -174,6 +174,31 @@ def run():
         print(f"[8c] window size modes: FAIL ({e})")
         results["window_size"] = False
 
+    # 8c2. v0.3.8.2: in a short window the Theme Editor's left column scrolls and the "IN THIS THEME" list keeps its
+    # minimum height (it was squeezed to 50 px). At the normal window height the column does not scroll.
+    try:
+        from scripts.gui_design import SIDEBAR_ITEMS
+        app.show_window()
+        app.select_tab(SIDEBAR_ITEMS.index("Theme Editor"))
+        root.update()
+        editor = app.theme_editor
+        flat = lambda w: [w] + [x for c in w.winfo_children() for x in flat(c)]
+        column = [w for w in flat(app.nb.nametowidget(app.nb.select())) if type(w).__name__ == "ScrollFrame"
+                  and w is not editor._layers and str(editor._layers).startswith(str(w))][0]
+        root.minsize(300, 300)
+        root.geometry("1200x540"); root.update(); root.update()
+        assert editor._layers._canvas.winfo_height() >= app.px(120), editor._layers._canvas.winfo_height()
+        assert column._bar.winfo_manager(), "a short window: the column should scroll"
+        root.geometry("%dx%d" % tuple(app._window_sizes()[0])); root.update(); root.update()
+        assert not column._bar.winfo_manager(), "the normal window height: the column should not scroll"
+        root.minsize(*app._window_sizes()[0]); root.update()  # the size the next blocks expect
+        app.select_tab(0); root.update()  # leave the first page open for the next blocks
+        print("[8c2] Theme Editor list keeps its height in a short window: PASS")
+        results["editor_list_height"] = True
+    except Exception as e:
+        print(f"[8c2] Theme Editor list height: FAIL ({e})")
+        results["editor_list_height"] = False
+
     # 8d. v0.2.4: Gallery, Sensors & Graphs, Diagnostics and About are empty frames until opened; each keeps its
     # place in the notebook, a rebuild (theme switch) drops what they made, and opening one builds it again.
     try:
