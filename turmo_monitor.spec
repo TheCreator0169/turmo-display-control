@@ -174,26 +174,35 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
+# Onedir (v0.3.8.5): nothing is unpacked at start, so no temp folder can vanish ("Failed to load Python DLL").
+# No UPX: a packed python DLL is slower to load and flagged more often by scanners.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="TURMO-Monitor",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=True,  # Console for logging output
-    onefile=True,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=str(PROJECT_ROOT / "assets" / "turmo_icon.png"),
     version=write_version_file(PROJECT_ROOT / "build" / "version_TURMO-Monitor.txt", "TURMO Monitor", "TURMO-Monitor"),
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name="TURMO-Monitor",
 )

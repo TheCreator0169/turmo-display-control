@@ -36,13 +36,18 @@ Name: "desktopicon"; Description: "Desktop shortcut"; Flags: unchecked
 Name: "startup"; Description: "Start TURMO with Windows"; Flags: unchecked
 
 [Files]
-Source: "..\dist\TURMO-Display-Control.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\TURMO-Monitor.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Onedir builds (v0.3.8.5): the GUI sits in {app} with its _internal folder, the Monitor in its own folder. Nothing is unpacked at start.
+Source: "..\dist\TURMO-Display-Control\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+Source: "..\dist\TURMO-Monitor\*"; DestDir: "{app}\TURMO-Monitor"; Flags: ignoreversion recursesubdirs
 ; The CPU temperature helper is a separate onedir build (turmo_cpumonitor_helper.spec), unchanged between releases.
 Source: "..\dist\TURMO-CpuTempHelper\*"; DestDir: "{app}\TURMO-CpuTempHelper"; Flags: ignoreversion recursesubdirs
 Source: "helper_task.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+
+[InstallDelete]
+; The one-file Monitor of v0.3.8.4 and older (the Monitor now lives in the TURMO-Monitor folder)
+Type: files; Name: "{app}\TURMO-Monitor.exe"
 
 [Icons]
 Name: "{group}\TURMO Display Control"; Filename: "{app}\TURMO-Display-Control.exe"

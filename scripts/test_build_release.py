@@ -65,14 +65,42 @@ class BackupNaming(unittest.TestCase):
         root = pathlib.Path(tempfile.mkdtemp())
         (root / "dist").mkdir()
         (root / "archives").mkdir()
-        (root / "dist" / "TURMO-Monitor.exe").write_bytes(b"new")
+        (root / "dist" / "TURMO-Monitor").mkdir()
+        exe = root / "dist" / "TURMO-Monitor" / "TURMO-Monitor.exe"
+        exe.write_bytes(b"new")
         with mock.patch.object(br, "ROOT", root):
             first = br.backup_previous("v0.1.8")
-            (root / "dist" / "TURMO-Monitor.exe").write_bytes(b"newer")
+            exe.write_bytes(b"newer")
             second = br.backup_previous("v0.1.8")
         self.assertNotEqual(first, second)
-        self.assertEqual((first / "TURMO-Monitor.exe").read_bytes(), b"new")
-        self.assertEqual((second / "TURMO-Monitor.exe").read_bytes(), b"newer")
+        self.assertEqual((first / "TURMO-Monitor" / "TURMO-Monitor.exe").read_bytes(), b"new")
+        self.assertEqual((second / "TURMO-Monitor" / "TURMO-Monitor.exe").read_bytes(), b"newer")
+
+
+class OnedirLayout(unittest.TestCase):
+    """v0.3.8.5: the GUI and the Monitor are onedir builds: no unpacking at start (a one-file exe once failed with
+    "Failed to load Python DLL" when its temp folder was gone), the installer ships the folders."""
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+    def test_both_specs_build_a_folder_without_upx(self):
+        for spec in ("turmo.spec", "turmo_monitor.spec"):
+            text = (self.ROOT / spec).read_text(encoding="utf-8")
+            self.assertIn("COLLECT(", text, spec)
+            self.assertIn("exclude_binaries=True", text, spec)
+            self.assertNotIn("onefile=True", text, spec)
+            self.assertNotIn("upx=True", text, spec)
+
+    def test_the_build_script_and_the_installer_use_the_folders(self):
+        self.assertEqual(br.OUTPUTS, ["TURMO-Display-Control/TURMO-Display-Control.exe", "TURMO-Monitor/TURMO-Monitor.exe"])
+        iss = (self.ROOT / "installer" / "turmo.iss").read_text(encoding="utf-8")
+        self.assertIn('Source: "..\dist\TURMO-Display-Control\*"; DestDir: "{app}"', iss)
+        self.assertIn('Source: "..\dist\TURMO-Monitor\*"; DestDir: "{app}\TURMO-Monitor"', iss)
+        self.assertIn('Name: "{app}\TURMO-Monitor.exe"', iss)  # the old one-file Monitor is removed on upgrade
+
+    def test_the_app_finds_the_monitor_in_its_folder(self):
+        text = (self.ROOT / "scripts" / "gui_common.py").read_text(encoding="utf-8")
+        self.assertIn('EXE_DIR / "TURMO-Monitor" / "TURMO-Monitor.exe"', text)
+        self.assertIn('GUI_EXE = Path(sys.executable)', text)
 
 
 class ExeVersion(unittest.TestCase):
@@ -124,7 +152,7 @@ class AppIconStaysInTheBuild(unittest.TestCase):
     def test_the_built_exes_carry_an_icon(self):
         import ctypes
         for exe in ("TURMO-Display-Control.exe", "TURMO-Monitor.exe"):
-            path = self.ROOT / "dist" / exe
+            path = self.ROOT / "dist" / exe[:-4] / exe
             if not path.is_file():
                 self.skipTest(f"{exe} is not built")
             count = ctypes.windll.shell32.ExtractIconExW(str(path), -1, None, None, 0)

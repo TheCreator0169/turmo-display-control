@@ -25,7 +25,9 @@ PY = ROOT / ".venv-win" / "Scripts" / "python.exe"
 if not PY.exists():  # CI: no project venv, use the running interpreter
     PY = pathlib.Path(sys.executable)
 SPECS = ["turmo.spec", "turmo_monitor.spec"]
-OUTPUTS = ["TURMO-Display-Control.exe", "TURMO-Monitor.exe"]
+# Onedir folders (v0.3.8.5): the exe sits inside its folder, next to _internal
+OUTPUTS = ["TURMO-Display-Control/TURMO-Display-Control.exe", "TURMO-Monitor/TURMO-Monitor.exe"]
+FOLDERS = ["TURMO-Display-Control", "TURMO-Monitor"]
 
 
 def git(*args):
@@ -50,7 +52,7 @@ def backup_previous(version):
     If that folder already exists (an earlier build of the same version), the time is added to
     the name, so nothing is overwritten. Returns the backup folder, or None when there is nothing
     to back up."""
-    existing = [ROOT / "dist" / name for name in OUTPUTS if (ROOT / "dist" / name).exists()]
+    existing = [ROOT / "dist" / name for name in FOLDERS if (ROOT / "dist" / name).exists()]
     if not existing:
         return None
     now = datetime.datetime.now()
@@ -62,8 +64,10 @@ def backup_previous(version):
     dest.mkdir(parents=True)
     lines = []
     for src in existing:
-        shutil.copy2(src, dest / src.name)
-        lines.append(f"{sha256(src)}  {src.name}")
+        shutil.copytree(src, dest / src.name)
+        exe = src / (src.name + ".exe")
+        if exe.is_file():
+            lines.append(f"{sha256(exe)}  {src.name}/{exe.name}")
     (dest / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return dest
 
@@ -110,7 +114,7 @@ def main(argv):
     if dirty:
         print("refusing to build: the git tree is not clean:\n" + dirty)
         return 1
-    busy = [name for name in OUTPUTS if in_use(ROOT / "dist" / name)]
+    busy = [name for name in OUTPUTS if in_use(ROOT / "dist" / name)]  # the exe of each folder
     if busy:
         print("refusing to build: these dist files are in use (stop the program first): " + ", ".join(busy))
         return 1

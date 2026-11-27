@@ -3,6 +3,11 @@ TURMO - CHANGELOG
 
 Builds, hashes and test results of every build are in BUILD_HISTORY.md.
 
+v0.3.8.5 (2026-11-27)
+----------------------
+- Fix: "Failed to load Python DLL ... python314.dll" could appear when TURMO started right after an update. The window and the Monitor were single-file programs that unpack themselves into a temporary folder at every start (about 5 seconds); if that folder disappeared in that moment, Windows could not find the DLL. Both are now folders of files like the CPU temperature helper: nothing is unpacked, so the error cannot happen, and TURMO starts faster.
+- The installer puts the window in the install folder and the Monitor in its own TURMO-Monitor folder, and removes the old single-file Monitor.
+
 v0.3.8.4 (2026-11-27)
 ----------------------
 - Fix: pressing Update started the installer but TURMO stayed open (its close button only hides it in the tray), so the installer could not close it and asked the user to end it in the Task Manager. TURMO now quits by itself a moment after the installer starts, and the installer closes any copy still running without asking.

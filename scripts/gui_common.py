@@ -212,9 +212,9 @@ if getattr(sys, 'frozen', False):
     else:
         DATA_ROOT = BUNDLE_DIR
 
-    # Use bundled monitor worker executable (headless, console) - it's alongside the main exe
-    # For onedir: in _internal/  For onefile: alongside main exe in installation dir
-    TURMO_MONITOR_EXE = EXE_DIR / "TURMO-Monitor.exe"
+    # The Monitor (headless worker) is its own onedir folder next to the main exe (v0.3.8.5)
+    TURMO_MONITOR_EXE = EXE_DIR / "TURMO-Monitor" / "TURMO-Monitor.exe"
+    GUI_EXE = Path(sys.executable)
     TURMO_RUNTIME_SCRIPT = DATA_ROOT / "scripts" / "turmo_runtime.py"
 
     # Add bundle dir to sys.path so imports like "libre_panel", "scripts" work
@@ -257,11 +257,12 @@ else:
     # Running from source
     BUNDLE_DIR = PROJECT_ROOT
     DATA_ROOT = PROJECT_ROOT
-    TURMO_MONITOR_EXE = PROJECT_ROOT / "dist" / "TURMO-Monitor.exe"
+    TURMO_MONITOR_EXE = PROJECT_ROOT / "dist" / "TURMO-Monitor" / "TURMO-Monitor.exe"
+    GUI_EXE = PROJECT_ROOT / "dist" / "TURMO-Display-Control" / "TURMO-Display-Control.exe"
     TURMO_RUNTIME_SCRIPT = PROJECT_ROOT / "scripts" / "turmo_runtime.py"
     from scripts.turmo_runtime import find_turmo_port, scan_all_ports, load_theme, LANDSCAPE_SIZE, TURING_SIZE, _preinit_libre_hardware_monitor
 
-GUI_EXE = TURMO_MONITOR_EXE.with_name("TURMO-Display-Control.exe")  # what the Start-with-Windows entry runs
+# GUI_EXE (set above) is what the Start-with-Windows entry runs
 
 from scripts.settings import (GAIN_RANGE, Settings, dim_image, gain_values, keeps_celsius, read_link_status, read_serial_stats,
                               renderer_for_unit, temps_in_unit)
