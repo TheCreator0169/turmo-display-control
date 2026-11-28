@@ -1,10 +1,18 @@
 # Registers or removes the elevated scheduled task "TURMO CpuTemp Helper" (same task and XML as the Settings button).
 # Run by the installer (already admin). Usage: helper_task.ps1 -Action install|remove [-Dir <folder with TURMO-CpuTempHelper.exe>]
-param([Parameter(Mandatory)][ValidateSet('install','remove')][string]$Action, [string]$Dir = '')
+param([Parameter(Mandatory)][ValidateSet('install','remove','stop-app')][string]$Action, [string]$Dir = '')
 $ErrorActionPreference = 'Stop'
 $task = 'TURMO CpuTemp Helper'
 try {
-  if ($Action -eq 'install') {
+  if ($Action -eq 'stop-app') {
+    # Uninstall while TURMO runs (v0.3.8.6): Dir is the install folder. Stop the GUI and the Monitor started from it, by exact path
+    # (never by name); the helper is left to the 'remove' action. A bootloader and its child share the path, so both are stopped.
+    $root = (Join-Path $Dir '*')
+    $skip = Join-Path $Dir 'TURMO-CpuTempHelper\*'
+    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like $root -and $_.ExecutablePath -notlike $skip } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 800   # let Windows release the file locks
+  } elseif ($Action -eq 'install') {
     $exe = Join-Path $Dir 'TURMO-CpuTempHelper.exe'
     if (-not (Test-Path -LiteralPath $exe)) { throw "helper not found: $exe" }
     $user = "$env:USERDOMAIN\$env:USERNAME"

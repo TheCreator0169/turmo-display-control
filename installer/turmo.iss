@@ -84,7 +84,14 @@ end;
 
 // Uninstall asks whether to keep settings and custom themes (default: keep).
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Code: Integer;
 begin
+  // v0.3.8.6: the uninstaller has no Restart Manager step. With the window or the Monitor running, their files stayed locked and the
+  // install folder was left behind (seen in Windows Sandbox). Stop them first, by the exact path of this install.
+  if CurUninstallStep = usUninstall then
+    Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\helper_task.ps1') +
+      '" -Action stop-app -Dir "' + ExpandConstant('{app}') + '"', '', SW_HIDE, ewWaitUntilTerminated, Code);
   if (CurUninstallStep = usPostUninstall) and (not UninstallSilent) then
     if MsgBox('Also delete your settings and custom themes (%APPDATA%\TURMO)?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
       DelTree(ExpandConstant('{userappdata}\TURMO'), True, True, True);

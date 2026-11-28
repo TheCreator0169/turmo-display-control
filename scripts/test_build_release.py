@@ -97,6 +97,39 @@ class OnedirLayout(unittest.TestCase):
         self.assertIn('Source: "..\dist\TURMO-Monitor\*"; DestDir: "{app}\TURMO-Monitor"', iss)
         self.assertIn('Name: "{app}\TURMO-Monitor.exe"', iss)  # the old one-file Monitor is removed on upgrade
 
+    def test_the_uninstaller_stops_the_running_app_first(self):
+        iss = (self.ROOT / "installer" / "turmo.iss").read_text(encoding="utf-8")
+        self.assertIn("CurUninstallStep = usUninstall", iss)
+        self.assertIn("-Action stop-app", iss)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows only")
+    def test_stop_app_stops_only_processes_started_from_the_folder(self):
+        """A fake 'install folder' holds a copy of ping.exe (long run); another copy lives elsewhere and must survive."""
+        import shutil, subprocess, tempfile, time
+        ping = pathlib.Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE"
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            inside = pathlib.Path(a) / "TURMO-Monitor.exe"
+            helper_dir = pathlib.Path(a) / "TURMO-CpuTempHelper"
+            helper_dir.mkdir()
+            helper = helper_dir / "TURMO-CpuTempHelper.exe"
+            outside = pathlib.Path(b) / "other.exe"
+            for dst in (inside, helper, outside):
+                shutil.copy(ping, dst)
+            procs = [subprocess.Popen([str(p), "-t", "127.0.0.1"], stdout=subprocess.DEVNULL) for p in (inside, helper, outside)]
+            try:
+                time.sleep(1)
+                subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                str(self.ROOT / "installer" / "helper_task.ps1"), "-Action", "stop-app", "-Dir", a],
+                               check=True, timeout=60)
+                self.assertIsNotNone(procs[0].poll(), "the app process was not stopped")
+                self.assertIsNone(procs[1].poll(), "the helper must be left to the remove action")
+                self.assertIsNone(procs[2].poll(), "a process outside the install folder was stopped")
+            finally:
+                for p in procs:
+                    if p.poll() is None:
+                        p.kill()
+                    p.wait()
+
     def test_the_app_finds_the_monitor_in_its_folder(self):
         text = (self.ROOT / "scripts" / "gui_common.py").read_text(encoding="utf-8")
         self.assertIn('EXE_DIR / "TURMO-Monitor" / "TURMO-Monitor.exe"', text)
