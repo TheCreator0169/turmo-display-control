@@ -3,6 +3,10 @@ TURMO - CHANGELOG
 
 Builds, hashes and test results of every build are in BUILD_HISTORY.md.
 
+v0.3.8.7 (2026-11-28)
+----------------------
+- Diagnostics: when the USB link to the display is lost (for example a "write timeout"), the log now says why: which chunk of the frame failed and after how many seconds, or the error of a failed open. Until now it only said "link lost". The cause of the rare write timeout is still unknown (it could not be reproduced on the real display), so this version makes the next occurrence explain itself. The Monitor already reconnects by itself after such a loss.
+
 v0.3.8.6 (2026-11-27)
 ----------------------
 - Fix: uninstalling while TURMO was running (window or Monitor open) left the install folder behind, because their files were still in use. The uninstaller now closes the window and the Monitor of this install first, then removes everything.

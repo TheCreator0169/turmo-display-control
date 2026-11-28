@@ -155,6 +155,7 @@ class TurmoDisplay:
         self._serial = None
         self._orientation: str | None = None  # "portrait" or "landscape"
         self._shutdown = False
+        self.last_error = ""  # why the last send_bitmap returned False (v0.3.8.7): the link logs it with "link lost"
 
     def open(self) -> None:
         """Open serial port, send screen ON (once), then set orientation."""
@@ -220,22 +221,27 @@ class TurmoDisplay:
             return False
         orientation = "landscape" if self.landscape else "portrait"
         self.send_orientation(orientation)  # no-op if already set
+        started = time.monotonic()
         try:
             self._serial.write(header(CMD_DISPLAY_BITMAP, 0, 0, self.W - 1, self.H - 1))
         except serial.SerialTimeoutException:
+            self.last_error = f"write timeout sending the frame header after {time.monotonic() - started:.1f}s"
             print("[turmo] write timeout sending header", file=sys.stderr)
             return False
         pix = rgb565(image, "little")
         chunk_size = self.W * 8  # width * 8 matches libre-panel reference
+        chunks = -(-len(pix) // chunk_size)
         for i in range(0, len(pix), chunk_size):
             if self._shutdown:
                 return False
             try:
                 self._serial.write(pix[i:i + chunk_size])
             except serial.SerialTimeoutException:
+                self.last_error = f"write timeout at chunk {i // chunk_size + 1} of {chunks}, {time.monotonic() - started:.1f}s into the frame"
                 print(f"[turmo] write timeout at chunk {i//chunk_size}", file=sys.stderr)
                 return False
             except serial.SerialException as e:
+                self.last_error = f"serial error at chunk {i // chunk_size + 1} of {chunks}: {e}"
                 print(f"[turmo] serial error during send: {e}", file=sys.stderr)
                 return False
         return True
@@ -274,6 +280,7 @@ class UsbLink:
         self.attempt = 0
         self.since = time.time()
         self.next_try = 0.0
+        self.why = ""  # the cause of the last failure, logged with the change of state (v0.3.8.7)
         self._shutdown = False
 
     def ready(self):
@@ -290,11 +297,12 @@ class UsbLink:
     def _set(self, state):
         if state != self.state:
             self.state, self.since = state, time.time()
-            self.log(state, self.port, self.attempt)
+            self.log(state, self.port, self.attempt, self.why)
         self.publish(self.state, self.port, self.attempt, self.since)
 
-    def _failed(self, state, now):
+    def _failed(self, state, now, why=""):
         self.attempt += 1
+        self.why = why
         self.next_try = now + USB_BACKOFF[min(self.attempt - 1, len(USB_BACKOFF) - 1)]
         self._set(state)
 
@@ -323,7 +331,7 @@ class UsbLink:
             except Exception:
                 pass
             denied = "denied" in str(e).lower() or isinstance(e, PermissionError)
-            self._failed("busy" if denied else "retrying", now)
+            self._failed("busy" if denied else "retrying", now, f"open failed: {type(e).__name__}: {e}")
             return
         self.disp, self.attempt, self.next_try = disp, 0, 0.0
         self._set("connected")
@@ -331,21 +339,23 @@ class UsbLink:
     def send_bitmap(self, image):
         if self.disp is None or self._shutdown:
             return False
+        why = ""
         try:
             ok = self.disp.send_bitmap(image)
-        except Exception:  # the cable was pulled mid-frame
-            ok = False
+            why = getattr(self.disp, "last_error", "")
+        except Exception as e:  # the cable was pulled mid-frame
+            ok, why = False, f"{type(e).__name__}: {e}"
         if not ok and not self._shutdown:
-            self._lose()
+            self._lose(why)
         return ok
 
-    def _lose(self):
+    def _lose(self, why=""):
         try:
             self.disp.close()
         except Exception:
             pass
         self.disp = None
-        self._failed("retrying", self.clock())
+        self._failed("retrying", self.clock(), why)
 
     def set_landscape(self, landscape):
         """The live orientation changed: tell the open display (a display opened later is made with the new value)."""
@@ -363,14 +373,14 @@ class UsbLink:
             self.disp = None
 
 
-def _log_link(state, port, attempt):
+def _log_link(state, port, attempt, why=""):
     """One line per change of the USB link's state, in the console and in the runtime log (never one per attempt)."""
     text = {"connected": "display connected", "retrying": "link lost, reconnecting",
             "busy": "port in use by another program, waiting", "not_found": "display not found, waiting"}[state]
-    print(f"\n[turmo] USB: {text} ({port or 'no port'})", flush=True)
+    print(f"\n[turmo] USB: {text} ({port or 'no port'}){': ' + why if why else ''}", flush=True)
     try:
         from runtime_logging import log_runtime
-        log_runtime("WORKER", "USB_" + state.upper(), f"{text} port={port} attempt={attempt}",
+        log_runtime("WORKER", "USB_" + state.upper(), f"{text} port={port} attempt={attempt}" + (f" cause: {why}" if why else ""),
                     level="INFO" if state == "connected" else "WARNING")
     except Exception:
         pass

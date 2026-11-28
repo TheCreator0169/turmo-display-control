@@ -319,6 +319,46 @@ def settings_text():
     return (ROOT / "scripts" / "settings.py").read_text(encoding="utf-8")
 
 
+class Cause(unittest.TestCase):
+    """v0.3.8.7: "link lost" used to say nothing about why. The first cause of a failure now goes in the log line."""
+
+    def test_a_write_timeout_is_logged_with_its_chunk_and_time(self):
+        class Port:
+            writes = 0
+
+            def write(self, data):
+                Port.writes += 1
+                if Port.writes == 4:  # the header and two chunks went through
+                    raise serial.SerialTimeoutException("Write timeout")
+
+        d = rt.TurmoDisplay("COM4")
+        d._serial, d._orientation = Port(), "portrait"
+        from PIL import Image
+        self.assertFalse(d.send_bitmap(Image.new("RGB", (d.W, d.H))))
+        self.assertIn("write timeout at chunk 3 of 120", d.last_error)
+
+    def test_the_link_logs_the_cause_of_a_lost_send_and_of_a_failed_open(self):
+        w = World()
+        link = w.link()
+        link.maintain()
+        w.send_ok = serial.SerialException("device disconnected")
+        link.send_bitmap("frame")
+        self.assertEqual(w.logs[-1][0], "retrying")
+        self.assertIn("device disconnected", w.logs[-1][3])
+        w.send_ok = True
+        w.open_errors = [PermissionError("Access is denied")]
+        w.now += 1
+        link.maintain()
+        self.assertEqual(w.logs[-1][0], "busy")
+        self.assertIn("Access is denied", w.logs[-1][3])
+
+    def test_the_cause_reaches_the_runtime_log_line(self):
+        from unittest import mock
+        with mock.patch("runtime_logging.log_runtime") as log:
+            rt._log_link("retrying", "COM4", 1, "write timeout at chunk 3 of 60")
+        self.assertIn("cause: write timeout at chunk 3 of 60", log.call_args[0][2])
+
+
 class Wiring(unittest.TestCase):
     def test_the_live_monitor_uses_the_link_and_a_missing_port_does_not_exit(self):
         text = (ROOT / "scripts" / "turmo_runtime.py").read_text(encoding="utf-8")
